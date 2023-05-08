@@ -13,4 +13,4 @@ fbsource = shim
 buck = shim
 
 [parser]
-target_platform_detector_spec = target:root//...->prelude//platforms:default target:shim//...->prelude//platforms:default
+target_platform_detector_spec = target:root//...->prelude//platforms:default target:shim//...->prelude//platforms:default target:prelude//...->prelude//platforms:default
