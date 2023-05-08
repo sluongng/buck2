@@ -1,6 +1,7 @@
 load("@prelude//toolchains:cxx.bzl", "system_cxx_toolchain")
 load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
 load("@prelude//toolchains:python.bzl", "system_python_bootstrap_toolchain", "system_python_toolchain")
+load("@prelude//toolchains:go.bzl", "remote_go_toolchain", "system_go_toolchain")
 load("@prelude//toolchains:rust.bzl", "system_rust_toolchain")
 
 system_cxx_toolchain(
@@ -26,5 +27,17 @@ system_python_toolchain(
 
 system_python_bootstrap_toolchain(
     name = "python_bootstrap",
+    visibility = ["PUBLIC"],
+)
+
+remote_go_toolchain(
+    name = "go",
+    version = "1.20.4",
+    visibility = ["PUBLIC"],
+)
+
+system_go_toolchain(
+    name = "system_go",
+    go_root = "/opt/homebrew/Cellar/go/1.20.4/libexec",
     visibility = ["PUBLIC"],
 )
