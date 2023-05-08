@@ -1,6 +1,7 @@
 load("@prelude//cxx:cxx_toolchain_types.bzl", "CxxToolchainInfo")
 load("@prelude//go:toolchain.bzl", "GoToolchainInfo")
 load("@prelude//toolchains:go_toolchain_release.bzl", "GO_SDKS_METADATA")
+load("@prelude//os_lookup:defs.bzl", "OsLookup")
 load("@prelude//:rules.bzl", "http_archive")
 
 def _get_go_arch() -> "string":
@@ -156,6 +157,11 @@ def _remote_go_toolchain_impl(ctx) -> ["promise", ["provider"]]:
             ]
         ],
         "strip_prefix": "go",
+        # Anon target hacks
+        # See https://github.com/facebook/buck2/commit/76e9a01ade4b91a95be961e75dad287bc99f81c4
+        "_create_exclusion_list": [],
+        "_exec_os_type": [],
+        "_override_exec_platform_name": ctx.attrs._exec_os_type[OsLookup].platform,
     }).map(handle_toolchain_archive)
 
 remote_go_toolchain = rule(
@@ -174,6 +180,7 @@ remote_go_toolchain = rule(
         "compile_wrapper": attrs.default_only(attrs.dep(providers = [RunInfo], default = "prelude//go/tools:compile_wrapper")),
         "cover_srcs": attrs.default_only(attrs.dep(providers = [RunInfo], default = "prelude//go/tools:cover_srcs")),
         "filter_srcs": attrs.default_only(attrs.dep(providers = [RunInfo], default = "prelude//go/tools:filter_srcs")),
+        "_exec_os_type": attrs.default_only(attrs.exec_dep(default = "prelude//os_lookup/targets:os_lookup")),
     },
     is_toolchain_rule = True,
 )
