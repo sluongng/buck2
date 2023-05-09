@@ -55,21 +55,22 @@ def go_binary_impl(ctx: "context") -> ["provider"]:
 def go_tool_binary_impl(ctx: "context") -> ["provider"]:
     go_toolchain = ctx.attrs._go_toolchain[GoToolchainInfo]
     out = ctx.actions.declare_output("main")
+    gocache = ctx.actions.declare_output("gocache", dir = True)
 
-    build_script, _ = ctx.actions.write(
+    build_script = ctx.actions.write(
         "build.sh",
         [
-            cmd_args(['GOCACHE="$(mktemp -d)"']),
-            cmd_args(["trap", '"rm -rf $GOCACHE"', "EXIT"], delimiter = " "),
-            cmd_args([go_toolchain.go, "build", "-o", out.as_output(), "-trimpath"] + ctx.attrs.srcs, delimiter = " "),
+            cmd_args(["export ", 'GOCACHE="${PWD}/', gocache.as_output(), '"'], delimiter = ""),
+            cmd_args(["mkdir", "-p", "$GOCACHE"], delimiter = " "),
+            cmd_args([go_toolchain.go, "build", "-x", "-o", out.as_output(), "-trimpath"] + ctx.attrs.srcs, delimiter = " "),
         ],
         is_executable = True,
-        allow_args = True,
     )
     ctx.actions.run(
         cmd_args(["/bin/sh", build_script])
-            .hidden(go_toolchain.go, out.as_output(), ctx.attrs.srcs),
+            .hidden(gocache.as_output(), go_toolchain.go, out.as_output(), ctx.attrs.srcs),
         category = "go_tool_binary",
+        no_outputs_cleanup = True,  # Preserve GOCACHE for subsequent runs
     )
 
     return [
