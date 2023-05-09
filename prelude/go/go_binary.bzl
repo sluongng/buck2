@@ -9,8 +9,11 @@ load(
     "@prelude//utils:utils.bzl",
     "expect",
 )
+load("@prelude//decls:go_common.bzl", "go_common")
+load("@prelude//decls/toolchains_common.bzl", "toolchains_common")
 load(":compile.bzl", "compile", "get_filtered_srcs")
 load(":link.bzl", "link")
+load(":toolchain.bzl", "GoToolchainInfo")
 
 def go_binary_impl(ctx: "context") -> ["provider"]:
     lib = compile(
@@ -48,3 +51,35 @@ def go_binary_impl(ctx: "context") -> ["provider"]:
         ),
         RunInfo(args = cmd_args(bin).hidden(hidden + runtime_files)),
     ]
+
+def go_tool_binary_impl(ctx: "context") -> ["provider"]:
+    go_toolchain = ctx.attrs._go_toolchain[GoToolchainInfo]
+    out = ctx.actions.declare_output("main")
+
+    build_script, _ = ctx.actions.write(
+        "build.sh",
+        [
+            cmd_args(['GOCACHE="$(mktemp -d)"']),
+            cmd_args(["trap", '"rm -rf $GOCACHE"', "EXIT"], delimiter = " "),
+            cmd_args([go_toolchain.go, "build", "-o", out.as_output(), "-trimpath"] + ctx.attrs.srcs, delimiter = " "),
+        ],
+        is_executable = True,
+        allow_args = True,
+    )
+    ctx.actions.run(
+        cmd_args(["/bin/sh", build_script])
+            .hidden(go_toolchain.go, out.as_output(), ctx.attrs.srcs),
+        category = "go_tool_binary",
+    )
+
+    return [
+        DefaultInfo(default_output = out),
+        RunInfo(args = cmd_args(out)),
+    ]
+
+go_tool_binary = rule(
+    impl = go_tool_binary_impl,
+    attrs = {
+        "_go_toolchain": toolchains_common.go(),
+    } | go_common.srcs_arg(),
+)

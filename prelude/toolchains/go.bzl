@@ -2,7 +2,7 @@ load("@prelude//cxx:cxx_toolchain_types.bzl", "CxxToolchainInfo")
 load("@prelude//go:toolchain.bzl", "GoToolchainInfo")
 load("@prelude//toolchains:go_toolchain_release.bzl", "GO_SDKS_METADATA")
 load("@prelude//os_lookup:defs.bzl", "OsLookup")
-load("@prelude//:rules.bzl", "http_archive")
+load("@prelude//:prelude.bzl", "native")
 
 def _get_go_arch() -> "string":
     arch = host_info().arch
@@ -142,7 +142,7 @@ def _remote_go_toolchain_impl(ctx) -> ["promise", ["provider"]]:
             ),
         ]
 
-    return ctx.actions.anon_target(http_archive, {
+    return ctx.actions.anon_target(native.http_archive, {
         "urls": ["https://dl.google.com/go/{}".format(sdk_file_metadata["filename"])],
         "sha256": sdk_file_metadata["sha256"],
         "sub_targets": ["bin/go"] + [

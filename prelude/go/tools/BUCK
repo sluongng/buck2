@@ -1,3 +1,4 @@
+load("@prelude//go:go_binary.bzl", "go_tool_binary")
 prelude = native
 
 prelude.python_bootstrap_binary(
@@ -32,4 +33,10 @@ prelude.go_binary(
     visibility = [
         "PUBLIC",
     ],
+)
+
+go_tool_binary(
+    name = "testmaingen2",
+    srcs = ["testmaingen.go"],
+    visibility = ["PUBLIC"],
 )
