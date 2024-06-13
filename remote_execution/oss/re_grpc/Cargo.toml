@@ -25,6 +25,9 @@ uuid = { workspace = true }
 
 buck2_re_configuration = { workspace = true }
 re_grpc_proto = { path = "../re_grpc_proto" }
+serde_json.workspace = true
+prost-wkt-types = "0.5.1"
+serde.workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -122,7 +122,7 @@ fn check_status(status: Status) -> Result<(), REClientError> {
     })
 }
 
-fn ttimestamp_from(ts: Option<::prost_types::Timestamp>) -> TTimestamp {
+fn ttimestamp_from(ts: Option<::prost_wkt_types::Timestamp>) -> TTimestamp {
     match ts {
         Some(timestamp) => TTimestamp {
             seconds: timestamp.seconds,
@@ -541,20 +541,24 @@ impl REClient {
     ) -> anyhow::Result<ActionResultResponse> {
         let mut client = self.grpc_clients.action_cache_client.clone();
 
+        let req = GetActionResultRequest {
+            instance_name: self.instance_name.as_str().to_owned(),
+            action_digest: Some(tdigest_to(request.digest)),
+            ..Default::default()
+        };
+        debug_request("GetActionResult", &req);
         let res = client
             .get_action_result(with_re_metadata(
-                GetActionResultRequest {
-                    instance_name: self.instance_name.as_str().to_owned(),
-                    action_digest: Some(tdigest_to(request.digest)),
-                    ..Default::default()
-                },
+                req,
                 metadata,
                 self.runtime_opts.use_fbcode_metadata,
             ))
             .await?;
+        let ar = res.into_inner();
+        debug_response("GetActionResult", &ar);
 
         Ok(ActionResultResponse {
-            action_result: convert_action_result(res.into_inner())?,
+            action_result: convert_action_result(ar)?,
             ttl: 0,
         })
     }
@@ -587,6 +591,7 @@ impl REClient {
             action_digest: Some(action_digest.clone()),
         };
 
+        debug_request("Execute", &request);
         let stream = client
             .execute(with_re_metadata(
                 request,
@@ -649,12 +654,12 @@ impl REClient {
                 let meta =
                     ExecuteOperationMetadata::decode(&msg.metadata.unwrap_or_default().value[..])?;
 
-                let stage = match execution_stage::Value::from_i32(meta.stage) {
-                    Some(execution_stage::Value::Unknown) => Stage::UNKNOWN,
-                    Some(execution_stage::Value::CacheCheck) => Stage::CACHE_CHECK,
-                    Some(execution_stage::Value::Queued) => Stage::QUEUED,
-                    Some(execution_stage::Value::Executing) => Stage::EXECUTING,
-                    Some(execution_stage::Value::Completed) => Stage::COMPLETED,
+                let stage = match execution_stage::Value::try_from(meta.stage) {
+                    Ok(execution_stage::Value::Unknown) => Stage::UNKNOWN,
+                    Ok(execution_stage::Value::CacheCheck) => Stage::CACHE_CHECK,
+                    Ok(execution_stage::Value::Queued) => Stage::QUEUED,
+                    Ok(execution_stage::Value::Executing) => Stage::EXECUTING,
+                    Ok(execution_stage::Value::Completed) => Stage::COMPLETED,
                     _ => Stage::UNKNOWN,
                 };
 
@@ -700,14 +705,17 @@ impl REClient {
             |re_request| async {
                 let metadata = metadata.clone();
                 let mut cas_client = self.grpc_clients.cas_client.clone();
+                debug_request("BatchUpdateBlobs", &re_request);
                 let resp = cas_client
                     .batch_update_blobs(with_re_metadata(
                         re_request,
                         metadata,
                         self.runtime_opts.use_fbcode_metadata,
                     ))
-                    .await?;
-                Ok(resp.into_inner())
+                    .await?
+                    .into_inner();
+                debug_response("BatchUpdateBlobs", &resp);
+                Ok(resp)
             },
             |segments| async {
                 let metadata = metadata.clone();
@@ -748,14 +756,17 @@ impl REClient {
             |re_request| async {
                 let metadata = metadata.clone();
                 let mut client = self.grpc_clients.cas_client.clone();
-                Ok(client
+                debug_request("BatchReadBlobs", &re_request);
+                let res = client
                     .batch_read_blobs(with_re_metadata(
                         re_request,
                         metadata,
                         self.runtime_opts.use_fbcode_metadata,
                     ))
                     .await?
-                    .into_inner())
+                    .into_inner();
+                debug_response("BatchReadBlobs", &res);
+                Ok(res)
             },
             |read_request| {
                 let metadata = metadata.clone();
@@ -813,18 +824,21 @@ impl REClient {
                 continue;
             }
 
+            let req = FindMissingBlobsRequest {
+                instance_name: self.instance_name.as_str().to_owned(),
+                blob_digests: digest_to_check.map(|b| tdigest_to(b.clone())),
+            };
+            debug_request("FindMissingBlobs", &req);
             let missing_blobs = cas_client
                 .find_missing_blobs(with_re_metadata(
-                    FindMissingBlobsRequest {
-                        instance_name: self.instance_name.as_str().to_owned(),
-                        blob_digests: digest_to_check.map(|b| tdigest_to(b.clone())),
-                    },
+                    req,
                     metadata.clone(),
                     self.runtime_opts.use_fbcode_metadata,
                 ))
                 .await
                 .context("Failed to request what blobs are not present on remote")?;
             let resp: FindMissingBlobsResponse = missing_blobs.into_inner();
+            debug_response("FindMissingBlobs", &resp);
             let mut find_missing_cache = self.find_missing_cache.lock().unwrap();
             for digest in &digest_to_check {
                 find_missing_cache.put(digest.clone(), DigestRemoteState::ExistsOnRemote);
@@ -881,6 +895,22 @@ impl REClient {
     pub fn get_experiment_name(&self) -> anyhow::Result<Option<String>> {
         Ok(None)
     }
+}
+
+fn debug_request<T>(rpc_name: &str, payload: &T)
+where
+    T: serde::Serialize,
+{
+    let msg = serde_json::to_string_pretty(payload).unwrap();
+    println!("Calling {rpc_name} RPC: {msg}");
+}
+
+fn debug_response<T>(rpc_name: &str, payload: &T)
+where
+    T: serde::Serialize,
+{
+    let msg = serde_json::to_string_pretty(payload).unwrap();
+    println!("Got {rpc_name} RPC response: {msg}");
 }
 
 fn convert_action_result(action_result: ActionResult) -> anyhow::Result<TActionResult2> {
