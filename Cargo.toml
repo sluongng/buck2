@@ -4,6 +4,7 @@ members = [
     "allocative/allocative_derive",
     # @oss-disable: "attic/uniplate",
     # @oss-disable: "attic/uniplate_derive",
+    "app/bazel_event_publisher_proto",
     "app/buck2",
     "app/buck2_action_impl",
     "app/buck2_action_impl_tests",
@@ -35,6 +36,7 @@ members = [
     "app/buck2_event_observer",
     "app/buck2_events",
     "app/buck2_event_log",
+    "app/buck2_event_publisher_proto",
     "app/buck2_execute",
     "app/buck2_execute_impl",
     "app/buck2_external_cells",
@@ -129,6 +131,7 @@ async-compression = { version = "0.4.1", features = ["tokio", "gzip", "zstd"] }
 async-condvar-fair = { version = "1.0", features = ["parking_lot_0_11", "tokio"] }
 async-recursion = "1.0"
 async-scoped = { version = "0.9", features = ["use-tokio"] }
+async-stream = "0.3.6"
 async-trait = "0.1.24"
 atomic = "0.5.1"
 backtrace = "0.3.51"
@@ -337,6 +340,8 @@ starlark_syntax = { version = "0.13.0", path = "starlark-rust/starlark_syntax" }
 static_interner = { path = "shed/static_interner" }
 three_billion_instructions = { path = "shed/three_billion_instructions" }
 
+bazel_event_publisher_proto = { path = "app/bazel_event_publisher_proto" }
+
 buck2_action_impl = { path = "app/buck2_action_impl" }
 buck2_action_metadata_proto = { path = "app/buck2_action_metadata_proto" }
 buck2_analysis = { path = "app/buck2_analysis" }
@@ -374,6 +379,7 @@ buck2_error = { path = "app/buck2_error" }
 buck2_error_derive = { path = "app/buck2_error_derive" }
 buck2_event_log = { path = "app/buck2_event_log" }
 buck2_event_observer = { path = "app/buck2_event_observer" }
+buck2_event_publisher_proto = { path = "app/buck2_event_publisher_proto" }
 buck2_events = { path = "app/buck2_events" }
 buck2_execute = { path = "app/buck2_execute" }
 buck2_execute_impl = { path = "app/buck2_execute_impl" }
