@@ -297,15 +297,18 @@ mod fbcode {
     use std::env::VarError;
     use std::str::FromStr;
     use std::sync::Arc;
-    use std::thread::JoinHandle;
 
     use allocative::Allocative;
-    use anyhow::Context;
     use bazel_event_publisher_proto::google::devtools::build::v1;
     use bazel_event_publisher_proto::google::devtools::build::v1::OrderedBuildEvent;
     use bazel_event_publisher_proto::google::devtools::build::v1::PublishBuildToolEventStreamRequest;
+    use bazel_event_publisher_proto::google::devtools::build::v1::PublishLifecycleEventRequest;
+    use bazel_event_publisher_proto::google::devtools::build::v1::publish_lifecycle_event_request::ServiceLevel;
     use bazel_event_publisher_proto::google::devtools::build::v1::StreamId;
+    use bazel_event_publisher_proto::google::devtools::build::v1::stream_id::BuildComponent;
     use bazel_event_publisher_proto::google::devtools::build::v1::publish_build_event_client::PublishBuildEventClient;
+    use buck2_error::BuckErrorContext;
+    use buck2_error::conversion::from_any_with_tag;
     use buck2_util::future::try_join_all;
     use dupe::Dupe;
     use futures::Stream;
@@ -338,9 +341,10 @@ mod fbcode {
     use crate::EventSinkWithStats;
     use crate::sink::smart_truncate_event::smart_truncate_event;
 
+    #[derive(Clone)]
     pub struct RemoteEventSink {
-        _handler: JoinHandle<()>,
         sender: UnboundedSender<Vec<BuckEvent>>,
+        client: PublishBuildEventClient<GrpcService>,
     }
 
     // TODO[AH] re-use definitions from REOSS crate.
@@ -351,7 +355,7 @@ mod fbcode {
     }
 
     impl FromStr for HttpHeader {
-        type Err = anyhow::Error;
+        type Err = buck2_error::Error;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             let mut iter = s.split(':');
@@ -360,7 +364,8 @@ mod fbcode {
                     key: key.trim().to_owned(),
                     value: value.trim().to_owned(),
                 }),
-                _ => Err(anyhow::anyhow!(
+                _ => Err(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Tier0,
                     "Invalid header (expect exactly one `:`): `{}`",
                     s
                 )),
@@ -369,14 +374,14 @@ mod fbcode {
     }
 
     /// Replace occurrences of $FOO in a string with the value of the env var $FOO.
-    fn substitute_env_vars(s: &str) -> anyhow::Result<String> {
+    fn substitute_env_vars(s: &str) -> buck2_error::Result<String> {
         substitute_env_vars_impl(s, |v| std::env::var(v))
     }
 
     fn substitute_env_vars_impl(
         s: &str,
         getter: impl Fn(&str) -> Result<String, VarError>,
-    ) -> anyhow::Result<String> {
+    ) -> buck2_error::Result<String> {
         static ENV_REGEX: Lazy<Regex> =
             Lazy::new(|| Regex::new("\\$[a-zA-Z_][a-zA-Z_0-9]*").unwrap());
 
@@ -386,8 +391,9 @@ mod fbcode {
         for mat in ENV_REGEX.find_iter(s) {
             out.push_str(&s[last_idx..mat.start()]);
             let var = &mat.as_str()[1..];
-            let val =
-                getter(var).with_context(|| format!("Error substituting `{}`", mat.as_str()))?;
+            let val = getter(var)
+                .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
+                .with_buck_error_context(|| format!("Error substituting: `{}`", mat.as_str()))?;
             out.push_str(&val);
             last_idx = mat.end();
         }
@@ -405,7 +411,7 @@ mod fbcode {
     }
 
     impl InjectHeadersInterceptor {
-        pub fn new(headers: &[HttpHeader]) -> anyhow::Result<Self> {
+        pub fn new(headers: &[HttpHeader]) -> buck2_error::Result<Self> {
             let headers = headers
                 .iter()
                 .map(|h| {
@@ -416,16 +422,21 @@ mod fbcode {
                     let value = substitute_env_vars(&h.value)?;
 
                     let key = MetadataKey::<metadata::Ascii>::from_bytes(key.as_bytes())
-                        .with_context(|| format!("Invalid key in header: `{}: {}`", key, value))?;
+                        .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
+                        .with_buck_error_context(|| {
+                            format!("Invalid key in header: `{}: {}`", key, value)
+                        })?;
 
-                    let value = MetadataValue::try_from(&value).with_context(|| {
-                        format!("Invalid value in header: `{}: {}`", key, value)
-                    })?;
+                    let value = MetadataValue::try_from(&value)
+                        .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
+                        .with_buck_error_context(|| {
+                            format!("Invalid value in header: `{}: {}`", key, value)
+                        })?;
 
-                    anyhow::Ok((key, value))
+                    buck2_error::Ok((key, value))
                 })
-                .collect::<Result<_, _>>()
-                .context("Error converting headers")?;
+                .collect::<Result<Vec<_>, _>>()
+                .with_buck_error_context(|| "Error converting headers")?;
 
             Ok(Self {
                 headers: Arc::new(headers),
@@ -447,8 +458,11 @@ mod fbcode {
 
     type GrpcService = InterceptedService<Channel, InjectHeadersInterceptor>;
 
-    async fn connect_build_event_server() -> anyhow::Result<PublishBuildEventClient<GrpcService>> {
-        let uri = std::env::var("BES_URI")?.parse()?;
+    async fn connect_build_event_server()
+    -> buck2_error::Result<PublishBuildEventClient<GrpcService>> {
+        let uri = std::env::var("BES_URI")
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?
+            .parse()?;
         let mut channel = Channel::builder(uri);
         let tls_config = ClientTlsConfig::new();
         {
@@ -464,7 +478,8 @@ mod fbcode {
         let endpoint = channel
             .connect()
             .await
-            .context("connecting to Bazel event stream gRPC server")?;
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
+            .with_buck_error_context(|| "connecting to Bazel event stream gRPC server")?;
         let mut headers = vec![];
         for hdr in std::env::var("BES_HEADERS")
             .unwrap_or("".to_owned())
@@ -513,92 +528,119 @@ mod fbcode {
             })
     }
 
-    async fn event_sink_loop(recv: UnboundedReceiver<Vec<BuckEvent>>) -> anyhow::Result<()> {
-        let mut handlers: HashMap<
-            String,
-            (
-                UnboundedSender<BuckEvent>,
-                tokio::task::JoinHandle<anyhow::Result<()>>,
-            ),
-        > = HashMap::new();
-        let client = connect_build_event_server().await?;
-        let mut recv = UnboundedReceiverStream::new(recv).flat_map(|v| stream::iter(v));
-        let result_uri = std::env::var("BES_RESULT").ok();
-        while let Some(event) = recv.next().await {
-            if let Some((send, _)) = handlers.get(&event.event.trace_id) {
-                send.send(event)
-                    .unwrap_or_else(|e| println!("build event send failed {:?}", e));
-            } else {
-                let (send, recv) = mpsc::unbounded_channel::<BuckEvent>();
-                let mut client = client.clone();
-                let result_uri = result_uri.clone();
-                let trace_id = event.event.trace_id.clone();
-                let handler = tokio::spawn(async move {
-                    let recv = UnboundedReceiverStream::new(recv);
-                    let request = Request::new(stream_build_tool_events(trace_id.clone(), recv));
-                    if let Some(result_uri) = result_uri.as_ref() {
-                        println!("BES results: {}{}", &result_uri, &trace_id);
-                    }
-                    let response = client.publish_build_tool_event_stream(request).await?;
-                    let mut inbound = response.into_inner();
-                    while let Some(_ack) = inbound.message().await? {
-                        // TODO: Handle ACKs properly and add retry.
-                        //println!("ACK  {:?}", ack);
-                    }
-                    if let Some(result_uri) = result_uri.as_ref() {
-                        println!("BES results: {}{}", &result_uri, &trace_id);
-                    }
-                    Ok(())
-                });
-                handlers.insert(event.event.trace_id.to_owned(), (send, handler));
-            }
-        }
-        //println!("event_sink_loop recv CLOSED");
-        // TODO: handle closure and retry.
-        // close send handles and await all handlers.
-        let handlers: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> =
-            handlers.into_values().map(|(_, handler)| handler).collect();
-        // TODO: handle retry.
-        try_join_all(handlers)
-            .await?
-            .into_iter()
-            .collect::<anyhow::Result<Vec<()>>>()?;
-        Ok(())
-    }
-
     impl RemoteEventSink {
         pub fn new() -> buck2_error::Result<Self> {
-            let (sender, recv) = mpsc::unbounded_channel::<Vec<BuckEvent>>();
-            let handler = std::thread::Builder::new()
+            let (sender, receiver) = mpsc::unbounded_channel::<Vec<BuckEvent>>();
+            let client: PublishBuildEventClient<GrpcService> =
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(connect_build_event_server())?; // Initialize the gRPC client
+            let sink = RemoteEventSink { sender, client };
+            let sink_clone = sink.clone();
+            std::thread::Builder::new()
                 .name("buck-event-producer".to_owned())
                 .spawn({
                     move || {
                         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-                        runtime.block_on(event_sink_loop(recv)).unwrap();
+                        runtime
+                            .block_on(sink_clone.event_sink_loop(receiver))
+                            .unwrap();
                     }
                 })
-                .context("spawning buck-event-producer thread")
                 .unwrap();
-            Ok(RemoteEventSink {
-                _handler: handler,
-                sender,
-            })
+            Ok(sink)
         }
+
+        async fn event_sink_loop(
+            &self,
+            receiver: UnboundedReceiver<Vec<BuckEvent>>,
+        ) -> buck2_error::Result<()> {
+            let mut handlers: HashMap<
+                String,
+                (
+                    UnboundedSender<BuckEvent>,
+                    tokio::task::JoinHandle<buck2_error::Result<()>>,
+                ),
+            > = HashMap::new();
+            let mut recv = UnboundedReceiverStream::new(receiver).flat_map(|v| stream::iter(v));
+            let result_uri = std::env::var("BES_RESULT").ok();
+            while let Some(event) = recv.next().await {
+                if let Some((send, _)) = handlers.get(&event.event.trace_id) {
+                    send.send(event)
+                        .unwrap_or_else(|e| println!("build event send failed {:?}", e));
+                } else {
+                    let (send, recv) = mpsc::unbounded_channel::<BuckEvent>();
+                    let mut client = self.client.clone();
+                    let result_uri = result_uri.clone();
+                    let trace_id = event.event.trace_id.clone();
+                    let handler = tokio::spawn(async move {
+                        let recv = UnboundedReceiverStream::new(recv);
+                        let request =
+                            Request::new(stream_build_tool_events(trace_id.clone(), recv));
+                        if let Some(result_uri) = result_uri.as_ref() {
+                            println!("BES results: {}{}", &result_uri, &trace_id);
+                        }
+                        let response = client.publish_build_tool_event_stream(request).await?;
+                        let mut inbound = response.into_inner();
+                        while let Some(_ack) = inbound.message().await? {
+                            // TODO: Handle ACKs properly and add retry.
+                            //println!("ACK  {:?}", ack);
+                        }
+                        if let Some(result_uri) = result_uri.as_ref() {
+                            println!("BES results: {}{}", &result_uri, &trace_id);
+                        }
+                        Ok(())
+                    });
+                    handlers.insert(event.event.trace_id.to_owned(), (send, handler));
+                }
+            }
+            //println!("event_sink_loop recv CLOSED");
+            // TODO: handle closure and retry.
+            // close send handles and await all handlers.
+            let handlers: Vec<tokio::task::JoinHandle<buck2_error::Result<()>>> =
+                handlers.into_values().map(|(_, handler)| handler).collect();
+            // TODO: handle retry.
+            try_join_all(handlers)
+                .await?
+                .into_iter()
+                .collect::<buck2_error::Result<Vec<()>>>()?;
+            Ok(())
+        }
+
         pub async fn send_now(&self, event: BuckEvent) {
-            self.send_messages_now(vec![event]).await;
+            let mut client = self.client.clone();
+            let _ = client.publish_lifecycle_event(Request::new(PublishLifecycleEventRequest {
+                    service_level: ServiceLevel::Interactive.into(),
+                    project_id: "".to_owned(),
+                    stream_timeout: None,
+                    notification_keywords: vec![],
+                    check_preceding_lifecycle_events_present: false,
+                    build_event: Some(OrderedBuildEvent {
+                        stream_id: Some(StreamId {
+                            build_id: event.event().trace_id.clone(),
+                            invocation_id: event.event().trace_id.clone(),
+                            component: BuildComponent::UnknownComponent.into(),
+                        }),
+                        sequence_number: 0,
+                        event: Some(v1::BuildEvent {
+                            event_time: event.event().timestamp.clone(),
+                            event: Some(v1::build_event::Event::BuckEvent(prost_types::Any {
+                                type_url: "".to_owned(),
+                                value: event.event().encode_to_vec(),
+                            })),
+                        }),
+                    }),
+                })).await;
         }
         pub async fn send_messages_now(&self, events: Vec<BuckEvent>) {
-            // TODO: does this make sense for BES? If so, implement send now variant.
-            if let Err(err) = self.sender.send(events) {
-                // TODO: proper error handling
-                dbg!(err);
+            for event in events {
+                self.send_now(event).await;
             }
         }
         pub fn offer(&self, event: BuckEvent) {
-            if let Err(err) = self.sender.send(vec![event]) {
-                // TODO: proper error handling
-                dbg!(err);
-            }
+            self.sender.send(vec![event]).unwrap();
         }
     }
 
