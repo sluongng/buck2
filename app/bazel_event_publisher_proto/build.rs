@@ -13,14 +13,6 @@ use std::path::PathBuf;
 
 fn main() -> io::Result<()> {
     let proto_files = &[
-        "proto/action_cache.proto",
-        "proto/build_event_stream.proto",
-        "proto/command_line.proto",
-        "proto/failure_details.proto",
-        "proto/invocation_policy.proto",
-        "proto/option_filters.proto",
-        "proto/package_load_metrics.proto",
-        "proto/strategy_policy.proto",
         "proto/google/api/annotations.proto",
         "proto/google/api/client.proto",
         "proto/google/api/field_behavior.proto",
