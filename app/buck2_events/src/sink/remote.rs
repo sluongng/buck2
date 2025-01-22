@@ -303,10 +303,10 @@ mod fbcode {
     use bazel_event_publisher_proto::google::devtools::build::v1::OrderedBuildEvent;
     use bazel_event_publisher_proto::google::devtools::build::v1::PublishBuildToolEventStreamRequest;
     use bazel_event_publisher_proto::google::devtools::build::v1::PublishLifecycleEventRequest;
-    use bazel_event_publisher_proto::google::devtools::build::v1::publish_lifecycle_event_request::ServiceLevel;
     use bazel_event_publisher_proto::google::devtools::build::v1::StreamId;
-    use bazel_event_publisher_proto::google::devtools::build::v1::stream_id::BuildComponent;
     use bazel_event_publisher_proto::google::devtools::build::v1::publish_build_event_client::PublishBuildEventClient;
+    use bazel_event_publisher_proto::google::devtools::build::v1::publish_lifecycle_event_request::ServiceLevel;
+    use bazel_event_publisher_proto::google::devtools::build::v1::stream_id::BuildComponent;
     use buck2_error::BuckErrorContext;
     use buck2_error::conversion::from_any_with_tag;
     use buck2_util::future::try_join_all;
@@ -320,6 +320,7 @@ mod fbcode {
     use prost_types;
     use regex::Regex;
     use tokio::runtime::Builder;
+    use tokio::runtime::Runtime;
     use tokio::sync::mpsc;
     use tokio::sync::mpsc::UnboundedReceiver;
     use tokio::sync::mpsc::UnboundedSender;
@@ -344,6 +345,7 @@ mod fbcode {
     #[derive(Clone)]
     pub struct RemoteEventSink {
         sender: UnboundedSender<Vec<BuckEvent>>,
+        _runtime: Arc<Runtime>,
         client: PublishBuildEventClient<GrpcService>,
     }
 
@@ -458,6 +460,9 @@ mod fbcode {
 
     type GrpcService = InterceptedService<Channel, InjectHeadersInterceptor>;
 
+    static EVENT_RUNTIME: Lazy<Arc<Runtime>> =
+        Lazy::new(|| Arc::new(Builder::new_multi_thread().enable_all().build().unwrap()));
+
     async fn connect_build_event_server()
     -> buck2_error::Result<PublishBuildEventClient<GrpcService>> {
         let uri = std::env::var("BES_URI")
@@ -531,25 +536,18 @@ mod fbcode {
     impl RemoteEventSink {
         pub fn new() -> buck2_error::Result<Self> {
             let (sender, receiver) = mpsc::unbounded_channel::<Vec<BuckEvent>>();
-            let client: PublishBuildEventClient<GrpcService> =
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(connect_build_event_server())?; // Initialize the gRPC client
-            let sink = RemoteEventSink { sender, client };
+            let client = EVENT_RUNTIME.block_on(connect_build_event_server())?;
+            let sink = RemoteEventSink {
+                sender,
+                _runtime: EVENT_RUNTIME.clone(),
+                client,
+            };
+
             let sink_clone = sink.clone();
-            std::thread::Builder::new()
-                .name("buck-event-producer".to_owned())
-                .spawn({
-                    move || {
-                        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-                        runtime
-                            .block_on(sink_clone.event_sink_loop(receiver))
-                            .unwrap();
-                    }
-                })
-                .unwrap();
+            EVENT_RUNTIME.spawn(async move {
+                sink_clone.event_sink_loop(receiver).await.unwrap();
+            });
+
             Ok(sink)
         }
 
@@ -611,7 +609,8 @@ mod fbcode {
 
         pub async fn send_now(&self, event: BuckEvent) {
             let mut client = self.client.clone();
-            let _ = client.publish_lifecycle_event(Request::new(PublishLifecycleEventRequest {
+            let _ = client
+                .publish_lifecycle_event(Request::new(PublishLifecycleEventRequest {
                     service_level: ServiceLevel::Interactive.into(),
                     project_id: "".to_owned(),
                     stream_timeout: None,
@@ -632,7 +631,8 @@ mod fbcode {
                             })),
                         }),
                     }),
-                })).await;
+                }))
+                .await;
         }
         pub async fn send_messages_now(&self, events: Vec<BuckEvent>) {
             for event in events {
