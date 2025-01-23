@@ -7,9 +7,7 @@
  * of this source tree.
  */
 
-use std::env;
 use std::io;
-use std::path::PathBuf;
 
 fn main() -> io::Result<()> {
     let proto_files = &[

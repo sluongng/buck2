@@ -309,9 +309,7 @@ mod fbcode {
     use bazel_event_publisher_proto::google::devtools::build::v1::stream_id::BuildComponent;
     use buck2_error::BuckErrorContext;
     use buck2_error::conversion::from_any_with_tag;
-    use buck2_util::future::try_join_all;
     use dupe::Dupe;
-    use futures::Stream;
     use futures::StreamExt;
     use futures::stream;
     use once_cell::sync::Lazy;
@@ -321,6 +319,7 @@ mod fbcode {
     use regex::Regex;
     use tokio::runtime::Builder;
     use tokio::runtime::Runtime;
+    use tokio::sync::Mutex;
     use tokio::sync::mpsc;
     use tokio::sync::mpsc::UnboundedReceiver;
     use tokio::sync::mpsc::UnboundedSender;
@@ -500,39 +499,6 @@ mod fbcode {
         Ok(client)
     }
 
-    fn stream_build_tool_events<S: Stream<Item = BuckEvent>>(
-        trace_id: String,
-        events: S,
-    ) -> impl Stream<Item = PublishBuildToolEventStreamRequest> {
-        stream::iter(1..)
-            .zip(events)
-            .map(move |(sequence_number, mut event)| {
-                smart_truncate_event(event.data_mut());
-                let mut proto: Box<buck2_data::BuckEvent> = event.into();
-                prepare_event(&mut proto);
-                PublishBuildToolEventStreamRequest {
-                    check_preceding_lifecycle_events_present: false,
-                    notification_keywords: vec![],
-                    ordered_build_event: Some(OrderedBuildEvent {
-                        stream_id: Some(StreamId {
-                            build_id: trace_id.clone(),
-                            invocation_id: trace_id.clone(),
-                            component: BuildComponent::UnknownComponent.into(),
-                        }),
-                        sequence_number,
-                        event: Some(v1::BuildEvent {
-                            event_time: proto.timestamp.clone(),
-                            event: Some(v1::build_event::Event::BuckEvent(prost_types::Any {
-                                type_url: "type.googleapis.com/buck.data.BuckEvent".to_owned(),
-                                value: proto.encode_to_vec(),
-                            })),
-                        }),
-                    }),
-                    project_id: "12341234".to_owned(), // TODO: needed
-                }
-            })
-    }
-
     impl RemoteEventSink {
         pub fn new() -> buck2_error::Result<Self> {
             let (sender, receiver) = mpsc::unbounded_channel::<Vec<BuckEvent>>();
@@ -555,55 +521,73 @@ mod fbcode {
             &self,
             receiver: UnboundedReceiver<Vec<BuckEvent>>,
         ) -> buck2_error::Result<()> {
-            let mut handlers: HashMap<
-                String,
-                (
-                    UnboundedSender<BuckEvent>,
-                    tokio::task::JoinHandle<buck2_error::Result<()>>,
-                ),
-            > = HashMap::new();
-            let mut recv = UnboundedReceiverStream::new(receiver).flat_map(|v| stream::iter(v));
             let result_uri = std::env::var("BES_RESULT").ok();
-            while let Some(event) = recv.next().await {
-                if let Some((send, _)) = handlers.get(&event.event.trace_id) {
-                    send.send(event)
-                        .unwrap_or_else(|e| println!("build event send failed {:?}", e));
-                } else {
-                    let (send, recv) = mpsc::unbounded_channel::<BuckEvent>();
-                    let mut client = self.client.clone();
-                    let result_uri = result_uri.clone();
-                    let trace_id = event.event.trace_id.clone();
-                    let handler = tokio::spawn(async move {
-                        let recv = UnboundedReceiverStream::new(recv);
-                        let request =
-                            Request::new(stream_build_tool_events(trace_id.clone(), recv));
-                        if let Some(result_uri) = result_uri.as_ref() {
-                            println!("BES results: {}{}", &result_uri, &trace_id);
+
+            let unack_events: Arc<Mutex<HashMap<i64, PublishBuildToolEventStreamRequest>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+            let result_uri_clone = result_uri.clone();
+            let unpack_events_for_stream = unack_events.clone();
+            let buck2_event_stream = UnboundedReceiverStream::new(receiver)
+                .flat_map(|v| stream::iter(v))
+                .map(|mut buck_event| {
+                    smart_truncate_event(buck_event.data_mut());
+                    let mut buck_event_proto: Box<buck2_data::BuckEvent> = buck_event.into();
+                    prepare_event(&mut buck_event_proto);
+                    buck_event_proto
+                })
+                .zip(stream::iter(1..))
+                .map(move |(buck_event_proto, sequence_number)| {
+                    if sequence_number == 1 {
+                        if let Some(result_uri) = result_uri_clone.as_ref() {
+                            println!("BES results: {}{}", &result_uri, buck_event_proto.trace_id);
                         }
-                        let response = client.publish_build_tool_event_stream(request).await?;
-                        let mut inbound = response.into_inner();
-                        while let Some(_ack) = inbound.message().await? {
-                            // TODO: Handle ACKs properly and add retry.
-                            //println!("ACK  {:?}", ack);
-                        }
-                        if let Some(result_uri) = result_uri.as_ref() {
-                            println!("BES results: {}{}", &result_uri, &trace_id);
-                        }
-                        Ok(())
+                    }
+                    let req = PublishBuildToolEventStreamRequest {
+                        check_preceding_lifecycle_events_present: false,
+                        notification_keywords: vec![],
+                        ordered_build_event: Some(OrderedBuildEvent {
+                            stream_id: Some(StreamId {
+                                build_id: buck_event_proto.trace_id.clone(),
+                                invocation_id: buck_event_proto.trace_id.clone(),
+                                component: BuildComponent::UnknownComponent.into(),
+                            }),
+                            sequence_number,
+                            event: Some(v1::BuildEvent {
+                                event_time: buck_event_proto.timestamp.clone(),
+                                event: Some(v1::build_event::Event::BuckEvent(prost_types::Any {
+                                    type_url: "type.googleapis.com/buck.data.BuckEvent".to_owned(),
+                                    value: buck_event_proto.encode_to_vec(),
+                                })),
+                            }),
+                        }),
+                        project_id: "".to_owned(),
+                    };
+                    let req_clone = req.clone();
+                    let unack_events_clone = unpack_events_for_stream.clone();
+                    tokio::task::spawn(async move {
+                        let mut lock = unack_events_clone.lock().await;
+                        lock.insert(sequence_number, req_clone);
+                        drop(lock);
                     });
-                    handlers.insert(event.event.trace_id.to_owned(), (send, handler));
-                }
-            }
-            //println!("event_sink_loop recv CLOSED");
-            // TODO: handle closure and retry.
-            // close send handles and await all handlers.
-            let handlers: Vec<tokio::task::JoinHandle<buck2_error::Result<()>>> =
-                handlers.into_values().map(|(_, handler)| handler).collect();
-            // TODO: handle retry.
-            try_join_all(handlers)
+
+                    req
+                });
+
+            let mut resp_stream = self
+                .client
+                .clone()
+                .publish_build_tool_event_stream(Request::new(buck2_event_stream))
                 .await?
-                .into_iter()
-                .collect::<buck2_error::Result<Vec<()>>>()?;
+                .into_inner();
+            while let Some(ack) = resp_stream.message().await? {
+                let unack_events_clone = unack_events.clone();
+                tokio::task::spawn(async move {
+                    let mut lock = unack_events_clone.lock().await;
+                    lock.remove(&ack.sequence_number);
+                    drop(lock);
+                });
+            }
+
             Ok(())
         }
 
