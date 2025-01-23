@@ -30,6 +30,7 @@ mod fbcode {
     use fbinit::FacebookInit;
     use prost::Message;
 
+    use super::prepare_event;
     use crate::BuckEvent;
     use crate::Event;
     use crate::EventSink;
@@ -343,8 +344,8 @@ mod fbcode {
 
     #[derive(Clone)]
     pub struct RemoteEventSink {
-        sender: UnboundedSender<Vec<BuckEvent>>,
         _runtime: Arc<Runtime>,
+        sender: UnboundedSender<Vec<BuckEvent>>,
         client: PublishBuildEventClient<GrpcService>,
     }
 
@@ -504,8 +505,8 @@ mod fbcode {
             let (sender, receiver) = mpsc::unbounded_channel::<Vec<BuckEvent>>();
             let client = EVENT_RUNTIME.block_on(connect_build_event_server())?;
             let sink = RemoteEventSink {
-                sender,
                 _runtime: EVENT_RUNTIME.clone(),
+                sender,
                 client,
             };
 
@@ -560,7 +561,7 @@ mod fbcode {
                                 })),
                             }),
                         }),
-                        project_id: "".to_owned(),
+                        project_id: "buck2".to_owned(),
                     };
                     let req_clone = req.clone();
                     let unack_events_clone = unpack_events_for_stream.clone();
@@ -579,13 +580,27 @@ mod fbcode {
                 .publish_build_tool_event_stream(Request::new(buck2_event_stream))
                 .await?
                 .into_inner();
-            while let Some(ack) = resp_stream.message().await? {
-                let unack_events_clone = unack_events.clone();
-                tokio::task::spawn(async move {
-                    let mut lock = unack_events_clone.lock().await;
-                    lock.remove(&ack.sequence_number);
-                    drop(lock);
-                });
+            let mut trace_id = None;
+            loop {
+                match resp_stream.message().await {
+                    Ok(Some(ack)) => {
+                        if let (None, Some(stream_id)) = (&trace_id, &ack.stream_id) {
+                            trace_id = Some(stream_id.invocation_id.clone());
+                        }
+                        let mut lock = unack_events.lock().await;
+                        lock.remove(&ack.sequence_number);
+                        drop(lock);
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        // TODO: implement retry here
+                        return Err(from_any_with_tag(e, buck2_error::ErrorTag::Tier0));
+                    }
+                }
+            }
+
+            if let (Some(result_uri), Some(trace_id)) = (result_uri, trace_id) {
+                println!("BES results: {}{}", result_uri, trace_id);
             }
 
             Ok(())
@@ -596,7 +611,7 @@ mod fbcode {
             let _ = client
                 .publish_lifecycle_event(Request::new(PublishLifecycleEventRequest {
                     service_level: ServiceLevel::Interactive.into(),
-                    project_id: "".to_owned(),
+                    project_id: "buck2".to_owned(),
                     stream_timeout: None,
                     notification_keywords: vec![],
                     check_preceding_lifecycle_events_present: false,
