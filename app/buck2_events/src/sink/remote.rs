@@ -517,13 +517,13 @@ mod fbcode {
                         stream_id: Some(StreamId {
                             build_id: trace_id.clone(),
                             invocation_id: trace_id.clone(),
-                            component: 0,
+                            component: BuildComponent::UnknownComponent.into(),
                         }),
                         sequence_number,
                         event: Some(v1::BuildEvent {
                             event_time: proto.timestamp.clone(),
                             event: Some(v1::build_event::Event::BuckEvent(prost_types::Any {
-                                type_url: "".to_owned(),
+                                type_url: "type.googleapis.com/buck.data.BuckEvent".to_owned(),
                                 value: proto.encode_to_vec(),
                             })),
                         }),
@@ -626,7 +626,7 @@ mod fbcode {
                         event: Some(v1::BuildEvent {
                             event_time: event.event().timestamp.clone(),
                             event: Some(v1::build_event::Event::BuckEvent(prost_types::Any {
-                                type_url: "".to_owned(),
+                                type_url: "type.googleapis.com/buck.data.BuckEvent".to_owned(),
                                 value: event.event().encode_to_vec(),
                             })),
                         }),
