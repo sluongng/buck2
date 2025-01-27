@@ -298,6 +298,7 @@ mod fbcode {
     use std::env::VarError;
     use std::str::FromStr;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use allocative::Allocative;
     use bazel_event_publisher_proto::google::devtools::build::v1;
@@ -319,12 +320,11 @@ mod fbcode {
     use prost_types;
     use regex::Regex;
     use tokio::runtime::Builder;
-    use tokio::runtime::Runtime;
     use tokio::sync::Mutex;
     use tokio::sync::mpsc;
-    use tokio::sync::mpsc::UnboundedReceiver;
-    use tokio::sync::mpsc::UnboundedSender;
-    use tokio_stream::wrappers::UnboundedReceiverStream;
+    use tokio::sync::mpsc::Receiver;
+    use tokio::sync::mpsc::Sender;
+    use tokio_stream::wrappers::ReceiverStream;
     use tonic::Request;
     use tonic::metadata;
     use tonic::metadata::MetadataKey;
@@ -341,13 +341,6 @@ mod fbcode {
     use crate::EventSinkStats;
     use crate::EventSinkWithStats;
     use crate::sink::smart_truncate_event::smart_truncate_event;
-
-    #[derive(Clone)]
-    pub struct RemoteEventSink {
-        _runtime: Arc<Runtime>,
-        sender: UnboundedSender<Vec<BuckEvent>>,
-        client: PublishBuildEventClient<GrpcService>,
-    }
 
     // TODO[AH] re-use definitions from REOSS crate.
     #[derive(Clone, Debug, Default, Allocative)]
@@ -460,31 +453,28 @@ mod fbcode {
 
     type GrpcService = InterceptedService<Channel, InjectHeadersInterceptor>;
 
-    static EVENT_RUNTIME: Lazy<Arc<Runtime>> =
-        Lazy::new(|| Arc::new(Builder::new_multi_thread().enable_all().build().unwrap()));
-
-    async fn connect_build_event_server()
-    -> buck2_error::Result<PublishBuildEventClient<GrpcService>> {
-        let uri = std::env::var("BES_URI")
-            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))?
-            .parse()?;
-        let mut channel = Channel::builder(uri);
-        let tls_config = ClientTlsConfig::new();
-        {
-            let tls_setting = std::env::var("BES_TLS").unwrap_or("0".to_owned());
-            match tls_setting.as_str() {
-                "1" | "true" => {
-                    channel = channel.tls_config(tls_config)?;
-                }
-                _ => {}
+    fn connect_build_event_server(
+        bes_uri: String,
+    ) -> buck2_error::Result<PublishBuildEventClient<GrpcService>> {
+        let mut channel =
+            Channel::builder(bes_uri.parse()?).connect_timeout(Duration::from_secs(600));
+        if let Ok(bes_tls) = std::env::var("BES_TLS") {
+            if bes_tls == "1" {
+                let tls_config = ClientTlsConfig::new();
+                channel = channel.tls_config(tls_config)?;
             }
         }
+        let tls_config = match std::env::var("BES_TLS") {
+            Ok(tls_setting) => match tls_setting.as_str() {
+                "1" | "true" => Some(ClientTlsConfig::new()),
+                _ => None,
+            },
+            Err(_) => None,
+        };
+        if let Some(tls_config) = tls_config {
+            channel = channel.tls_config(tls_config)?;
+        }
         // TODO: parse PEM
-        let endpoint = channel
-            .connect()
-            .await
-            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Tier0))
-            .with_buck_error_context(|| "connecting to Bazel event stream gRPC server")?;
         let mut headers = vec![];
         for hdr in std::env::var("BES_HEADERS")
             .unwrap_or("".to_owned())
@@ -496,31 +486,42 @@ mod fbcode {
             }
         }
         let interceptor = InjectHeadersInterceptor::new(&headers)?;
-        let client = PublishBuildEventClient::with_interceptor(endpoint, interceptor);
+        let client = PublishBuildEventClient::with_interceptor(channel.connect_lazy(), interceptor);
         Ok(client)
     }
 
+    #[derive(Clone)]
+    pub struct RemoteEventSink {
+        // For streaming events asynchronously via PublishBuildToolEventStream
+        sender: Sender<Vec<BuckEvent>>,
+        // For sending events directly with PublishLifecycleEvent
+        client: PublishBuildEventClient<GrpcService>,
+    }
+
     impl RemoteEventSink {
-        pub fn new() -> buck2_error::Result<Self> {
-            let (sender, receiver) = mpsc::unbounded_channel::<Vec<BuckEvent>>();
-            let client = EVENT_RUNTIME.block_on(connect_build_event_server())?;
-            let sink = RemoteEventSink {
-                _runtime: EVENT_RUNTIME.clone(),
-                sender,
-                client,
-            };
+        pub fn new(bes_uri: String) -> buck2_error::Result<Self> {
+            let (sender, receiver) = mpsc::channel::<Vec<BuckEvent>>(100);
+            let client = connect_build_event_server(bes_uri)?;
+            let sink = RemoteEventSink { sender, client };
 
             let sink_clone = sink.clone();
-            EVENT_RUNTIME.spawn(async move {
-                sink_clone.event_sink_loop(receiver).await.unwrap();
-            });
+            std::thread::Builder::new()
+                .name("buck-event-service".to_owned())
+                .spawn({
+                    move || {
+                        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+                        runtime
+                            .block_on(sink_clone.event_sink_loop(receiver))
+                            .unwrap();
+                    }
+                })?;
 
             Ok(sink)
         }
 
         async fn event_sink_loop(
             &self,
-            receiver: UnboundedReceiver<Vec<BuckEvent>>,
+            receiver: Receiver<Vec<BuckEvent>>,
         ) -> buck2_error::Result<()> {
             let result_uri = std::env::var("BES_RESULT").ok();
 
@@ -528,7 +529,8 @@ mod fbcode {
                 Arc::new(Mutex::new(HashMap::new()));
             let result_uri_clone = result_uri.clone();
             let unpack_events_for_stream = unack_events.clone();
-            let buck2_event_stream = UnboundedReceiverStream::new(receiver)
+
+            let buck2_event_stream = ReceiverStream::new(receiver)
                 .flat_map(|v| stream::iter(v))
                 .map(|mut buck_event| {
                     smart_truncate_event(buck_event.data_mut());
@@ -571,15 +573,22 @@ mod fbcode {
                         drop(lock);
                     });
 
+                    println!("sending: {}", sequence_number);
                     req
                 });
 
-            let mut resp_stream = self
+            let mut resp_stream = match self
                 .client
                 .clone()
                 .publish_build_tool_event_stream(Request::new(buck2_event_stream))
-                .await?
-                .into_inner();
+                .await
+            {
+                Ok(resp) => resp.into_inner(),
+                Err(e) => {
+                    println!("Error streaming event: {:?}", e);
+                    return Err(from_any_with_tag(e, buck2_error::ErrorTag::Tier0));
+                }
+            };
             let mut trace_id = None;
             loop {
                 match resp_stream.message().await {
@@ -588,12 +597,17 @@ mod fbcode {
                             trace_id = Some(stream_id.invocation_id.clone());
                         }
                         let mut lock = unack_events.lock().await;
+                        println!("ack: {}", ack.sequence_number);
                         lock.remove(&ack.sequence_number);
                         drop(lock);
                     }
-                    Ok(None) => break,
+                    Ok(None) => {
+                        println!("No ack message");
+                        break;
+                    }
                     Err(e) => {
                         // TODO: implement retry here
+                        println!("Error getting ack: {:?}", e);
                         return Err(from_any_with_tag(e, buck2_error::ErrorTag::Tier0));
                     }
                 }
@@ -639,7 +653,9 @@ mod fbcode {
             }
         }
         pub fn offer(&self, event: BuckEvent) {
-            self.sender.send(vec![event]).unwrap();
+            if let Err(e) = self.sender.blocking_send(vec![event]) {
+                println!("Error sending event: {:?}", e);
+            }
         }
     }
 
@@ -753,9 +769,10 @@ fn new_remote_event_sink_if_fbcode(
             retry_attempts,
             message_batch_size,
         );
-        match std::env::var("BES_URI") {
-            Ok(_) => Ok(Some(RemoteEventSink::new()?)),
-            _ => Ok(None),
+        if let Ok(bes_uri) = std::env::var("BES_URI") {
+            Ok(Some(RemoteEventSink::new(bes_uri)?))
+        } else {
+            Ok(None)
         }
     }
 }
