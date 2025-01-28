@@ -457,12 +457,6 @@ mod fbcode {
     ) -> buck2_error::Result<PublishBuildEventClient<GrpcService>> {
         let mut channel =
             Channel::builder(bes_uri.parse()?).connect_timeout(Duration::from_secs(600));
-        if let Ok(bes_tls) = std::env::var("BES_TLS") {
-            if bes_tls == "1" {
-                let tls_config = ClientTlsConfig::new();
-                channel = channel.tls_config(tls_config)?;
-            }
-        }
         let tls_config = match std::env::var("BES_TLS") {
             Ok(tls_setting) => match tls_setting.as_str() {
                 "1" | "true" => Some(ClientTlsConfig::new()),
@@ -501,7 +495,7 @@ mod fbcode {
         pub fn new(bes_uri: String) -> buck2_error::Result<Self> {
             let (sender, receiver) = mpsc::unbounded_channel::<Vec<BuckEvent>>();
             let client = connect_build_event_server(bes_uri)?;
-            let sink = RemoteEventSink { sender: sender.clone(), client };
+            let sink = RemoteEventSink { sender, client };
 
             let sink_clone = sink.clone();
             tokio::spawn(async move {
