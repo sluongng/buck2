@@ -319,12 +319,11 @@ mod fbcode {
     use prost::Message;
     use prost_types;
     use regex::Regex;
-    use tokio::runtime::Builder;
     use tokio::sync::Mutex;
     use tokio::sync::mpsc;
-    use tokio::sync::mpsc::Receiver;
-    use tokio::sync::mpsc::Sender;
-    use tokio_stream::wrappers::ReceiverStream;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio_stream::wrappers::UnboundedReceiverStream;
     use tonic::Request;
     use tonic::metadata;
     use tonic::metadata::MetadataKey;
@@ -493,35 +492,31 @@ mod fbcode {
     #[derive(Clone)]
     pub struct RemoteEventSink {
         // For streaming events asynchronously via PublishBuildToolEventStream
-        sender: Sender<Vec<BuckEvent>>,
+        sender: UnboundedSender<Vec<BuckEvent>>,
         // For sending events directly with PublishLifecycleEvent
         client: PublishBuildEventClient<GrpcService>,
     }
 
     impl RemoteEventSink {
         pub fn new(bes_uri: String) -> buck2_error::Result<Self> {
-            let (sender, receiver) = mpsc::channel::<Vec<BuckEvent>>(100);
+            let (sender, receiver) = mpsc::unbounded_channel::<Vec<BuckEvent>>();
             let client = connect_build_event_server(bes_uri)?;
-            let sink = RemoteEventSink { sender, client };
+            let sink = RemoteEventSink { sender: sender.clone(), client };
 
             let sink_clone = sink.clone();
-            std::thread::Builder::new()
-                .name("buck-event-service".to_owned())
-                .spawn({
-                    move || {
-                        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-                        runtime
-                            .block_on(sink_clone.event_sink_loop(receiver))
-                            .unwrap();
-                    }
-                })?;
+            tokio::spawn(async move {
+                sink_clone
+                    .event_sink_loop(receiver)
+                    .await
+                    .expect("Event sink loop failed");
+            });
 
             Ok(sink)
         }
 
         async fn event_sink_loop(
             &self,
-            receiver: Receiver<Vec<BuckEvent>>,
+            receiver: UnboundedReceiver<Vec<BuckEvent>>,
         ) -> buck2_error::Result<()> {
             let result_uri = std::env::var("BES_RESULT").ok();
 
@@ -530,7 +525,7 @@ mod fbcode {
             let result_uri_clone = result_uri.clone();
             let unpack_events_for_stream = unack_events.clone();
 
-            let buck2_event_stream = ReceiverStream::new(receiver)
+            let buck2_event_stream = UnboundedReceiverStream::new(receiver)
                 .flat_map(|v| stream::iter(v))
                 .map(|mut buck_event| {
                     smart_truncate_event(buck_event.data_mut());
@@ -653,7 +648,7 @@ mod fbcode {
             }
         }
         pub fn offer(&self, event: BuckEvent) {
-            if let Err(e) = self.sender.blocking_send(vec![event]) {
+            if let Err(e) = self.sender.send(vec![event]) {
                 println!("Error sending event: {:?}", e);
             }
         }
