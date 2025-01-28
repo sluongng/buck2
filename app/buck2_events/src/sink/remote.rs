@@ -298,6 +298,7 @@ mod fbcode {
     use std::env::VarError;
     use std::str::FromStr;
     use std::sync::Arc;
+    use std::sync::OnceLock;
     use std::time::Duration;
 
     use allocative::Allocative;
@@ -483,33 +484,18 @@ mod fbcode {
         Ok(client)
     }
 
-    #[derive(Clone)]
-    pub struct RemoteEventSink {
+    static BES_PRODUCER: OnceLock<Arc<BesProducer>> = OnceLock::new();
+
+    struct BesProducer {
         // For streaming events asynchronously via PublishBuildToolEventStream
         sender: UnboundedSender<Vec<BuckEvent>>,
         // For sending events directly with PublishLifecycleEvent
         client: PublishBuildEventClient<GrpcService>,
     }
 
-    impl RemoteEventSink {
-        pub fn new(bes_uri: String) -> buck2_error::Result<Self> {
-            let (sender, receiver) = mpsc::unbounded_channel::<Vec<BuckEvent>>();
-            let client = connect_build_event_server(bes_uri)?;
-            let sink = RemoteEventSink { sender, client };
-
-            let sink_clone = sink.clone();
-            tokio::spawn(async move {
-                sink_clone
-                    .event_sink_loop(receiver)
-                    .await
-                    .expect("Event sink loop failed");
-            });
-
-            Ok(sink)
-        }
-
+    impl BesProducer {
         async fn event_sink_loop(
-            &self,
+            &'static self,
             receiver: UnboundedReceiver<Vec<BuckEvent>>,
         ) -> buck2_error::Result<()> {
             let result_uri = std::env::var("BES_RESULT").ok();
@@ -562,33 +548,35 @@ mod fbcode {
                         drop(lock);
                     });
 
-                    println!("sending: {}", sequence_number);
                     req
                 });
 
+            println!("About to stream");
             let mut resp_stream = match self
                 .client
                 .clone()
                 .publish_build_tool_event_stream(Request::new(buck2_event_stream))
                 .await
             {
-                Ok(resp) => resp.into_inner(),
+                Ok(resp) => {
+                    println!("stream ok");
+                    resp.into_inner()
+                }
                 Err(e) => {
                     println!("Error streaming event: {:?}", e);
                     return Err(from_any_with_tag(e, buck2_error::ErrorTag::Tier0));
                 }
             };
-            let mut trace_id = None;
+            let mut trace_id: Option<String> = None;
+            println!("starting ack loop");
             loop {
                 match resp_stream.message().await {
                     Ok(Some(ack)) => {
+                        // ack is not used
                         if let (None, Some(stream_id)) = (&trace_id, &ack.stream_id) {
                             trace_id = Some(stream_id.invocation_id.clone());
                         }
-                        let mut lock = unack_events.lock().await;
                         println!("ack: {}", ack.sequence_number);
-                        lock.remove(&ack.sequence_number);
-                        drop(lock);
                     }
                     Ok(None) => {
                         println!("No ack message");
@@ -601,6 +589,7 @@ mod fbcode {
                     }
                 }
             }
+            println!("Finish waiting ack");
 
             if let (Some(result_uri), Some(trace_id)) = (result_uri, trace_id) {
                 println!("BES results: {}{}", result_uri, trace_id);
@@ -608,9 +597,36 @@ mod fbcode {
 
             Ok(())
         }
+    }
+
+    #[derive(Clone)]
+    pub struct RemoteEventSink {
+        producer: &'static BesProducer,
+    }
+
+    impl RemoteEventSink {
+        pub fn new(bes_uri: String) -> buck2_error::Result<Self> {
+            let (sender, receiver) = mpsc::unbounded_channel::<Vec<BuckEvent>>();
+            let producer = &**BES_PRODUCER.get_or_try_init(|| -> buck2_error::Result<_> {
+                let client: PublishBuildEventClient<GrpcService> =
+                    connect_build_event_server(bes_uri)?;
+                let producer = BesProducer { sender, client };
+
+                Ok(Arc::new(producer))
+            })?;
+
+            tokio::spawn(async move {
+                producer
+                    .event_sink_loop(receiver)
+                    .await
+                    .expect("Event sink loop failed");
+            });
+
+            Ok(RemoteEventSink { producer })
+        }
 
         pub async fn send_now(&self, event: BuckEvent) {
-            let mut client = self.client.clone();
+            let mut client = self.producer.client.clone();
             let _ = client
                 .publish_lifecycle_event(Request::new(PublishLifecycleEventRequest {
                     service_level: ServiceLevel::Interactive.into(),
@@ -642,8 +658,8 @@ mod fbcode {
             }
         }
         pub fn offer(&self, event: BuckEvent) {
-            if let Err(e) = self.sender.send(vec![event]) {
-                println!("Error sending event: {:?}", e);
+            if let Err(e) = self.producer.sender.send(vec![event]) {
+                println!("Error sending event to channel: {:?}", e);
             }
         }
     }
@@ -662,7 +678,7 @@ mod fbcode {
 
     impl EventSinkWithStats for RemoteEventSink {
         fn to_event_sync(self: Arc<Self>) -> Arc<dyn EventSink> {
-            self as _
+            self as Arc<dyn EventSink>
         }
 
         fn stats(&self) -> EventSinkStats {
