@@ -294,6 +294,7 @@ mod fbcode {
 
 #[cfg(not(fbcode_build))]
 mod fbcode {
+    use std::collections::HashMap;
     use std::env::VarError;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -319,6 +320,7 @@ mod fbcode {
     use prost::Message;
     use prost_types;
     use regex::Regex;
+    use tokio::sync::Mutex;
     use tokio::sync::mpsc;
     use tokio::sync::mpsc::UnboundedReceiver;
     use tokio::sync::mpsc::UnboundedSender;
@@ -497,58 +499,13 @@ mod fbcode {
             receiver: UnboundedReceiver<Vec<BuckEvent>>,
         ) -> buck2_error::Result<()> {
             let result_uri = std::env::var("BES_RESULT").ok();
+
+            let unack_events: Arc<Mutex<HashMap<i64, PublishBuildToolEventStreamRequest>>> =
+                Arc::new(Mutex::new(HashMap::new()));
             let result_uri_clone = result_uri.clone();
+            let unpack_events_for_stream = unack_events.clone();
 
-            println!("About to stream");
-            let (request_sender, request_receiver) =
-                mpsc::unbounded_channel::<PublishBuildToolEventStreamRequest>();
-            let mut resp_stream = match self
-                .client
-                .clone()
-                .publish_build_tool_event_stream(Request::new(UnboundedReceiverStream::new(
-                    request_receiver,
-                )))
-                .await
-            {
-                Ok(resp) => {
-                    println!("stream ok");
-                    resp.into_inner()
-                }
-                Err(e) => {
-                    println!("Error streaming event: {:?}", e);
-                    return Err(from_any_with_tag(e, buck2_error::ErrorTag::Tier0));
-                }
-            };
-
-            // Spawn a separate task to handle acknowledgements concurrently
-            tokio::spawn(async move {
-                println!("Starting acknowledgement processing task...");
-                let mut trace_id: Option<String> = None;
-                while let Some(result) = resp_stream.next().await {
-                    match result {
-                        Ok(ack) => {
-                            if let (None, Some(stream_id)) = (&trace_id, &ack.stream_id) {
-                                trace_id = Some(stream_id.invocation_id.clone());
-                            }
-                            // Process acknowledgement (logging, metrics, etc.)
-                            println!("Received ack: {}", ack.sequence_number);
-                        }
-                        Err(e) => {
-                            // Handle error in receiving acknowledgements
-                            println!("Error receiving ack: {:?}", e);
-                            // Consider error handling strategies here (retry stream, log error, etc.)
-                            break; // Exit ack loop on error for now.
-                        }
-                    }
-                }
-                println!("Acknowledgement processing task finished.");
-
-                if let (Some(result_uri), Some(trace_id)) = (result_uri, trace_id) {
-                    println!("BES results: {}{}", result_uri, trace_id);
-                }
-            });
-
-            UnboundedReceiverStream::new(receiver)
+            let buck2_event_stream = UnboundedReceiverStream::new(receiver)
                 .flat_map(|v| stream::iter(v))
                 .map(|mut buck_event| {
                     smart_truncate_event(buck_event.data_mut());
@@ -583,14 +540,60 @@ mod fbcode {
                         }),
                         project_id: "buck2".to_owned(),
                     };
+                    let req_clone = req.clone();
+                    let unack_events_clone = unpack_events_for_stream.clone();
+                    tokio::task::spawn(async move {
+                        let mut lock = unack_events_clone.lock().await;
+                        lock.insert(sequence_number, req_clone);
+                        drop(lock);
+                    });
 
                     req
-                })
-                .for_each(|req| async {
-                    if let Err(e) = request_sender.send(req) {
-                        println!("Error sending event to channel: {:?}", e);
+                });
+
+            println!("About to stream");
+            let mut resp_stream = match self
+                .client
+                .clone()
+                .publish_build_tool_event_stream(Request::new(buck2_event_stream))
+                .await
+            {
+                Ok(resp) => {
+                    println!("stream ok");
+                    resp.into_inner()
+                }
+                Err(e) => {
+                    println!("Error streaming event: {:?}", e);
+                    return Err(from_any_with_tag(e, buck2_error::ErrorTag::Tier0));
+                }
+            };
+            let mut trace_id: Option<String> = None;
+            println!("starting ack loop");
+            loop {
+                match resp_stream.message().await {
+                    Ok(Some(ack)) => {
+                        // ack is not used
+                        if let (None, Some(stream_id)) = (&trace_id, &ack.stream_id) {
+                            trace_id = Some(stream_id.invocation_id.clone());
+                        }
+                        println!("ack: {}", ack.sequence_number);
                     }
-                }).await;
+                    Ok(None) => {
+                        println!("No ack message");
+                        break;
+                    }
+                    Err(e) => {
+                        // TODO: implement retry here
+                        println!("Error getting ack: {:?}", e);
+                        return Err(from_any_with_tag(e, buck2_error::ErrorTag::Tier0));
+                    }
+                }
+            }
+            println!("Finish waiting ack");
+
+            if let (Some(result_uri), Some(trace_id)) = (result_uri, trace_id) {
+                println!("BES results: {}{}", result_uri, trace_id);
+            }
 
             Ok(())
         }
