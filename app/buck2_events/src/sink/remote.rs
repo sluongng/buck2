@@ -294,7 +294,6 @@ mod fbcode {
 
 #[cfg(not(fbcode_build))]
 mod fbcode {
-    use std::collections::HashMap;
     use std::env::VarError;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -320,7 +319,6 @@ mod fbcode {
     use prost::Message;
     use prost_types;
     use regex::Regex;
-    use tokio::sync::Mutex;
     use tokio::sync::mpsc;
     use tokio::sync::mpsc::UnboundedReceiver;
     use tokio::sync::mpsc::UnboundedSender;
@@ -456,8 +454,9 @@ mod fbcode {
     fn connect_build_event_server(
         bes_uri: String,
     ) -> buck2_error::Result<PublishBuildEventClient<GrpcService>> {
-        let mut channel =
-            Channel::builder(bes_uri.parse()?).connect_timeout(Duration::from_secs(600));
+        let mut channel = Channel::builder(bes_uri.parse()?)
+            .connect_timeout(Duration::from_secs(600))
+            .keep_alive_while_idle(true);
         let tls_config = match std::env::var("BES_TLS") {
             Ok(tls_setting) => match tls_setting.as_str() {
                 "1" | "true" => Some(ClientTlsConfig::new()),
@@ -499,11 +498,7 @@ mod fbcode {
             receiver: UnboundedReceiver<Vec<BuckEvent>>,
         ) -> buck2_error::Result<()> {
             let result_uri = std::env::var("BES_RESULT").ok();
-
-            let unack_events: Arc<Mutex<HashMap<i64, PublishBuildToolEventStreamRequest>>> =
-                Arc::new(Mutex::new(HashMap::new()));
             let result_uri_clone = result_uri.clone();
-            let unpack_events_for_stream = unack_events.clone();
 
             let buck2_event_stream = UnboundedReceiverStream::new(receiver)
                 .flat_map(|v| stream::iter(v))
@@ -540,13 +535,6 @@ mod fbcode {
                         }),
                         project_id: "buck2".to_owned(),
                     };
-                    let req_clone = req.clone();
-                    let unack_events_clone = unpack_events_for_stream.clone();
-                    tokio::task::spawn(async move {
-                        let mut lock = unack_events_clone.lock().await;
-                        lock.insert(sequence_number, req_clone);
-                        drop(lock);
-                    });
 
                     req
                 });
@@ -602,6 +590,7 @@ mod fbcode {
     #[derive(Clone)]
     pub struct RemoteEventSink {
         producer: &'static BesProducer,
+        handler: Arc<tokio::task::JoinHandle<()>>,
     }
 
     impl RemoteEventSink {
@@ -615,14 +604,17 @@ mod fbcode {
                 Ok(Arc::new(producer))
             })?;
 
-            tokio::spawn(async move {
+            let handler = tokio::spawn(async move {
                 producer
                     .event_sink_loop(receiver)
                     .await
                     .expect("Event sink loop failed");
             });
 
-            Ok(RemoteEventSink { producer })
+            Ok(RemoteEventSink {
+                producer,
+                handler: Arc::new(handler),
+            })
         }
 
         pub async fn send_now(&self, event: BuckEvent) {
@@ -660,6 +652,16 @@ mod fbcode {
         pub fn offer(&self, event: BuckEvent) {
             if let Err(e) = self.producer.sender.send(vec![event]) {
                 println!("Error sending event to channel: {:?}", e);
+            }
+        }
+    }
+
+    impl Drop for RemoteEventSink {
+        fn drop(&mut self) {
+            if Arc::strong_count(&self.handler) == 1 {
+                // Take ownership of the task and block until completion
+                let task = Arc::into_inner(self.handler.clone()).unwrap();
+                let _ = futures::executor::block_on(task);
             }
         }
     }
