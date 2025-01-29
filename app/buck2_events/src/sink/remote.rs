@@ -15,6 +15,8 @@ use std::time::Duration;
 use buck2_data;
 use fbinit::FacebookInit;
 
+use crate::schedule_type::ScheduleType;
+
 #[cfg(fbcode_build)]
 mod fbcode {
     use std::sync::Arc;
@@ -30,6 +32,7 @@ mod fbcode {
     use fbinit::FacebookInit;
     use prost::Message;
 
+    use super::should_send_event;
     use super::prepare_event;
     use crate::BuckEvent;
     use crate::Event;
@@ -38,8 +41,8 @@ mod fbcode {
     use crate::EventSinkWithStats;
     use crate::TraceId;
     use crate::metadata;
-    use crate::schedule_type::ScheduleType;
     use crate::sink::smart_truncate_event::smart_truncate_event;
+    use crate::schedule_type::ScheduleType;
 
     // 1 MiB limit
     static SCRIBE_MESSAGE_SIZE_LIMIT: usize = 1024 * 1024;
@@ -179,7 +182,7 @@ mod fbcode {
         fn send(&self, event: Event) {
             match event {
                 Event::Buck(event) => {
-                    if should_send_event(event.data(), &self.schedule_type) {
+                    if should_send_event(event.data(), SCHEDULE_TYPE_CONTINUOUS) {
                         self.offer(event);
                     }
                 }
@@ -209,73 +212,6 @@ mod fbcode {
                 buffered: counters.queue_depth,
                 dropped: counters.dropped,
                 bytes_written: counters.bytes_written,
-            }
-        }
-    }
-
-    fn should_send_event(d: &buck2_data::buck_event::Data, schedule_type: &ScheduleType) -> bool {
-        use buck2_data::buck_event::Data;
-
-        match d {
-            Data::SpanStart(s) => {
-                use buck2_data::span_start_event::Data;
-
-                match &s.data {
-                    Some(Data::Command(..)) => true,
-                    None => false,
-                    _ => false,
-                }
-            }
-            Data::SpanEnd(s) => {
-                use buck2_data::ActionExecutionKind;
-                use buck2_data::span_end_event::Data;
-
-                match &s.data {
-                    Some(Data::Command(..)) => true,
-                    Some(Data::ActionExecution(a)) => {
-                        a.failed
-                            || match ActionExecutionKind::from_i32(a.execution_kind) {
-                                // Those kinds are not used in downstreams
-                                Some(ActionExecutionKind::Simple) => false,
-                                Some(ActionExecutionKind::Deferred) => false,
-                                Some(ActionExecutionKind::NotSet) => false,
-                                _ => true,
-                            }
-                    }
-                    Some(Data::Analysis(..)) => !schedule_type.is_diff(),
-                    Some(Data::Load(..)) => true,
-                    Some(Data::CacheUpload(..)) => true,
-                    Some(Data::DepFileUpload(..)) => true,
-                    Some(Data::Materialization(..)) => true,
-                    Some(Data::TestDiscovery(..)) => true,
-                    Some(Data::TestEnd(..)) => true,
-                    None => false,
-                    _ => false,
-                }
-            }
-            Data::Instant(i) => {
-                use buck2_data::instant_event::Data;
-
-                match i.data {
-                    Some(Data::BuildGraphInfo(..)) => true,
-                    Some(Data::RageResult(..)) => true,
-                    Some(Data::ReSession(..)) => true,
-                    Some(Data::StructuredError(..)) => true,
-                    Some(Data::PersistEventLogSubprocess(..)) => true,
-                    Some(Data::CleanStaleResult(..)) => true,
-                    Some(Data::ConfigurationCreated(..)) => true,
-                    None => false,
-                    _ => false,
-                }
-            }
-            Data::Record(r) => {
-                use buck2_data::record_event::Data;
-
-                match r.data {
-                    Some(Data::InvocationRecord(..)) => true,
-                    Some(Data::BuildGraphStats(..)) => true,
-                    None => false,
-                }
             }
         }
     }
@@ -333,12 +269,14 @@ mod fbcode {
     use tonic::transport::channel::ClientTlsConfig;
 
     use super::prepare_event;
+    use super::should_send_event;
     use crate::BuckEvent;
     use crate::Event;
     use crate::EventSink;
     use crate::EventSinkStats;
     use crate::EventSinkWithStats;
     use crate::sink::smart_truncate_event::smart_truncate_event;
+    use crate::schedule_type::ScheduleType;
 
     // TODO[AH] re-use definitions from REOSS crate.
     #[derive(Clone, Debug, Default, Allocative)]
@@ -587,10 +525,10 @@ mod fbcode {
         }
     }
 
-    #[derive(Clone)]
     pub struct RemoteEventSink {
         producer: &'static BesProducer,
         handler: Arc<tokio::task::JoinHandle<()>>,
+        schedule_type: ScheduleType,
     }
 
     impl RemoteEventSink {
@@ -610,10 +548,11 @@ mod fbcode {
                     .await
                     .expect("Event sink loop failed");
             });
-
+            let schedule_type = ScheduleType::new()?;
             Ok(RemoteEventSink {
                 producer,
                 handler: Arc::new(handler),
+                schedule_type,
             })
         }
 
@@ -670,7 +609,9 @@ mod fbcode {
         fn send(&self, event: Event) {
             match event {
                 Event::Buck(event) => {
-                    self.offer(event);
+                    if should_send_event(event.data(), &self.schedule_type) {
+                        self.offer(event);
+                    }
                 }
                 Event::CommandResult(..) => {}
                 Event::PartialResult(..) => {}
@@ -746,6 +687,73 @@ fn prepare_event(event: &mut buck2_data::BuckEvent) {
             _ => {}
         },
         _ => {}
+    }
+}
+
+fn should_send_event(d: &buck2_data::buck_event::Data, schedule_type: &ScheduleType) -> bool {
+    use buck2_data::buck_event::Data;
+
+    match d {
+        Data::SpanStart(s) => {
+            use buck2_data::span_start_event::Data;
+
+            match &s.data {
+                Some(Data::Command(..)) => true,
+                None => false,
+                _ => false,
+            }
+        }
+        Data::SpanEnd(s) => {
+            use buck2_data::ActionExecutionKind;
+            use buck2_data::span_end_event::Data;
+
+            match &s.data {
+                Some(Data::Command(..)) => true,
+                Some(Data::ActionExecution(a)) => {
+                    a.failed
+                        || match ActionExecutionKind::from_i32(a.execution_kind) {
+                            // Those kinds are not used in downstreams
+                            Some(ActionExecutionKind::Simple) => false,
+                            Some(ActionExecutionKind::Deferred) => false,
+                            Some(ActionExecutionKind::NotSet) => false,
+                            _ => true,
+                        }
+                }
+                Some(Data::Analysis(..)) => !schedule_type.is_diff(),
+                Some(Data::Load(..)) => true,
+                Some(Data::CacheUpload(..)) => true,
+                Some(Data::DepFileUpload(..)) => true,
+                Some(Data::Materialization(..)) => true,
+                Some(Data::TestDiscovery(..)) => true,
+                Some(Data::TestEnd(..)) => true,
+                None => false,
+                _ => false,
+            }
+        }
+        Data::Instant(i) => {
+            use buck2_data::instant_event::Data;
+
+            match i.data {
+                Some(Data::BuildGraphInfo(..)) => true,
+                Some(Data::RageResult(..)) => true,
+                Some(Data::ReSession(..)) => true,
+                Some(Data::StructuredError(..)) => true,
+                Some(Data::PersistEventLogSubprocess(..)) => true,
+                Some(Data::CleanStaleResult(..)) => true,
+                Some(Data::ConfigurationCreated(..)) => true,
+                None => false,
+                _ => false,
+            }
+        }
+        Data::Record(r) => {
+            use buck2_data::record_event::Data;
+
+            match r.data {
+                Some(Data::InvocationRecord(..)) => true,
+                Some(Data::BuildGraphStats(..)) => true,
+                None => false,
+            }
+        }
     }
 }
 
