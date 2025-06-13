@@ -7,6 +7,7 @@
  * of this source tree.
  */
 
+use std::env;
 use std::io;
 
 fn main() -> io::Result<()> {
@@ -14,6 +15,12 @@ fn main() -> io::Result<()> {
         "proto/build/bazel/remote/execution/v2/remote_execution.proto",
         "proto/build/bazel/semver/semver.proto",
     ];
+
+    let includes = if let Ok(path) = env::var("BUCK_PROTO_SRCS") {
+        vec![path]
+    } else {
+        vec!["./proto/".to_owned(), "../google_api_proto/proto".to_owned()]
+    };
 
     let builder = buck2_protoc_dev::configure();
     unsafe { builder.setup_protoc() }
@@ -74,5 +81,5 @@ fn main() -> io::Result<()> {
             "build.bazel.remote.execution.v2.ExecutedActionMetadata.auxiliary_metadata",
             "#[serde(with = \"google_api_proto::serialize_vec_any\")]",
         )
-        .compile(proto_files, &["./proto/", "../google_api_proto/proto"])
+        .compile(proto_files, &includes)
 }

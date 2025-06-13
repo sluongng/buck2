@@ -75,12 +75,21 @@ def rust_protobuf_library(
 ProtoSrcsInfo = provider(fields = ["srcs"])
 
 def _proto_srcs_impl(ctx):
-    srcs = {src.basename: src for src in ctx.attrs.srcs}
+    """Collect proto sources preserving their relative directory structure."""
+
+    def add_src(map, src):
+        key = src.short_path
+        if key in map:
+            fail("Duplicate src:", key)
+        map[key] = src
+
+    srcs = {}
+    for src in ctx.attrs.srcs:
+        add_src(srcs, src)
     for dep in ctx.attrs.deps:
         for src in dep[ProtoSrcsInfo].srcs:
-            if src.basename in srcs:
-                fail("Duplicate src:", src.basename)
-            srcs[src.basename] = src
+            add_src(srcs, src)
+
     out = ctx.actions.copied_dir(ctx.attrs.name, srcs)
     return [DefaultInfo(default_output = out), ProtoSrcsInfo(srcs = srcs.values())]
 
