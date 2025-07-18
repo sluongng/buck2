@@ -146,12 +146,39 @@ def _rust_protobuf_library(
 ProtoSrcsInfo = provider(fields = ["srcs"])
 
 def _proto_srcs_impl(ctx):
-    srcs = {src.basename: src for src in ctx.attrs.srcs}
+    srcs = {}
+
+    # Process local sources, preserving their directory structure
+    for src in ctx.attrs.srcs:
+        # Get the relative path from the package directory
+        source_path = src.short_path
+        package_prefix = ctx.label.package + "/"
+        if source_path.startswith(package_prefix):
+            relative_path = source_path[len(package_prefix):]
+        else:
+            relative_path = source_path
+
+        if relative_path in srcs:
+            fail("Duplicate src:", relative_path)
+        srcs[relative_path] = src
+
+    # Process dependencies
     for dep in ctx.attrs.deps:
         for src in dep[ProtoSrcsInfo].srcs:
-            if src.basename in srcs:
-                fail("Duplicate src:", src.basename)
-            srcs[src.basename] = src
+            # For dependencies, try to preserve the original directory structure
+            if "/proto/" in src.short_path:
+                parts = src.short_path.split("/proto/")
+                if len(parts) > 1:
+                    relative_path = parts[1]
+                else:
+                    relative_path = src.basename
+            else:
+                relative_path = src.basename
+
+            if relative_path in srcs:
+                fail("Duplicate src:", relative_path)
+            srcs[relative_path] = src
+
     out = ctx.actions.copied_dir(ctx.attrs.name, srcs)
     return [DefaultInfo(default_output = out), ProtoSrcsInfo(srcs = srcs.values())]
 
