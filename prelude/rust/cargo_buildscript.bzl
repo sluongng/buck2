@@ -196,6 +196,9 @@ def buildscript_run(
         **kwargs):
     kwargs = apply_platform_attrs(platform, kwargs)
 
+    # Remove platform parameter from kwargs as _cargo_buildscript_rule doesn't accept it
+    kwargs.pop("platform", None)
+
     if manifest_dir == None and local_manifest_dir == None:
         existing_filegroup_name = "{}-{}.crate".format(package_name, version)
         if rule_exists(existing_filegroup_name):
