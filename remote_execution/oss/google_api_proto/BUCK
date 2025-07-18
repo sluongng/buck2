@@ -3,22 +3,19 @@ load("@fbcode//buck2:proto_defs.bzl", "proto_srcs", "rust_protobuf_library")
 oncall("build_infra")
 
 proto_srcs(
-    name = "re_grpc_proto_srcs",
+    name = "google_api_proto_srcs",
     srcs = glob(["proto/**/*.proto"]),
-    deps = [
-        "//remote_execution/oss/google_api_proto:google_api_proto_srcs",
-    ],
+    visibility = ["//remote_execution/oss/..."],
 )
 
 rust_protobuf_library(
-    name = "re_grpc_proto",
+    name = "google_api_proto",
     srcs = glob(["src/**/*.rs"]),
     build_script = "build.rs",
-    proto_srcs = ":re_grpc_proto_srcs",
+    proto_srcs = ":google_api_proto_srcs",
     deps = [
         "fbsource//third-party/rust:prost-types",
         "fbsource//third-party/rust:serde",
         "//buck2/app/buck2_data:buck2_data",
-        "//buck2/remote_execution/oss/google_api_proto:google_api_proto",
     ],
 )
