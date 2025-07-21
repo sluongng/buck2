@@ -53,6 +53,7 @@ tracing = { workspace = true }
 superconsole = { version = "0.2.0", path = "../../superconsole" }
 
 # Please do not add dependency on `buck2_build_api`.
+buck2_bes_configuration = { workspace = true }
 buck2_build_info = { workspace = true }
 buck2_cli_proto = { workspace = true }
 buck2_common = { workspace = true }

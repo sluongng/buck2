@@ -1,0 +1,16 @@
+[package]
+description = "utilities to configure BES in Buck2 (OSS builds only, fbcode uses Scribe)"
+edition = "2024"
+license = { workspace = true }
+name = "buck2_bes_configuration"
+repository = { workspace = true }
+version = "0.1.0"
+
+[dependencies]
+allocative = { workspace = true }
+buck2_common = { workspace = true }
+buck2_core = { workspace = true }
+buck2_error = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fbcode_build)"] }

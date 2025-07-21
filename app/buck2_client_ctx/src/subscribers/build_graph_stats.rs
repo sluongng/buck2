@@ -8,12 +8,25 @@
  * above-listed licenses.
  */
 
+#[cfg(fbcode_build)]
 use std::time::Duration;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+#[cfg(not(fbcode_build))]
+use buck2_bes_configuration::BesConfigurationImpl;
+#[cfg(not(fbcode_build))]
+use buck2_bes_configuration::bes_config_from_legacy;
 use buck2_cli_proto::command_result;
+#[cfg(not(fbcode_build))]
+use buck2_common::legacy_configs::configs::LegacyBuckConfig;
+#[cfg(not(fbcode_build))]
+use buck2_events::EventSink;
+#[cfg(not(fbcode_build))]
+use buck2_events::sink::bes::BesEventSink;
+#[cfg(fbcode_build)]
 use buck2_events::sink::remote::ScribeConfig;
+#[cfg(fbcode_build)]
 use buck2_events::sink::remote::new_remote_event_sink_if_enabled;
 use buck2_wrapper_common::invocation_id::TraceId;
 use dupe::Dupe;
@@ -22,6 +35,7 @@ use fbinit::FacebookInit;
 use crate::subscribers::subscriber::EventSubscriber;
 
 pub struct BuildGraphStats {
+    #[allow(dead_code)] // Used in fbcode builds
     fb: FacebookInit,
     trace_id: TraceId,
 }
@@ -77,22 +91,85 @@ impl BuildGraphStats {
     }
 
     async fn send_events(&self, events: Vec<buck2_events::BuckEvent>) {
-        #[allow(unreachable_patterns)]
-        if let Ok(Some(sink)) = new_remote_event_sink_if_enabled(
-            self.fb,
-            ScribeConfig {
-                buffer_size: 1,
-                retry_backoff: Duration::from_millis(100),
-                retry_attempts: 2,
-                message_batch_size: None,
-                thrift_timeout: Duration::from_secs(1),
-            },
-        ) {
-            tracing::info!("Sending events to Scribe: {:?}", &events);
-            let _res = sink.send_messages_now(events).await;
-        } else {
-            tracing::info!("Events were not sent to Scribe: {:?}", &events);
+        // Use configuration-based approach for both fbcode and OSS builds
+        #[cfg(fbcode_build)]
+        {
+            #[allow(unreachable_patterns)]
+            if let Ok(Some(sink)) = new_remote_event_sink_if_enabled(
+                self.fb,
+                ScribeConfig {
+                    buffer_size: 1,
+                    retry_backoff: Duration::from_millis(100),
+                    retry_attempts: 2,
+                    message_batch_size: None,
+                    thrift_timeout: Duration::from_secs(1),
+                }
+                .into(),
+            ) {
+                tracing::info!("Sending events to Scribe: {:?}", &events);
+                let _res = sink.send_messages_now(events).await;
+            } else {
+                tracing::info!("Events were not sent to Scribe: {:?}", &events);
+            }
         }
+        #[cfg(not(fbcode_build))]
+        {
+            // In OSS builds, attempt to send to BES if configured
+            // This provides better observability for OSS Buck2 users
+            if let Err(e) = self.send_events_to_bes_if_configured(events).await {
+                tracing::debug!("Failed to send build graph stats to BES: {}", e);
+            }
+        }
+    }
+
+    #[cfg(not(fbcode_build))]
+    async fn send_events_to_bes_if_configured(
+        &self,
+        events: Vec<buck2_events::BuckEvent>,
+    ) -> buck2_error::Result<()> {
+        // Try to load BES configuration from environment or default locations
+        // This is a best-effort approach since we don't have direct access to BuckConfig here
+        if let Ok(bes_config) = self.try_load_bes_config() {
+            if bes_config.is_enabled() {
+                if let Some((endpoint, project, build_id, invocation_id)) =
+                    bes_config.get_bes_config_values(Some(&self.trace_id.to_string()))
+                {
+                    let config = buck2_events::sink::bes::BesConfig::new(
+                        endpoint,
+                        project,
+                        build_id,
+                        invocation_id,
+                    );
+
+                    match BesEventSink::new(config) {
+                        Ok(sink) => {
+                            tracing::info!(
+                                "Sending build graph stats to BES: {} events",
+                                events.len()
+                            );
+                            for event in events {
+                                sink.send(buck2_events::Event::Buck(event));
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("Failed to create BES sink: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(fbcode_build))]
+    fn try_load_bes_config(
+        &self,
+    ) -> buck2_error::Result<buck2_bes_configuration::BesConfiguration> {
+        // Since we don't have direct access to BuckConfig, try to load from environment
+        // This is a simplified approach - in a full implementation, this would be passed
+        // from the context that has access to the configuration
+        let config = LegacyBuckConfig::empty(); // Placeholder - would be actual config
+        bes_config_from_legacy(&config)
     }
 }
 

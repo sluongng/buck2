@@ -23,40 +23,13 @@ mod fbcode {
 }
 
 #[cfg(not(fbcode_build))]
-mod fbcode {
-    use std::sync::Arc;
+mod oss {
     use std::time::Duration;
 
-    use crate::BuckEvent;
-    use crate::Event;
-    use crate::EventSink;
-    use crate::EventSinkStats;
-    use crate::EventSinkWithStats;
+    use crate::sink::bes::BesEventSink;
 
-    pub enum RemoteEventSink {}
-
-    impl RemoteEventSink {
-        pub async fn send_now(&self, _event: BuckEvent) -> buck2_error::Result<()> {
-            Ok(())
-        }
-        pub async fn send_messages_now(&self, _events: Vec<BuckEvent>) -> buck2_error::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl EventSink for RemoteEventSink {
-        fn send(&self, _event: Event) {}
-    }
-
-    impl EventSinkWithStats for RemoteEventSink {
-        fn to_event_sync(self: Arc<Self>) -> Arc<dyn EventSink> {
-            self as _
-        }
-
-        fn stats(&self) -> EventSinkStats {
-            match *self {}
-        }
-    }
+    // Alias for compatibility with existing code
+    pub type RemoteEventSink = BesEventSink;
 
     #[derive(Default)]
     pub struct ScribeConfig {
@@ -68,31 +41,63 @@ mod fbcode {
     }
 }
 
+#[cfg(fbcode_build)]
 pub use fbcode::*;
+#[cfg(not(fbcode_build))]
+pub use oss::*;
 
-fn new_remote_event_sink_if_fbcode(
-    fb: FacebookInit,
-    config: ScribeConfig,
-) -> buck2_error::Result<Option<RemoteEventSink>> {
+// Re-export BES components for OSS builds
+#[cfg(not(fbcode_build))]
+pub use crate::sink::bes::{BesConfig, BesEventSink};
+
+/// Unified configuration for remote event sinks
+pub enum RemoteEventSinkConfig {
     #[cfg(fbcode_build)]
-    {
-        Ok(Some(RemoteEventSink::new(fb, scribe_category()?, config)?))
-    }
+    Scribe(ScribeConfig),
     #[cfg(not(fbcode_build))]
-    {
-        let _ = (fb, config);
-        Ok(None)
+    Bes(BesConfig),
+}
+
+impl From<ScribeConfig> for RemoteEventSinkConfig {
+    #[cfg(fbcode_build)]
+    fn from(config: ScribeConfig) -> Self {
+        RemoteEventSinkConfig::Scribe(config)
+    }
+
+    #[cfg(not(fbcode_build))]
+    fn from(_config: ScribeConfig) -> Self {
+        unreachable!("ScribeConfig should not be used in OSS builds")
     }
 }
 
+#[cfg(not(fbcode_build))]
+impl From<BesConfig> for RemoteEventSinkConfig {
+    fn from(config: BesConfig) -> Self {
+        RemoteEventSinkConfig::Bes(config)
+    }
+}
+
+/// Create a new remote event sink from configuration (lower-level interface)
 pub fn new_remote_event_sink_if_enabled(
     fb: FacebookInit,
-    config: ScribeConfig,
+    config: RemoteEventSinkConfig,
 ) -> buck2_error::Result<Option<RemoteEventSink>> {
-    if is_enabled() {
-        new_remote_event_sink_if_fbcode(fb, config)
-    } else {
-        Ok(None)
+    if !is_enabled() {
+        return Ok(None);
+    }
+
+    match config {
+        #[cfg(fbcode_build)]
+        RemoteEventSinkConfig::Scribe(scribe_config) => Ok(Some(RemoteEventSink::new(
+            fb,
+            scribe_category()?,
+            scribe_config,
+        )?)),
+        #[cfg(not(fbcode_build))]
+        RemoteEventSinkConfig::Bes(bes_config) => {
+            let _ = fb; // fb not used in OSS builds
+            Ok(Some(RemoteEventSink::new(bes_config)?))
+        }
     }
 }
 
