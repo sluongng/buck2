@@ -27,7 +27,9 @@ use buck2_event_log::ttl::manifold_event_log_ttl;
 use buck2_events::BuckEvent;
 use buck2_events::daemon_id::DaemonId;
 use buck2_events::sink::remote::RemoteEventSink;
+#[cfg(fbcode_build)]
 use buck2_events::sink::remote::ScribeConfig;
+#[cfg(fbcode_build)]
 use buck2_events::sink::remote::new_remote_event_sink_if_enabled;
 use buck2_fs::paths::abs_path::AbsPathBuf;
 use buck2_wrapper_common::invocation_id::TraceId;
@@ -366,8 +368,19 @@ async fn dispatch_event_to_scribe(
     };
 }
 
-fn create_scribe_sink(ctx: &ClientCommandContext) -> buck2_error::Result<Option<RemoteEventSink>> {
-    new_remote_event_sink_if_enabled(ctx.fbinit(), ScribeConfig::default())
+fn create_scribe_sink(
+    _ctx: &ClientCommandContext<'_>,
+) -> buck2_error::Result<Option<RemoteEventSink>> {
+    #[cfg(fbcode_build)]
+    {
+        new_remote_event_sink_if_enabled(_ctx.fbinit(), ScribeConfig::default().into())
+    }
+    #[cfg(not(fbcode_build))]
+    {
+        // In OSS builds, BES configuration is not available in debug context
+        // Skip remote event sink creation - persist_event_logs doesn't need it
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

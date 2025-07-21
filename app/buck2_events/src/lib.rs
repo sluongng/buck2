@@ -202,7 +202,7 @@ pub enum Event {
 }
 
 /// Statistics from this event sink on how messages were processed.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct EventSinkStats {
     /// Count of number of successful messages (e.g. those that have been processed by their downstream destination).
     pub successes: u64,
@@ -298,6 +298,10 @@ pub fn init_late_bindings() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::collections::HashMap;
+    use std::str::FromStr;
+
     use buck2_data::CommandStart;
     use buck2_data::SpanStartEvent;
 

@@ -80,6 +80,9 @@ use dupe::Dupe;
 use fbinit::FacebookInit;
 use gazebo::prelude::*;
 use gazebo::variants::VariantName;
+#[cfg(not(fbcode_build))]
+use remote::BesConfig;
+#[cfg(fbcode_build)]
 use remote::ScribeConfig;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
@@ -307,12 +310,14 @@ impl DaemonState {
                 .parse_single_cell(cells.root_cell(), &fs)
                 .await?;
 
+            #[cfg(fbcode_build)]
             let buffer_size = root_config
                 .parse(BuckconfigKeyRef {
                     section: "buck2",
                     property: "event_log_buffer_size",
                 })?
                 .unwrap_or(10000);
+            #[cfg(fbcode_build)]
             let retry_backoff = Duration::from_millis(
                 root_config
                     .parse(BuckconfigKeyRef {
@@ -321,16 +326,19 @@ impl DaemonState {
                     })?
                     .unwrap_or(500),
             );
+            #[cfg(fbcode_build)]
             let retry_attempts = root_config
                 .parse(BuckconfigKeyRef {
                     section: "buck2",
                     property: "event_log_retry_attempts",
                 })?
                 .unwrap_or(5);
-            let message_batch_size = root_config.parse(BuckconfigKeyRef {
+            #[cfg(fbcode_build)]
+            let message_batch_size: Option<usize> = root_config.parse(BuckconfigKeyRef {
                 section: "buck2",
                 property: "event_log_message_batch_size",
             })?;
+            #[cfg(fbcode_build)]
             let scribe_sink = Self::init_scribe_sink(
                 fb,
                 ScribeConfig {
@@ -342,6 +350,44 @@ impl DaemonState {
                 },
             )
             .buck_error_context("failed to init scribe sink")?;
+
+            #[cfg(not(fbcode_build))]
+            let scribe_sink = {
+                // Read BES configuration from buckconfig
+                let bes_endpoint: Option<String> = root_config.parse(BuckconfigKeyRef {
+                    section: "buck2_bes",
+                    property: "endpoint",
+                })?;
+                let bes_project: Option<String> = root_config.parse(BuckconfigKeyRef {
+                    section: "buck2_bes",
+                    property: "project",
+                })?;
+                let bes_build_id: Option<String> = root_config.parse(BuckconfigKeyRef {
+                    section: "buck2_bes",
+                    property: "build_id",
+                })?;
+                let bes_invocation_id: Option<String> = root_config.parse(BuckconfigKeyRef {
+                    section: "buck2_bes",
+                    property: "invocation_id",
+                })?;
+
+                // Only create BES sink if endpoint is configured
+                if let Some(endpoint) = bes_endpoint {
+                    let project = bes_project.unwrap_or_else(|| "buck2-daemon".to_string());
+                    let build_id = bes_build_id.unwrap_or_else(|| "daemon-build".to_string());
+                    let invocation_id =
+                        bes_invocation_id.unwrap_or_else(|| "daemon-invocation".to_string());
+
+                    Self::init_bes_sink(
+                        fb,
+                        BesConfig::new(endpoint, project, build_id, invocation_id),
+                    )
+                    .buck_error_context("failed to init BES sink")?
+                } else {
+                    // BES not configured - no endpoint provided
+                    None
+                }
+            };
 
             let default_digest_algorithm =
                 buck2_env!("BUCK_DEFAULT_DIGEST_ALGORITHM", type=DigestAlgorithmFamily)?;
@@ -751,13 +797,23 @@ impl DaemonState {
         }
     }
 
+    #[cfg(fbcode_build)]
     fn init_scribe_sink(
         fb: FacebookInit,
         config: ScribeConfig,
     ) -> buck2_error::Result<Option<Arc<dyn EventSinkWithStats>>> {
         facebook_only();
-        remote::new_remote_event_sink_if_enabled(fb, config)
+        remote::new_remote_event_sink_if_enabled(fb, config.into())
             .map(|maybe_scribe| maybe_scribe.map(|scribe| Arc::new(scribe) as _))
+    }
+
+    #[cfg(not(fbcode_build))]
+    fn init_bes_sink(
+        fb: FacebookInit,
+        config: BesConfig,
+    ) -> buck2_error::Result<Option<Arc<dyn EventSinkWithStats>>> {
+        remote::new_remote_event_sink_if_enabled(fb, config.into())
+            .map(|maybe_bes| maybe_bes.map(|bes| Arc::new(bes) as _))
     }
 
     /// Prepares an event stream for a request by bootstrapping an event source and EventDispatcher pair. The given

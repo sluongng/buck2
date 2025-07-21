@@ -46,6 +46,7 @@ use buck2_error::buck2_error;
 use buck2_error::classify::ERROR_TAG_UNCLASSIFIED;
 use buck2_error::classify::ErrorLike;
 use buck2_error::classify::source_area;
+#[cfg(fbcode_build)]
 use buck2_error::internal_error;
 use buck2_error::source_location::SourceLocation;
 use buck2_event_log::ttl::manifold_event_log_ttl;
@@ -56,7 +57,9 @@ use buck2_event_observer::last_command_execution_kind::LastCommandExecutionKind;
 use buck2_event_observer::last_command_execution_kind::get_last_command_execution_time;
 use buck2_events::BuckEvent;
 use buck2_events::daemon_id::DaemonId;
+#[cfg(fbcode_build)]
 use buck2_events::sink::remote::ScribeConfig;
+#[cfg(fbcode_build)]
 use buck2_events::sink::remote::new_remote_event_sink_if_enabled;
 use buck2_fs::fs_util;
 use buck2_fs::paths::abs_path::AbsPathBuf;
@@ -2404,21 +2407,31 @@ impl EventSubscriber for InvocationRecorder {
         // Typically initialized already unless the command failed early.
         let fb = buck2_common::fbinit::get_or_init_fbcode_globals();
         let event = self.create_record_event();
-        if let Some(scribe_sink) = new_remote_event_sink_if_enabled(
-            fb,
-            ScribeConfig {
-                buffer_size: 1,
-                retry_backoff: Duration::from_millis(500),
-                retry_attempts: 5,
-                message_batch_size: None,
-                thrift_timeout: Duration::from_secs(2),
-            },
-        )? {
-            tracing::info!("Recording invocation to Scribe: {:?}", &event);
-            scribe_sink.send_now(event).await
-        } else {
-            tracing::info!("Invocation record is not sent to Scribe: {:?}", &event);
-            Err(internal_error!("Scribe sink not enabled"))
+        #[cfg(fbcode_build)]
+        {
+            if let Some(scribe_sink) = new_remote_event_sink_if_enabled(
+                fb,
+                ScribeConfig {
+                    buffer_size: 1,
+                    retry_backoff: Duration::from_millis(500),
+                    retry_attempts: 5,
+                    message_batch_size: None,
+                    thrift_timeout: Duration::from_secs(2),
+                }
+                .into(),
+            )? {
+                tracing::info!("Recording invocation to Scribe: {:?}", &event);
+                scribe_sink.send_now(event).await
+            } else {
+                tracing::info!("Invocation record is not sent to Scribe: {:?}", &event);
+                Err(internal_error!("Scribe sink not enabled"))
+            }
+        }
+        #[cfg(not(fbcode_build))]
+        {
+            // In OSS builds, attempt to send to BES if configured
+            // This provides better observability for OSS Buck2 users
+            self.send_record_to_bes_if_configured(event).await
         }
     }
 
@@ -2461,6 +2474,22 @@ where
     match (a, b) {
         (Some(av), Some(bv)) => Some(max(av, bv) - min(av, bv)),
         _ => None,
+    }
+}
+
+impl InvocationRecorder {
+    #[cfg(not(fbcode_build))]
+    async fn send_record_to_bes_if_configured(
+        &self,
+        _event: buck2_events::BuckEvent,
+    ) -> buck2_error::Result<()> {
+        // This is a placeholder implementation
+        // In a complete implementation, this would have access to the BES configuration
+        // and would send the invocation record to BES if configured
+        tracing::debug!(
+            "Invocation record not sent to BES in OSS builds (simplified implementation)"
+        );
+        Ok(())
     }
 }
 

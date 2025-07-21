@@ -36,7 +36,9 @@ use buck2_event_log::read::EventLogPathBuf;
 use buck2_event_log::read::EventLogSummary;
 use buck2_events::BuckEvent;
 use buck2_events::sink::remote::RemoteEventSink;
+#[cfg(fbcode_build)]
 use buck2_events::sink::remote::ScribeConfig;
+#[cfg(fbcode_build)]
 use buck2_events::sink::remote::new_remote_event_sink_if_enabled;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
 use buck2_fs::paths::abs_norm_path::AbsNormPathBuf;
@@ -581,10 +583,21 @@ async fn dispatch_event_to_scribe(
 }
 
 #[allow(unused_variables)] // Conditional compilation
-fn create_scribe_sink(ctx: &ClientCommandContext) -> buck2_error::Result<Option<RemoteEventSink>> {
+fn create_scribe_sink(
+    ctx: &ClientCommandContext<'_>,
+) -> buck2_error::Result<Option<RemoteEventSink>> {
     // TODO(swgiillespie) scribe_logging is likely the right feature for this, but we should be able to inject a sink
     // without using configurations at the call site
-    new_remote_event_sink_if_enabled(ctx.fbinit(), ScribeConfig::default())
+    #[cfg(fbcode_build)]
+    {
+        new_remote_event_sink_if_enabled(ctx.fbinit(), ScribeConfig::default().into())
+    }
+    #[cfg(not(fbcode_build))]
+    {
+        // In OSS builds, BES configuration is not available in rage context
+        // Skip remote event sink creation - rage command will still function
+        Ok(None)
+    }
 }
 
 async fn maybe_select_invocation(

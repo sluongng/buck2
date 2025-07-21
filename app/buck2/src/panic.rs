@@ -57,17 +57,25 @@ fn the_panic_hook(fb: FacebookInit, info: &PanicHookInfo) {
 mod imp {
     use std::collections::HashMap;
     use std::panic::PanicHookInfo;
+    #[cfg(not(fbcode_build))]
+    use std::time::SystemTime;
 
     use backtrace::Backtrace;
     use buck2_core::error::StructuredErrorOptions;
     use buck2_data::Location;
+    #[cfg(fbcode_build)]
     use buck2_events::BuckEvent;
     use buck2_events::daemon_id::get_daemon_id_for_panics;
     use buck2_events::metadata;
+    use buck2_events::sink::remote;
+    #[cfg(fbcode_build)]
     use buck2_events::sink::remote::ScribeConfig;
+    #[cfg(fbcode_build)]
     use buck2_events::sink::remote::new_remote_event_sink_if_enabled;
+    #[cfg(fbcode_build)]
     use buck2_util::threads::thread_spawn;
     use fbinit::FacebookInit;
+    #[cfg(fbcode_build)]
     use tokio::runtime::Builder;
 
     fn get_stack() -> Vec<buck2_data::structured_error::StackFrame> {
@@ -226,11 +234,13 @@ mod imp {
 
     /// Writes a representation of the given error (hard or soft) to Scribe
     fn write_to_scribe(fb: FacebookInit, data: buck2_data::StructuredError) {
+        #[cfg(fbcode_build)]
         use std::time::SystemTime;
 
         use buck2_core::facebook_only;
+        #[cfg(fbcode_build)]
         use buck2_data::InstantEvent;
-        use buck2_events::sink::remote;
+        #[cfg(fbcode_build)]
         use buck2_wrapper_common::invocation_id::TraceId;
 
         facebook_only();
@@ -238,41 +248,88 @@ mod imp {
             return;
         }
 
-        let sink = match new_remote_event_sink_if_enabled(fb, ScribeConfig::default()) {
-            #[allow(unreachable_patterns)]
-            Ok(Some(sink)) => sink,
-            _ => {
-                // We're already panicking and we can't connect to the scribe daemon? Things are bad and we're SOL.
-                return;
-            }
-        };
+        #[cfg(not(fbcode_build))]
+        let _ = fb;
 
-        // There are some dubious ways of acquiring a handle to the current Tokio runtime, if one exists, such as this
-        // one: https://docs.rs/tokio/latest/tokio/runtime/struct.Handle.html#method.current. However, there doesn't
-        // appear to be a good way to figure out if the thread we're running on is a tokio thread at all.
-        //
-        // Since this is the panic handler, and the panic handler runs in the context of the thread that panicked, we
-        // can make no assumptions about whether the thread we're on is a tokio thread. To flush the Scribe client,
-        // which is normally an async operation, we spawn a new thread, spawn a runtime on that, and await the flush
-        // on that thread.
-        //
-        // Note that if we fail to spawn a writer thread, then we just won't log.
-        let _err = thread_spawn("buck2-write-panic-to-scribe", move || {
-            let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-            let _res = runtime.block_on(
-                sink.send_now(BuckEvent::new(
-                    SystemTime::now(),
-                    TraceId::new(),
-                    None,
-                    None,
-                    InstantEvent {
-                        data: Some(data.into()),
-                    }
-                    .into(),
-                )),
-            );
-        })
-        .map_err(|_| ())
-        .and_then(|t| t.join().map_err(|_| ()));
+        #[cfg(fbcode_build)]
+        {
+            let sink = match new_remote_event_sink_if_enabled(fb, ScribeConfig::default().into()) {
+                #[allow(unreachable_patterns)]
+                Ok(Some(sink)) => sink,
+                _ => {
+                    // We're already panicking and we can't connect to the scribe daemon? Things are bad and we're SOL.
+                    return;
+                }
+            };
+
+            // There are some dubious ways of acquiring a handle to the current Tokio runtime, if one exists, such as this
+            // one: https://docs.rs/tokio/latest/tokio/runtime/struct.Handle.html#method.current. However, there doesn't
+            // appear to be a good way to figure out if the thread we're running on is a tokio thread at all.
+            //
+            // Since this is the panic handler, and the panic handler runs in the context of the thread that panicked, we
+            // can make no assumptions about whether the thread we're on is a tokio thread. To flush the Scribe client,
+            // which is normally an async operation, we spawn a new thread, spawn a runtime on that, and await the flush
+            // on that thread.
+            //
+            // Note that if we fail to spawn a writer thread, then we just won't log.
+            let _err = thread_spawn("buck2-write-panic-to-scribe", move || {
+                let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+                let _res = runtime.block_on(
+                    sink.send_now(BuckEvent::new(
+                        SystemTime::now(),
+                        TraceId::new(),
+                        None,
+                        None,
+                        InstantEvent {
+                            data: Some(data.into()),
+                        }
+                        .into(),
+                    )),
+                );
+            })
+            .map_err(|_| ())
+            .and_then(|t| t.join().map_err(|_| ()));
+        }
+
+        #[cfg(not(fbcode_build))]
+        {
+            // In OSS builds, write panic information to a local file
+            // This provides crash diagnostics without requiring BES configuration
+            write_panic_to_file(data);
+        }
+    }
+
+    #[cfg(not(fbcode_build))]
+    fn write_panic_to_file(data: buck2_data::StructuredError) {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+
+        // Try to write to buck2-panic.log in current directory
+        let panic_file = "buck2-panic.log";
+
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(panic_file)
+        {
+            Ok(mut file) => {
+                let timestamp = SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                let panic_entry = format!(
+                    "[{}] Buck2 Panic: {}\nDetails: {:?}\n---\n",
+                    timestamp, data.payload, data
+                );
+
+                if let Err(e) = file.write_all(panic_entry.as_bytes()) {
+                    eprintln!("Failed to write panic log to {}: {}", panic_file, e);
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to open panic log file {}: {}", panic_file, e);
+            }
+        }
     }
 }

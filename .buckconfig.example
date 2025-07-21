@@ -1,0 +1,56 @@
+# Example Buck2 configuration for Build Event Service (BES)
+# Copy this to .buckconfig and modify as needed
+
+[buck2_bes]
+# BES endpoint URL (required to enable BES)
+# BES is automatically enabled when endpoint is provided, unless explicitly disabled
+endpoint = https://bes.example.com/google.devtools.build.v1.PublishBuildToolEventStream
+
+# Explicitly enable/disable BES (optional, defaults to true when endpoint is provided)
+# enabled = true
+
+# Project identifier (optional, defaults to "buck2")
+project = my-project
+
+# Build identifier (optional, supports environment variables, auto-generated if not provided)
+build_id = ${BUILD_ID}
+
+# Invocation identifier (optional, supports environment variables, auto-generated if not provided)
+invocation_id = ${INVOCATION_ID}
+
+# Buffer size for batching events (optional, default: 100)
+buffer_size = 100
+
+# Number of retry attempts for failed requests (optional, default: 3)
+retry_attempts = 3
+
+# Use TLS encryption (optional, default: true, auto-detected from endpoint scheme)
+tls = true
+
+# Connection timeout in milliseconds (optional)
+connection_timeout_ms = 5000
+
+# Request timeout in milliseconds (optional)
+request_timeout_ms = 30000
+
+# Additional HTTP headers (optional, comma-separated list of "Header: Value" pairs)
+# Supports environment variable expansion
+http_headers = Authorization: Bearer ${BES_TOKEN}, X-Custom-Header: value
+
+# Message size limit in bytes (optional, default: 1048576 = 1MB)
+message_size_limit = 1048576
+
+# Maximum batch size for events (optional, default: 1000)
+max_batch_size = 1000
+
+# Example with localhost for development/testing:
+# endpoint = http://localhost:8080/google.devtools.build.v1.PublishBuildToolEventStream
+# project = buck2-local-dev
+# tls = false
+
+# Notes:
+# - BES is enabled when 'endpoint' is provided, unless 'enabled = false'
+# - Environment variables in ${VAR} format are expanded at runtime
+# - Auto-generated IDs are used when build_id/invocation_id aren't provided
+# - TLS is auto-detected from endpoint scheme (https = true, http = false)
+# - This configuration is only used in OSS builds (fbcode uses Scribe)
