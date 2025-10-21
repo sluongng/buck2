@@ -18,6 +18,10 @@ use buck2_common::invocation_roots::InvocationRoots;
 use buck2_common::invocation_roots::find_invocation_roots;
 use buck2_common::legacy_configs::cells::BuckConfigBasedCells;
 use buck2_core::buck2_env;
+#[cfg(not(fbcode_build))]
+use buck2_bes_configuration::BesConfiguration;
+#[cfg(not(fbcode_build))]
+use buck2_bes_configuration::bes_config_from_legacy;
 use buck2_core::cells::CellAliasResolver;
 use buck2_core::cells::CellResolver;
 use buck2_core::cells::cell_path::CellPathRef;
@@ -36,6 +40,8 @@ struct ImmediateConfig {
     cell_resolver: CellResolver,
     cwd_cell_alias_resolver: CellAliasResolver,
     daemon_startup_config: DaemonStartupConfig,
+    #[cfg(not(fbcode_build))]
+    bes_configuration: BesConfiguration,
 }
 
 impl ImmediateConfig {
@@ -58,6 +64,9 @@ impl ImmediateConfig {
             cwd_cell_alias_resolver,
             daemon_startup_config: DaemonStartupConfig::new(&cells.root_config)
                 .buck_error_context("Error loading daemon startup config")?,
+            #[cfg(not(fbcode_build))]
+            bes_configuration: bes_config_from_legacy(&cells.root_config)
+                .buck_error_context("Error loading BES configuration")?,
         })
     }
 }
@@ -69,6 +78,8 @@ struct ImmediateConfigContextData {
     cwd_cell_alias_resolver: CellAliasResolver,
     daemon_startup_config: DaemonStartupConfig,
     project_filesystem: ProjectRoot,
+    #[cfg(not(fbcode_build))]
+    bes_configuration: BesConfiguration,
 }
 
 pub struct ImmediateConfigContext<'a> {
@@ -101,6 +112,11 @@ impl<'a> ImmediateConfigContext<'a> {
 
     pub fn daemon_startup_config(&self) -> buck2_error::Result<&DaemonStartupConfig> {
         Ok(&self.data()?.daemon_startup_config)
+    }
+
+    #[cfg(not(fbcode_build))]
+    pub fn bes_configuration(&self) -> buck2_error::Result<&BesConfiguration> {
+        Ok(&self.data()?.bes_configuration)
     }
 
     /// Resolves a cell path (i.e., contains `//`) into an absolute path. The cell path must have
@@ -171,6 +187,8 @@ impl<'a> ImmediateConfigContext<'a> {
                     cwd_cell_alias_resolver: cfg.cwd_cell_alias_resolver,
                     daemon_startup_config,
                     project_filesystem: roots.project_root,
+                    #[cfg(not(fbcode_build))]
+                    bes_configuration: cfg.bes_configuration,
                 })
             })
             .buck_error_context("Error creating cell resolver")

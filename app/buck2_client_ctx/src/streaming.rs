@@ -315,9 +315,18 @@ fn get_build_graph_stats<T: StreamingCommand>(
     ctx: &ClientCommandContext,
 ) -> Option<Box<dyn EventSubscriber>> {
     if should_handle_build_graph_stats(cmd) {
+        #[cfg(not(fbcode_build))]
+        let bes_configuration = ctx
+            .immediate_config
+            .bes_configuration()
+            .ok()
+            .cloned();
+
         Some(Box::new(BuildGraphStats::new(
             ctx.fbinit(),
             ctx.trace_id.dupe(),
+            #[cfg(not(fbcode_build))]
+            bes_configuration,
         )))
     } else {
         None
