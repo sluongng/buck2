@@ -14,12 +14,10 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 #[cfg(not(fbcode_build))]
+use buck2_bes_configuration::BesConfiguration;
+#[cfg(not(fbcode_build))]
 use buck2_bes_configuration::BesConfigurationImpl;
-#[cfg(not(fbcode_build))]
-use buck2_bes_configuration::bes_config_from_legacy;
 use buck2_cli_proto::command_result;
-#[cfg(not(fbcode_build))]
-use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 #[cfg(not(fbcode_build))]
 use buck2_events::EventSink;
 #[cfg(not(fbcode_build))]
@@ -38,11 +36,22 @@ pub struct BuildGraphStats {
     #[allow(dead_code)] // Used in fbcode builds
     fb: FacebookInit,
     trace_id: TraceId,
+    #[cfg(not(fbcode_build))]
+    bes_config: Option<BesConfiguration>,
 }
 
 impl BuildGraphStats {
-    pub fn new(fb: FacebookInit, trace_id: TraceId) -> Self {
-        Self { fb, trace_id }
+    pub fn new(
+        fb: FacebookInit,
+        trace_id: TraceId,
+        #[cfg(not(fbcode_build))] bes_config: Option<BesConfiguration>,
+    ) -> Self {
+        Self {
+            fb,
+            trace_id,
+            #[cfg(not(fbcode_build))]
+            bes_config,
+        }
     }
 
     async fn handle_build_response(
@@ -127,9 +136,7 @@ impl BuildGraphStats {
         &self,
         events: Vec<buck2_events::BuckEvent>,
     ) -> buck2_error::Result<()> {
-        // Try to load BES configuration from environment or default locations
-        // This is a best-effort approach since we don't have direct access to BuckConfig here
-        if let Ok(bes_config) = self.try_load_bes_config() {
+        if let Some(bes_config) = &self.bes_config {
             if bes_config.is_enabled() {
                 if let Some((endpoint, project, build_id, invocation_id)) =
                     bes_config.get_bes_config_values(Some(&self.trace_id.to_string()))
@@ -159,17 +166,6 @@ impl BuildGraphStats {
             }
         }
         Ok(())
-    }
-
-    #[cfg(not(fbcode_build))]
-    fn try_load_bes_config(
-        &self,
-    ) -> buck2_error::Result<buck2_bes_configuration::BesConfiguration> {
-        // Since we don't have direct access to BuckConfig, try to load from environment
-        // This is a simplified approach - in a full implementation, this would be passed
-        // from the context that has access to the configuration
-        let config = LegacyBuckConfig::empty(); // Placeholder - would be actual config
-        bes_config_from_legacy(&config)
     }
 }
 
@@ -213,7 +209,12 @@ mod tests {
         };
 
         let uuid = TraceId::new();
-        let handler = BuildGraphStats::new(fb, uuid.dupe());
+        let handler = BuildGraphStats::new(
+            fb,
+            uuid.dupe(),
+            #[cfg(not(fbcode_build))]
+            None,
+        );
         let events = handler.build_graph_stats_from_build_response(&res);
 
         let event_expected = buck2_data::BuckEvent {
@@ -253,7 +254,12 @@ mod tests {
         };
 
         let uuid = TraceId::new();
-        let handler = BuildGraphStats::new(fb, uuid.dupe());
+        let handler = BuildGraphStats::new(
+            fb,
+            uuid.dupe(),
+            #[cfg(not(fbcode_build))]
+            None,
+        );
         let events = handler.build_graph_stats_from_build_response(&res);
 
         assert_eq!(events.len(), 0);
@@ -280,7 +286,12 @@ mod tests {
         };
 
         let uuid = TraceId::new();
-        let handler = BuildGraphStats::new(fb, uuid.dupe());
+        let handler = BuildGraphStats::new(
+            fb,
+            uuid.dupe(),
+            #[cfg(not(fbcode_build))]
+            None,
+        );
         let events = handler.build_graph_stats_from_build_response(&res);
 
         let build_target = buck2_data::BuildTarget {

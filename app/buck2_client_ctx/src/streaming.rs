@@ -330,6 +330,8 @@ fn get_build_graph_stats<T: StreamingCommand>(
         Some(Box::new(BuildGraphStats::new(
             ctx.fbinit(),
             ctx.trace_id.dupe(),
+            #[cfg(not(fbcode_build))]
+            ctx.immediate_config.bes_config().ok(),
         )))
     } else {
         None
