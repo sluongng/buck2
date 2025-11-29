@@ -13,6 +13,10 @@ buck = none
 [external_cells]
   prelude = bundled
 
-
 [parser]
 target_platform_detector_spec = target:root//...->prelude//platforms:default
+
+[buck2_bes]
+endpoint = grpc://localhost:1985
+tls = false
+project = hello_world_test

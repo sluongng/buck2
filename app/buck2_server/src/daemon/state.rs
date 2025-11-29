@@ -86,6 +86,7 @@ use remote::BesConfig;
 use remote::ScribeConfig;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::active_commands::ActiveCommandDropGuard;
 use crate::ctx::BaseServerCommandContext;
@@ -366,21 +367,16 @@ impl DaemonState {
                     section: "buck2_bes",
                     property: "build_id",
                 })?;
-                let bes_invocation_id: Option<String> = root_config.parse(BuckconfigKeyRef {
-                    section: "buck2_bes",
-                    property: "invocation_id",
-                })?;
 
                 // Only create BES sink if endpoint is configured
                 if let Some(endpoint) = bes_endpoint {
                     let project = bes_project.unwrap_or_else(|| "buck2-daemon".to_string());
-                    let build_id = bes_build_id.unwrap_or_else(|| "daemon-build".to_string());
-                    let invocation_id =
-                        bes_invocation_id.unwrap_or_else(|| "daemon-invocation".to_string());
+                    // If build_id is not provided, generate a new UUID for it.
+                    let build_id = bes_build_id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
                     Self::init_bes_sink(
                         fb,
-                        BesConfig::new(endpoint, project, build_id, invocation_id),
+                        BesConfig::new(endpoint, project, build_id.clone(), build_id),
                     )
                     .buck_error_context("failed to init BES sink")?
                 } else {
