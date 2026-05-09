@@ -14,6 +14,8 @@ use std::sync::atomic::Ordering;
 
 use fbinit::FacebookInit;
 
+#[cfg(not(fbcode_build))]
+pub use crate::sink::scribe::BesEventFormat;
 pub use crate::sink::scribe::RemoteEventConfig;
 pub use crate::sink::scribe::RemoteEventSink;
 pub(crate) use crate::sink::scribe::scribe_category;
