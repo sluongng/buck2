@@ -14,6 +14,7 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use buck2_action_metadata_proto::REMOTE_DEP_FILE_KEY;
+use buck2_common::file_ops::metadata::Symlink;
 use buck2_common::file_ops::metadata::TrackedFileDigest;
 use buck2_core::buck2_env;
 use buck2_core::execution_types::executor_config::RePlatformFields;
@@ -52,6 +53,7 @@ use remote_execution::TDirectory2;
 use remote_execution::TExecutedActionMetadata;
 use remote_execution::TFile;
 use remote_execution::TStatus;
+use remote_execution::TSymlink;
 use remote_execution::TTimestamp;
 
 use crate::executors::action_cache_upload_permission_checker::ActionCacheUploadPermissionChecker;
@@ -375,6 +377,7 @@ impl CacheUploader {
         let mut upload_futs = vec![];
         let mut output_files: Vec<TFile> = Vec::new();
         let mut output_directories: Vec<TDirectory2> = Vec::new();
+        let mut output_symlinks: Vec<TSymlink> = Vec::new();
 
         // Precompute the action_id string once since it's the same for all directory uploads.
         let action_id = action_digest.raw_digest().to_string();
@@ -467,14 +470,16 @@ impl CacheUploader {
                     upload_futs.push(fut.boxed());
                     tree_digests.push(tree_digest);
                 }
-                DirectoryEntry::Leaf(
-                    ActionDirectoryMember::Symlink(..) | ActionDirectoryMember::ExternalSymlink(..),
-                ) => {
-                    // Bail, there is something that is not a file here and we don't handle this.
-                    // This will happen if the value is a symlink. The primary output of a command
-                    // being a symlink is probably unlikely. Unfortunately, we can't represent this
-                    // in RE's action output, so we either have to lie about the output and pretend
-                    // it's a file, or bail.
+                DirectoryEntry::Leaf(ActionDirectoryMember::Symlink(symlink)) => {
+                    output_symlinks.push(symlink_output_to_re(
+                        output.path().to_string(),
+                        symlink.as_ref(),
+                    ));
+                }
+                DirectoryEntry::Leaf(ActionDirectoryMember::ExternalSymlink(..)) => {
+                    // Buck's remote output materializer only accepts relative
+                    // output symlink targets, so do not upload an ActionResult
+                    // that this client cannot consume on a later cache hit.
                     return Ok(Err(CacheUploadOutcome::RejectedSymlinkOutput));
                 }
             }
@@ -524,6 +529,7 @@ impl CacheUploader {
             stdout_digest,
             stderr_raw,
             stderr_digest,
+            output_symlinks,
             execution_metadata: TExecutedActionMetadata {
                 worker,
                 execution_dir: "".to_owned(),
@@ -540,6 +546,14 @@ impl CacheUploader {
         };
 
         Ok(Ok(result))
+    }
+}
+
+fn symlink_output_to_re(name: String, symlink: &Symlink) -> TSymlink {
+    TSymlink {
+        name,
+        target: symlink.target().as_str().to_owned(),
+        ..Default::default()
     }
 }
 
@@ -696,6 +710,16 @@ mod tests {
             CacheUploadOutcome::RejectedPermissionDenied { .. }
         ));
         assert!(outcome.error().contains("action-cache updates"));
+    }
+
+    #[test]
+    fn test_symlink_output_converts_to_action_result() {
+        let symlink = Symlink::new("dir/file".into());
+
+        let output_symlink = symlink_output_to_re("out/link".to_owned(), &symlink);
+
+        assert_eq!("out/link", output_symlink.name);
+        assert_eq!("dir/file", output_symlink.target);
     }
 
     #[test]
