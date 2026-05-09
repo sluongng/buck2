@@ -313,18 +313,18 @@ impl Uploader {
                     }
                     Err(
                         ref err @ ArtifactNotMaterializedReason::RequiresCasDownload {
+                            ref path,
                             ref entry,
                             ref info,
-                            ..
                         },
                     ) => {
                         if let DirectoryEntry::Leaf(ActionDirectoryMember::File(file)) =
                             entry.as_ref()
                         {
-                            // NOTE: find_missing has negative caching, so when we query to know if an
-                            // artifact was uploaded, if it was the result of an action we just ran, it
-                            // won't be here. On the flip side, if a digest has been in the CAS for
-                            // a very long time, it might have expired.
+                            // NOTE: FindMissingBlobs can report an artifact missing even when Buck
+                            // can still materialize it locally from the deferred materializer.
+                            // On the flip side, if a digest has been in the CAS for a very long
+                            // time, it might have expired.
                             if file.digest.to_re() == digest {
                                 if should_error_for_missing_digest(info) {
                                     soft_error!(
@@ -362,6 +362,15 @@ impl Uploader {
                                     quiet: true
                                 )?;
 
+                                // Materialize this file from CAS and include it in this upload.
+                                // Skipping it would leave the downstream action with an
+                                // incomplete input set after FindMissingBlobs reported it absent.
+                                paths_to_materialize.push(path.clone());
+                                upload_files.push(NamedDigest {
+                                    name: fs.resolve(path).as_maybe_relativized_str()?.to_owned(),
+                                    digest,
+                                    ..Default::default()
+                                });
                                 continue;
                             }
                         }
@@ -436,7 +445,7 @@ impl Uploader {
                 client.get_session_id(),
                 client.get_raw_re_client()
                     .upload(
-                        &use_case.metadata(identity),
+                        use_case.metadata(identity),
                         UploadRequest {
                             files_with_digest: Some(upload_files),
                             inlined_blobs_with_digest: Some(upload_blobs),
