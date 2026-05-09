@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::AtomicU64;
@@ -42,6 +43,9 @@ use tonic::Status;
 use tonic::metadata::MetadataKey;
 use tonic::metadata::MetadataValue;
 
+use crate::sink::bazel_converter::BazelEventConverter;
+use crate::sink::bazel_converter::encode_bep_event;
+
 const BUCK2_EVENT_TYPE_URL: &str = "type.googleapis.com/buck.data.BuckEvent";
 const DEFAULT_BATCH_SIZE: usize = 1;
 const CLOSE_ACK_TIMEOUT_MULTIPLIER: u32 = 30;
@@ -58,6 +62,14 @@ pub struct BesConfig {
     pub grpc_timeout: Duration,
     pub bes_backend: Option<String>,
     pub bes_headers: Vec<(String, String)>,
+    pub event_format: BesEventFormat,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BesEventFormat {
+    #[default]
+    Buck,
+    Bazel,
 }
 
 impl Default for BesConfig {
@@ -70,6 +82,7 @@ impl Default for BesConfig {
             grpc_timeout: Duration::from_secs(2),
             bes_backend: None,
             bes_headers: Vec::new(),
+            event_format: BesEventFormat::Buck,
         }
     }
 }
@@ -79,6 +92,22 @@ impl BesConfig {
         self.bes_backend
             .as_deref()
             .is_some_and(|backend| !backend.trim().is_empty())
+    }
+}
+
+impl FromStr for BesEventFormat {
+    type Err = buck2_error::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "buck" => Ok(Self::Buck),
+            "bazel" => Ok(Self::Bazel),
+            value => Err(buck2_error::buck2_error!(
+                ErrorTag::Input,
+                "Invalid `bes.event_format` value `{}` (expected `buck` or `bazel`)",
+                value
+            )),
+        }
     }
 }
 
@@ -502,7 +531,7 @@ impl WorkerState {
                 .streams
                 .get_mut(&parsed.invocation_id)
                 .expect("stream was inserted");
-            sequence_number = stream.enqueue_event(&parsed);
+            sequence_number = stream.enqueue_event(&parsed, self.config.event_format);
             close_immediately = parsed.is_invocation_record;
 
             if parsed.is_command_end {
@@ -543,7 +572,9 @@ impl WorkerState {
                         }
                     } else {
                         self.counters.inc_success(parsed.payload_size as u64);
-                        return Ok(Some((parsed.invocation_id.clone(), sequence_number)));
+                        return Ok(sequence_number.map(|sequence_number| {
+                            (parsed.invocation_id.clone(), sequence_number)
+                        }));
                     }
                 }
                 Err(status) => {
@@ -853,6 +884,7 @@ struct StreamState {
     ack_task: Option<tokio::task::JoinHandle<Result<(), Status>>>,
     project_id: String,
     pending_unacked: VecDeque<PublishBuildToolEventStreamRequest>,
+    bazel_converter: BazelEventConverter,
     last_sent_sequence_number: i64,
     saw_command_end: bool,
     pending_close: Option<PendingClose>,
@@ -878,6 +910,7 @@ impl StreamState {
             ack_task: None,
             project_id: parsed.project_id.clone(),
             pending_unacked: VecDeque::new(),
+            bazel_converter: BazelEventConverter::default(),
             last_sent_sequence_number: 0,
             saw_command_end: false,
             pending_close: None,
@@ -885,14 +918,33 @@ impl StreamState {
         }
     }
 
-    fn enqueue_event(&mut self, parsed: &ParsedMessage) -> i64 {
-        self.enqueue_raw_event(BuildEvent {
-            event_time: parsed.event_time.clone(),
-            event: Some(build_event::Event::ExperimentalBuildToolEvent(Any {
-                type_url: BUCK2_EVENT_TYPE_URL.to_owned(),
-                value: parsed.payload.clone(),
+    fn enqueue_event(
+        &mut self,
+        parsed: &ParsedMessage,
+        event_format: BesEventFormat,
+    ) -> Option<i64> {
+        match event_format {
+            BesEventFormat::Buck => Some(self.enqueue_raw_event(BuildEvent {
+                event_time: parsed.event_time.clone(),
+                event: Some(build_event::Event::ExperimentalBuildToolEvent(Any {
+                    type_url: BUCK2_EVENT_TYPE_URL.to_owned(),
+                    value: parsed.payload.clone(),
+                })),
             })),
-        })
+            BesEventFormat::Bazel => {
+                let events = self
+                    .bazel_converter
+                    .convert(self.next_sequence_number, &parsed.buck_event);
+                let mut last_sequence_number = None;
+                for event in events {
+                    last_sequence_number = Some(self.enqueue_raw_event(BuildEvent {
+                        event_time: parsed.event_time.clone(),
+                        event: Some(build_event::Event::BazelEvent(encode_bep_event(&event))),
+                    }));
+                }
+                last_sequence_number
+            }
+        }
     }
 
     fn enqueue_raw_event(&mut self, event: BuildEvent) -> i64 {
@@ -1006,6 +1058,7 @@ struct ParsedMessage {
     invocation_id: String,
     project_id: String,
     event_time: Option<Timestamp>,
+    buck_event: buck2_data::BuckEvent,
     payload: Vec<u8>,
     payload_size: usize,
     is_command_end: bool,
@@ -1029,15 +1082,20 @@ impl ParsedMessage {
             uuid::Uuid::new_v4().to_string()
         };
 
+        let event_time = event.timestamp.clone();
+        let is_command_end = is_command_end(&event);
+        let is_invocation_record = is_invocation_record(&event);
+
         Ok(Self {
             build_id: event_id.clone(),
             invocation_id: event_id,
             project_id: message.category.clone(),
-            event_time: event.timestamp,
+            event_time,
+            buck_event: event,
             payload_size: message.message.len(),
             payload: message.message.clone(),
-            is_command_end: is_command_end(&event),
-            is_invocation_record: is_invocation_record(&event),
+            is_command_end,
+            is_invocation_record,
         })
     }
 }
@@ -1282,6 +1340,57 @@ mod tests {
                 endpoint
             );
         }
+    }
+
+    #[test]
+    fn event_format_defaults_to_buck() {
+        assert_eq!(BesConfig::default().event_format, BesEventFormat::Buck);
+    }
+
+    #[test]
+    fn event_format_parses_supported_values() {
+        assert_eq!(
+            "buck".parse::<BesEventFormat>().unwrap(),
+            BesEventFormat::Buck
+        );
+        assert_eq!(
+            "bazel".parse::<BesEventFormat>().unwrap(),
+            BesEventFormat::Bazel
+        );
+        assert_eq!(
+            " bazel ".parse::<BesEventFormat>().unwrap(),
+            BesEventFormat::Bazel
+        );
+    }
+
+    #[test]
+    fn event_format_rejects_unknown_values() {
+        let err = "Bazel".parse::<BesEventFormat>().unwrap_err();
+        assert!(err.to_string().contains("expected `buck` or `bazel`"));
+    }
+
+    #[test]
+    fn bazel_enqueue_returns_highest_emitted_sequence_number() {
+        let message = make_message(
+            Some(&TraceId::new().to_string()),
+            Some(1),
+            command_start_data(),
+        );
+        let parsed = ParsedMessage::from_message(&message).expect("valid message");
+        let mut stream = StreamState::new(&parsed);
+
+        let last_sequence = stream.enqueue_event(&parsed, BesEventFormat::Bazel);
+
+        assert_eq!(last_sequence, Some(2));
+        assert_eq!(stream.pending_unacked.len(), 2);
+        assert_eq!(request_sequence_number(&stream.pending_unacked[0]), 1);
+        assert_eq!(request_sequence_number(&stream.pending_unacked[1]), 2);
+        let event = stream.pending_unacked[0]
+            .ordered_build_event
+            .as_ref()
+            .and_then(|ordered| ordered.event.as_ref())
+            .and_then(|event| event.event.as_ref());
+        assert!(matches!(event, Some(build_event::Event::BazelEvent(_))));
     }
 
     #[tokio::test]
