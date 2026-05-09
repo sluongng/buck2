@@ -370,14 +370,11 @@ impl ManagedRemoteExecutionClient {
         action_digest: ActionDigest,
         platform: &RE::Platform,
     ) -> buck2_error::Result<Option<ActionResultResponse>> {
-        Ok(self
-            .lock()?
+        self.lock()?
             .get()
             .await?
             .action_cache(action_digest, self.use_case, platform)
             .await
-            .ok()
-            .flatten())
     }
 
     pub async fn upload(
