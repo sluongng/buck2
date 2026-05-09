@@ -16,3 +16,24 @@ buck = none
 
 [parser]
 target_platform_detector_spec = target:root//...->prelude//platforms:default
+
+[bes]
+# Equivalent to Bazel's --bes_results_url
+results_url = http://localhost:8080/invocation/
+# Equivalent to Bazel's --bes_backend
+backend = grpc://localhost:1985
+# Send Bazel BEP payloads so BuildBuddy master can render Buck2 invocations
+# without BuckEvent-specific server support.
+event_format = bazel
+
+[buck2_re_client]
+# BuildBuddy local server gRPC endpoint (CAS / AC / Execution APIs)
+engine_address = grpc://localhost:1985
+action_cache_address = grpc://localhost:1985
+cas_address = grpc://localhost:1985
+instance_name = hello-world-rbe-reset-20260210-v10
+tls = false
+
+[build]
+# BuildBuddy-backed remote execution (configured in //platforms)
+execution_platforms = root//platforms:buildbuddy-rbe
