@@ -42,8 +42,23 @@ pub(crate) fn smart_truncate_event(d: &mut buck2_data::buck_event::Data) {
         }
         Data::Instant(inst) => {
             use buck2_data::instant_event::Data;
-            if let Some(Data::TargetPatterns(target_patterns)) = &mut inst.data {
-                truncate_target_patterns(&mut target_patterns.target_patterns);
+            match &mut inst.data {
+                Some(Data::TargetPatterns(target_patterns)) => {
+                    truncate_target_patterns(&mut target_patterns.target_patterns);
+                }
+                Some(Data::ConsoleMessage(console_message)) => {
+                    console_message.message = truncate(&console_message.message, 20 * 1024);
+                }
+                Some(Data::ConsoleWarning(console_warning)) => {
+                    console_warning.message = truncate(&console_warning.message, 20 * 1024);
+                }
+                Some(Data::StreamingOutput(streaming_output)) => {
+                    streaming_output.message = truncate(&streaming_output.message, 20 * 1024);
+                }
+                Some(Data::ActionError(action_error)) => {
+                    truncate_action_error(action_error);
+                }
+                _ => {}
             }
         }
         Data::Record(rec) => {
@@ -222,6 +237,29 @@ fn truncate_target_patterns(target_patterns: &mut Vec<buck2_data::TargetPattern>
     }
 }
 
+fn truncate_action_error(action_error: &mut buck2_data::ActionError) {
+    if let Some(error) = &mut action_error.error {
+        match error {
+            buck2_data::action_error::Error::Unknown(msg) => {
+                *msg = truncate(&console::strip_ansi_codes(msg), 20 * 1024);
+            }
+            buck2_data::action_error::Error::MissingOutputs(missing) => {
+                missing.message = truncate(&missing.message, 20 * 1024);
+            }
+            buck2_data::action_error::Error::CommandExecutionError(..) => {}
+        }
+    }
+
+    if let Some(command) = &mut action_error.last_command {
+        if let Some(details) = &mut command.details {
+            details.cmd_stdout =
+                truncate(&console::strip_ansi_codes(&details.cmd_stdout), 20 * 1024);
+            details.cmd_stderr =
+                truncate(&console::strip_ansi_codes(&details.cmd_stderr), 20 * 1024);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::sink::smart_truncate_event::smart_truncate_event;
@@ -276,6 +314,20 @@ mod tests {
         buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
             data: Some(buck2_data::span_end_event::Data::TestDiscovery(data)),
             ..Default::default()
+        })
+    }
+
+    fn make_console_message(data: buck2_data::ConsoleMessage) -> buck2_data::buck_event::Data {
+        buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
+            data: Some(buck2_data::instant_event::Data::ConsoleMessage(data)),
+        })
+    }
+
+    fn make_streaming_output(
+        data: buck2_data::StdoutStreamingOutput,
+    ) -> buck2_data::buck_event::Data {
+        buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
+            data: Some(buck2_data::instant_event::Data::StreamingOutput(data)),
         })
     }
 
@@ -624,6 +676,48 @@ mod tests {
             .map(|e| e.message.len() + e.telemetry_message.map_or(0, |s| s.len()))
             .sum::<usize>();
         assert!(size < 500 * 1024);
+    }
+
+    #[test]
+    fn smart_truncate_console_message_long_payload_truncated() {
+        let original = "0123456789".repeat(3 * 1024);
+        let mut event_data = make_console_message(buck2_data::ConsoleMessage {
+            message: original.clone(),
+        });
+
+        smart_truncate_event(&mut event_data);
+
+        let buck2_data::buck_event::Data::Instant(event) = event_data else {
+            unreachable!()
+        };
+        let Some(buck2_data::instant_event::Data::ConsoleMessage(console_message)) = event.data
+        else {
+            unreachable!()
+        };
+        assert!(console_message.message.len() <= 20 * 1024);
+        assert_ne!(console_message.message, original);
+        assert!(console_message.message.contains("<<omitted>>"));
+    }
+
+    #[test]
+    fn smart_truncate_streaming_output_long_payload_truncated() {
+        let original = "0123456789".repeat(3 * 1024);
+        let mut event_data = make_streaming_output(buck2_data::StdoutStreamingOutput {
+            message: original.clone(),
+        });
+
+        smart_truncate_event(&mut event_data);
+
+        let buck2_data::buck_event::Data::Instant(event) = event_data else {
+            unreachable!()
+        };
+        let Some(buck2_data::instant_event::Data::StreamingOutput(streaming_output)) = event.data
+        else {
+            unreachable!()
+        };
+        assert!(streaming_output.message.len() <= 20 * 1024);
+        assert_ne!(streaming_output.message, original);
+        assert!(streaming_output.message.contains("<<omitted>>"));
     }
 
     #[test]
