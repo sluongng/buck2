@@ -33,15 +33,20 @@ use buck2_data::record_event;
 use buck2_data::span_end_event;
 use buck2_error::ErrorTag;
 use fbinit::FacebookInit;
+use google_grpc_proto::google::bytestream::WriteRequest;
+use google_grpc_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use prost::Message as _;
 use prost_types::Any;
 use prost_types::Timestamp;
+use sha2::Digest as _;
+use sha2::Sha256;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 use tonic::metadata::MetadataKey;
 use tonic::metadata::MetadataValue;
+use tonic::transport::Channel;
 
 use crate::sink::bazel_converter::BazelEventConverter;
 use crate::sink::bazel_converter::encode_bep_event;
@@ -52,6 +57,7 @@ const CLOSE_ACK_TIMEOUT_MULTIPLIER: u32 = 30;
 const MIN_CLOSE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_END_CLOSE_GRACE: Duration = Duration::from_millis(500);
 const COMMAND_END_CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const DEFAULT_BAZEL_ARTIFACT_UPLOAD_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct BesConfig {
@@ -63,6 +69,11 @@ pub struct BesConfig {
     pub bes_backend: Option<String>,
     pub bes_headers: Vec<(String, String)>,
     pub event_format: BesEventFormat,
+    pub bazel_artifact_upload: bool,
+    pub bazel_artifact_upload_backend: Option<String>,
+    pub bazel_artifact_upload_instance_name: Option<String>,
+    pub bazel_artifact_uri_authority: Option<String>,
+    pub bazel_artifact_upload_max_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -83,6 +94,11 @@ impl Default for BesConfig {
             bes_backend: None,
             bes_headers: Vec::new(),
             event_format: BesEventFormat::Buck,
+            bazel_artifact_upload: false,
+            bazel_artifact_upload_backend: None,
+            bazel_artifact_upload_instance_name: None,
+            bazel_artifact_uri_authority: None,
+            bazel_artifact_upload_max_bytes: DEFAULT_BAZEL_ARTIFACT_UPLOAD_MAX_BYTES,
         }
     }
 }
@@ -227,6 +243,260 @@ impl CounterState {
 struct ConnectionConfig {
     endpoint: String,
     headers: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug)]
+struct BazelArtifactUploadConfig {
+    endpoint: String,
+    headers: Vec<(String, String)>,
+    instance_name: String,
+    uri_authority: String,
+    max_bytes: usize,
+    grpc_timeout: Duration,
+}
+
+impl BazelArtifactUploadConfig {
+    fn from_bes(
+        config: &BesConfig,
+        connection: &ConnectionConfig,
+    ) -> buck2_error::Result<Option<Self>> {
+        if config.event_format != BesEventFormat::Bazel || !config.bazel_artifact_upload {
+            return Ok(None);
+        }
+        let endpoint = match config.bazel_artifact_upload_backend.as_deref() {
+            Some(backend) => bes_backend(Some(backend))?,
+            None => connection.endpoint.clone(),
+        };
+        let uri_authority = config
+            .bazel_artifact_uri_authority
+            .as_deref()
+            .map(str::trim)
+            .filter(|authority| !authority.is_empty())
+            .map(str::to_owned)
+            .or_else(|| endpoint_authority(&endpoint))
+            .unwrap_or_default();
+        if uri_authority.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            endpoint,
+            headers: connection.headers.clone(),
+            instance_name: config
+                .bazel_artifact_upload_instance_name
+                .clone()
+                .unwrap_or_default(),
+            uri_authority,
+            max_bytes: config.bazel_artifact_upload_max_bytes,
+            grpc_timeout: config.grpc_timeout,
+        }))
+    }
+}
+
+struct BazelArtifactUploader {
+    config: BazelArtifactUploadConfig,
+    client: Option<ByteStreamClient<Channel>>,
+}
+
+impl BazelArtifactUploader {
+    fn new(config: BazelArtifactUploadConfig) -> Self {
+        Self {
+            config,
+            client: None,
+        }
+    }
+
+    async fn upload_event_files(
+        &mut self,
+        event: &mut bazel_bep_proto::build_event_stream::BuildEvent,
+    ) {
+        use bazel_bep_proto::build_event_stream::build_event::Payload;
+
+        match event.payload.as_mut() {
+            Some(Payload::Action(action)) => {
+                upload_named_file(self, action.stdout.as_mut()).await;
+                upload_named_file(self, action.stderr.as_mut()).await;
+                #[allow(deprecated)]
+                for file in &mut action.action_metadata_logs {
+                    self.upload_file_if_inline(file).await;
+                }
+            }
+            Some(Payload::TestResult(result)) => {
+                for file in &mut result.test_action_output {
+                    self.upload_file_if_inline(file).await;
+                }
+            }
+            Some(Payload::TestSummary(summary)) => {
+                for file in &mut summary.passed {
+                    self.upload_file_if_inline(file).await;
+                }
+                for file in &mut summary.failed {
+                    self.upload_file_if_inline(file).await;
+                }
+            }
+            Some(Payload::BuildToolLogs(logs)) => {
+                for file in &mut logs.log {
+                    self.upload_file_if_inline(file).await;
+                }
+            }
+            Some(Payload::NamedSetOfFiles(files)) => {
+                for file in &mut files.files {
+                    self.add_uri_for_digest_file(file);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn upload_file_if_inline(
+        &mut self,
+        file: &mut bazel_bep_proto::build_event_stream::File,
+    ) {
+        let Some(bazel_bep_proto::build_event_stream::file::File::Contents(contents)) =
+            file.file.as_ref()
+        else {
+            return;
+        };
+        if file.name == "primary_output"
+            || contents.is_empty()
+            || contents.len() > self.config.max_bytes
+        {
+            return;
+        }
+        let contents = contents.clone();
+        let Some((uri, digest, len)) = self.upload_bytes(&contents).await else {
+            return;
+        };
+        file.file = Some(bazel_bep_proto::build_event_stream::file::File::Uri(uri));
+        file.digest = digest;
+        file.length = len;
+    }
+
+    fn add_uri_for_digest_file(&self, file: &mut bazel_bep_proto::build_event_stream::File) {
+        if file.file.is_some() {
+            return;
+        }
+        let Some((hash, size)) = file_digest_and_size(file) else {
+            return;
+        };
+        file.file = Some(bazel_bep_proto::build_event_stream::file::File::Uri(
+            bytestream_uri(
+                &self.config.uri_authority,
+                &self.config.instance_name,
+                hash,
+                size,
+            ),
+        ));
+        file.length = size;
+    }
+
+    async fn upload_bytes(&mut self, contents: &[u8]) -> Option<(String, String, i64)> {
+        let mut hasher = Sha256::new();
+        hasher.update(contents);
+        let hash = format!("{:x}", hasher.finalize());
+        let size = i64::try_from(contents.len()).ok()?;
+        let resource_name = upload_resource_name(&self.config.instance_name, &hash, size);
+        let request = WriteRequest {
+            resource_name,
+            write_offset: 0,
+            finish_write: true,
+            data: contents.to_vec(),
+        };
+        let response = self.write_request(request).await.ok()?;
+        if response.committed_size != size && response.committed_size != -1 {
+            return None;
+        }
+        let uri = bytestream_uri(
+            &self.config.uri_authority,
+            &self.config.instance_name,
+            &hash,
+            size,
+        );
+        Some((uri, format!("{hash}:{size}"), size))
+    }
+
+    async fn write_request(
+        &mut self,
+        request: WriteRequest,
+    ) -> Result<google_grpc_proto::google::bytestream::WriteResponse, Status> {
+        if self.client.is_none() {
+            let endpoint = tonic::transport::Endpoint::from_shared(self.config.endpoint.clone())
+                .map_err(|e| Status::internal(e.to_string()))?
+                .connect_timeout(self.config.grpc_timeout);
+            let channel = endpoint.connect().await.map_err(map_transport_error)?;
+            self.client = Some(ByteStreamClient::new(channel));
+        }
+        let client = self.client.as_mut().expect("client was initialized");
+        let outbound = tokio_stream::iter(vec![request]);
+        let mut request = tonic::Request::new(outbound);
+        for (header_key, header_value) in &self.config.headers {
+            let metadata_key = MetadataKey::from_bytes(header_key.as_bytes())
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            let metadata_value = MetadataValue::try_from(header_value.as_str())
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            request.metadata_mut().insert(metadata_key, metadata_value);
+        }
+        Ok(client.write(request).await?.into_inner())
+    }
+}
+
+async fn upload_named_file(
+    uploader: &mut BazelArtifactUploader,
+    file: Option<&mut bazel_bep_proto::build_event_stream::File>,
+) {
+    if let Some(file) = file {
+        uploader.upload_file_if_inline(file).await;
+    }
+}
+
+fn endpoint_authority(endpoint: &str) -> Option<String> {
+    let without_scheme = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint);
+    without_scheme
+        .split('/')
+        .next()
+        .map(str::trim)
+        .filter(|authority| !authority.is_empty())
+        .map(str::to_owned)
+}
+
+fn upload_resource_name(instance_name: &str, hash: &str, size: i64) -> String {
+    let prefix = if instance_name.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", instance_name.trim_matches('/'))
+    };
+    format!(
+        "{prefix}uploads/{}/blobs/{hash}/{size}",
+        uuid::Uuid::new_v4()
+    )
+}
+
+fn bytestream_uri(authority: &str, instance_name: &str, hash: &str, size: i64) -> String {
+    let prefix = if instance_name.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", instance_name.trim_matches('/'))
+    };
+    format!("bytestream://{authority}/{prefix}blobs/{hash}/{size}")
+}
+
+fn file_digest_and_size(file: &bazel_bep_proto::build_event_stream::File) -> Option<(&str, i64)> {
+    if file.digest.is_empty() {
+        return None;
+    }
+    if let Some((hash, size)) = file.digest.split_once(':') {
+        let size = size.parse::<i64>().ok()?;
+        if hash.is_empty() || size < 0 {
+            return None;
+        }
+        Some((hash, size))
+    } else if file.length >= 0 {
+        Some((file.digest.as_str(), file.length))
+    } else {
+        None
+    }
 }
 
 pub struct BesClient {
@@ -521,7 +791,10 @@ impl WorkerState {
             }
         };
 
-        self.ensure_stream_exists(&parsed);
+        if let Err(e) = self.ensure_stream_exists(&parsed) {
+            self.counters.inc_failures_invalid_request();
+            return if fail_fast { Err(e) } else { Ok(None) };
+        }
 
         let close_after = Instant::now() + COMMAND_END_CLOSE_GRACE;
         let close_immediately;
@@ -531,7 +804,9 @@ impl WorkerState {
                 .streams
                 .get_mut(&parsed.invocation_id)
                 .expect("stream was inserted");
-            sequence_number = stream.enqueue_event(&parsed, self.config.event_format);
+            sequence_number = stream
+                .enqueue_event(&parsed, self.config.event_format)
+                .await;
             close_immediately = parsed.is_invocation_record;
 
             if parsed.is_command_end {
@@ -605,12 +880,14 @@ impl WorkerState {
         Ok(None)
     }
 
-    fn ensure_stream_exists(&mut self, parsed: &ParsedMessage) {
+    fn ensure_stream_exists(&mut self, parsed: &ParsedMessage) -> buck2_error::Result<()> {
         if self.streams.contains_key(&parsed.invocation_id) {
-            return;
+            return Ok(());
         }
-        let stream = StreamState::new(parsed);
+        let upload_config = BazelArtifactUploadConfig::from_bes(&self.config, &self.connection)?;
+        let stream = StreamState::new(parsed, upload_config);
         self.streams.insert(parsed.invocation_id.clone(), stream);
+        Ok(())
     }
 
     async fn flush_stream(&mut self, invocation_id: &str) -> Result<(), Status> {
@@ -885,6 +1162,7 @@ struct StreamState {
     project_id: String,
     pending_unacked: VecDeque<PublishBuildToolEventStreamRequest>,
     bazel_converter: BazelEventConverter,
+    bazel_artifact_uploader: Option<BazelArtifactUploader>,
     last_sent_sequence_number: i64,
     saw_command_end: bool,
     pending_close: Option<PendingClose>,
@@ -897,7 +1175,10 @@ struct PendingClose {
 }
 
 impl StreamState {
-    fn new(parsed: &ParsedMessage) -> Self {
+    fn new(
+        parsed: &ParsedMessage,
+        bazel_artifact_upload_config: Option<BazelArtifactUploadConfig>,
+    ) -> Self {
         Self {
             stream_id: StreamId {
                 build_id: parsed.build_id.clone(),
@@ -911,6 +1192,7 @@ impl StreamState {
             project_id: parsed.project_id.clone(),
             pending_unacked: VecDeque::new(),
             bazel_converter: BazelEventConverter::default(),
+            bazel_artifact_uploader: bazel_artifact_upload_config.map(BazelArtifactUploader::new),
             last_sent_sequence_number: 0,
             saw_command_end: false,
             pending_close: None,
@@ -918,7 +1200,7 @@ impl StreamState {
         }
     }
 
-    fn enqueue_event(
+    async fn enqueue_event(
         &mut self,
         parsed: &ParsedMessage,
         event_format: BesEventFormat,
@@ -936,7 +1218,10 @@ impl StreamState {
                     .bazel_converter
                     .convert(self.next_sequence_number, &parsed.buck_event);
                 let mut last_sequence_number = None;
-                for event in events {
+                for mut event in events {
+                    if let Some(uploader) = self.bazel_artifact_uploader.as_mut() {
+                        uploader.upload_event_files(&mut event).await;
+                    }
                     last_sequence_number = Some(self.enqueue_raw_event(BuildEvent {
                         event_time: parsed.event_time.clone(),
                         event: Some(build_event::Event::BazelEvent(encode_bep_event(&event))),
@@ -1343,6 +1628,78 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_authority_extracts_host_port() {
+        assert_eq!(
+            endpoint_authority("http://localhost:1985/foo").as_deref(),
+            Some("localhost:1985")
+        );
+        assert_eq!(
+            endpoint_authority("https://bes.example.com").as_deref(),
+            Some("bes.example.com")
+        );
+    }
+
+    #[test]
+    fn bytestream_uri_includes_instance_prefix() {
+        assert_eq!(
+            bytestream_uri("localhost:1985", "", "abc", 3),
+            "bytestream://localhost:1985/blobs/abc/3"
+        );
+        assert_eq!(
+            bytestream_uri("localhost:1985", "remote/instance", "abc", 3),
+            "bytestream://localhost:1985/remote/instance/blobs/abc/3"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_event_files_adds_named_set_uris_from_digest() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut uploader = BazelArtifactUploader::new(BazelArtifactUploadConfig {
+            endpoint: "http://localhost:1985".to_owned(),
+            headers: Vec::new(),
+            instance_name: "remote/instance".to_owned(),
+            uri_authority: "localhost:1985".to_owned(),
+            max_bytes: 1024,
+            grpc_timeout: Duration::from_secs(1),
+        });
+        let mut event = bazel_bep_proto::build_event_stream::BuildEvent {
+            id: None,
+            children: Vec::new(),
+            payload: Some(
+                bazel_bep_proto::build_event_stream::build_event::Payload::NamedSetOfFiles(
+                    bazel_bep_proto::build_event_stream::NamedSetOfFiles {
+                        files: vec![bazel_bep_proto::build_event_stream::File {
+                            name: "buck-out/gen/root/main".to_owned(),
+                            path_prefix: Vec::new(),
+                            file: None,
+                            digest: format!("{hash}:3"),
+                            length: 3,
+                        }],
+                        file_sets: Vec::new(),
+                    },
+                ),
+            ),
+            last_message: false,
+        };
+
+        uploader.upload_event_files(&mut event).await;
+
+        let Some(bazel_bep_proto::build_event_stream::build_event::Payload::NamedSetOfFiles(files)) =
+            event.payload
+        else {
+            panic!("expected named set");
+        };
+        let uri = match files.files[0].file.as_ref() {
+            Some(bazel_bep_proto::build_event_stream::file::File::Uri(uri)) => uri,
+            other => panic!("expected URI, got {other:?}"),
+        };
+        assert_eq!(
+            uri,
+            &format!("bytestream://localhost:1985/remote/instance/blobs/{hash}/3")
+        );
+    }
+
+    #[test]
     fn event_format_defaults_to_buck() {
         assert_eq!(BesConfig::default().event_format, BesEventFormat::Buck);
     }
@@ -1369,20 +1726,20 @@ mod tests {
         assert!(err.to_string().contains("expected `buck` or `bazel`"));
     }
 
-    #[test]
-    fn bazel_enqueue_returns_highest_emitted_sequence_number() {
+    #[tokio::test]
+    async fn bazel_enqueue_returns_highest_emitted_sequence_number() {
         let message = make_message(
             Some(&TraceId::new().to_string()),
             Some(1),
             command_start_data(),
         );
         let parsed = ParsedMessage::from_message(&message).expect("valid message");
-        let mut stream = StreamState::new(&parsed);
+        let mut stream = StreamState::new(&parsed, None);
 
-        let last_sequence = stream.enqueue_event(&parsed, BesEventFormat::Bazel);
+        let last_sequence = stream.enqueue_event(&parsed, BesEventFormat::Bazel).await;
 
-        assert_eq!(last_sequence, Some(2));
-        assert_eq!(stream.pending_unacked.len(), 2);
+        assert_eq!(last_sequence, Some(stream.pending_unacked.len() as i64));
+        assert!(stream.pending_unacked.len() > 1);
         assert_eq!(request_sequence_number(&stream.pending_unacked[0]), 1);
         assert_eq!(request_sequence_number(&stream.pending_unacked[1]), 2);
         let event = stream.pending_unacked[0]
@@ -1440,7 +1797,7 @@ mod tests {
         let mut worker = WorkerState::new(config, connection, counters.clone());
 
         let parsed = ParsedMessage::from_message(&message).expect("valid message");
-        worker.ensure_stream_exists(&parsed);
+        worker.ensure_stream_exists(&parsed).unwrap();
         {
             let (sender, receiver) = mpsc::channel(1);
             drop(receiver);
@@ -1480,7 +1837,7 @@ mod tests {
         let mut worker = WorkerState::new(config, connection, counters);
 
         let parsed = ParsedMessage::from_message(&message).expect("valid message");
-        worker.ensure_stream_exists(&parsed);
+        worker.ensure_stream_exists(&parsed).unwrap();
         let stream = worker
             .streams
             .get_mut(&parsed.invocation_id)

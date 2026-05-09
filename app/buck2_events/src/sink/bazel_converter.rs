@@ -11,15 +11,22 @@
 #![allow(deprecated)]
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::env;
 
+use bazel_bep_proto::blaze;
 use bazel_bep_proto::build_event_stream as bep;
 use bazel_bep_proto::build_event_stream::build_event;
 use bazel_bep_proto::build_event_stream::build_event_id;
 use bazel_bep_proto::command_line as cl;
+use bazel_bep_proto::failure_details as failure;
 use prost::Message as _;
 use prost_types::Any;
+use prost_types::Struct;
 use prost_types::Timestamp;
+use prost_types::Value;
+use prost_types::value;
 
 pub(crate) const BEP_EVENT_TYPE_URL: &str = "type.googleapis.com/build_event_stream.BuildEvent";
 
@@ -29,6 +36,9 @@ const GENERIC_TARGET_KIND: &str = "buck2 rule";
 const TEST_TARGET_KIND: &str = "buck2_test rule";
 const INTERRUPTED_EXIT_CODE: i32 = 8;
 const MAX_INLINE_FILE_BYTES: usize = 16 * 1024;
+const CANONICAL_COMMAND_LINE_LABEL: &str = "canonical";
+const ORIGINAL_COMMAND_LINE_LABEL: &str = "original";
+const STRUCT_TYPE_URL: &str = "type.googleapis.com/google.protobuf.Struct";
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TargetKey {
@@ -41,6 +51,15 @@ struct CompletedTargetState {
     success: bool,
 }
 
+#[derive(Clone, Debug)]
+struct TestCaseState {
+    name: String,
+    status: i32,
+    duration: Option<prost_types::Duration>,
+    details: String,
+    message: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct BazelEventConverter {
     saw_started: bool,
@@ -48,6 +67,13 @@ pub(crate) struct BazelEventConverter {
     completed_targets: BTreeMap<TargetKey, CompletedTargetState>,
     action_children: BTreeMap<TargetKey, BTreeMap<String, bep::BuildEventId>>,
     emitted_action_child_counts: BTreeMap<TargetKey, usize>,
+    emitted_configured_targets: BTreeSet<String>,
+    target_outputs: BTreeMap<TargetKey, BTreeMap<String, bep::File>>,
+    emitted_output_counts: BTreeMap<TargetKey, usize>,
+    emitted_completed_targets: BTreeSet<TargetKey>,
+    test_cases: BTreeMap<TargetKey, Vec<TestCaseState>>,
+    pending_patterns: Option<Vec<String>>,
+    pattern_expanded_emitted: bool,
 }
 
 impl BazelEventConverter {
@@ -94,13 +120,14 @@ impl BazelEventConverter {
                     events.push(self.started_event(event, Some(command)));
                     self.saw_started = true;
                 }
-                events.push(structured_command_line_event(command));
-                if let Some(workspace) = workspace_status_event(command) {
-                    events.push(workspace);
-                }
-                if let Some(metadata) = build_metadata_event_from_command(command) {
-                    events.push(metadata);
-                }
+                events.push(unstructured_command_line_event(command));
+                events.push(original_structured_command_line_event(command));
+                events.push(canonical_structured_command_line_event(command));
+                events.push(options_parsed_event(command));
+                events.push(default_configuration_event());
+                events.push(workspace_info_event(command));
+                events.push(workspace_status_event(command));
+                events.push(build_metadata_event_from_command(command));
             }
             Some(buck2_data::span_start_event::Data::CommandCritical(command)) => {
                 if let Some(metadata) = build_metadata_event_from_map(&command.metadata) {
@@ -108,17 +135,16 @@ impl BazelEventConverter {
                 }
             }
             Some(buck2_data::span_start_event::Data::Analysis(analysis)) => {
-                if let Some(configured) = configured_event_from_analysis_start(analysis) {
-                    events.push(configured);
-                }
+                self.push_configured_event(configured_event_from_analysis_start(analysis), events);
             }
             Some(buck2_data::span_start_event::Data::TestDiscovery(test_discovery)) => {
-                if let Some(configured) = configured_event_from_test_label(
-                    test_discovery.target_label.as_ref(),
-                    TEST_TARGET_KIND,
-                ) {
-                    events.push(configured);
-                }
+                self.push_configured_event(
+                    configured_event_from_test_label(
+                        test_discovery.target_label.as_ref(),
+                        TEST_TARGET_KIND,
+                    ),
+                    events,
+                );
             }
             _ => {}
         }
@@ -137,25 +163,31 @@ impl BazelEventConverter {
             Some(buck2_data::span_end_event::Data::Analysis(analysis)) => {
                 if let Some(completed) = completed_event_from_analysis_end(analysis) {
                     self.remember_completed(&completed);
-                    events.push(completed);
                 }
             }
             Some(buck2_data::span_end_event::Data::ActionExecution(action)) => {
-                if let Some(action) = action_event(event, span_end, action) {
-                    self.remember_action(&action);
-                    events.push(action);
+                if let Some(action_event) = action_event(event, span_end, action) {
+                    self.remember_action(&action_event);
+                    self.remember_target_outputs(action);
+                    events.push(action_event);
                 }
             }
             Some(buck2_data::span_end_event::Data::TestDiscovery(test_discovery)) => {
-                if let Some(configured) = configured_event_from_test_label(
-                    test_discovery.target_label.as_ref(),
-                    TEST_TARGET_KIND,
-                ) {
-                    events.push(configured);
-                }
+                self.push_configured_event(
+                    configured_event_from_test_label(
+                        test_discovery.target_label.as_ref(),
+                        TEST_TARGET_KIND,
+                    ),
+                    events,
+                );
             }
             Some(buck2_data::span_end_event::Data::TestRun(test_end)) => {
-                if let Some(summary) = test_summary_event(event, span_end, test_end) {
+                if let Some(result) =
+                    self.test_result_event_from_test_end(event, span_end, test_end)
+                {
+                    events.push(result);
+                }
+                if let Some(summary) = self.test_summary_event(event, span_end, test_end) {
                     events.push(summary);
                 }
             }
@@ -199,9 +231,7 @@ impl BazelEventConverter {
                 events.push(self.progress_event(sequence_hint, None, Some(error.payload.clone())));
             }
             Some(buck2_data::instant_event::Data::TargetPatterns(patterns)) => {
-                if let Some(expanded) = pattern_expanded_event(patterns) {
-                    events.push(expanded);
-                }
+                self.remember_target_patterns(patterns);
             }
             Some(buck2_data::instant_event::Data::TargetCfg(cfg)) => {
                 let mut metadata = BTreeMap::new();
@@ -214,8 +244,8 @@ impl BazelEventConverter {
                         cfg.cli_modifiers.join(","),
                     );
                 }
-                if let Some(event) = build_metadata_event(&metadata) {
-                    events.push(event);
+                if !metadata.is_empty() {
+                    events.push(build_metadata_event(&metadata));
                 }
             }
             Some(buck2_data::instant_event::Data::BuildGraphInfo(info)) => {
@@ -247,8 +277,8 @@ impl BazelEventConverter {
                 {
                     metadata.insert("BUCK2_ISOLATION_DIR".to_owned(), isolation_dir.clone());
                 }
-                if let Some(event) = build_metadata_event(&metadata) {
-                    events.push(event);
+                if !metadata.is_empty() {
+                    events.push(build_metadata_event(&metadata));
                 }
             }
             Some(buck2_data::instant_event::Data::VersionControlRevision(revision)) => {
@@ -262,8 +292,8 @@ impl BazelEventConverter {
                         has_local_changes.to_string(),
                     );
                 }
-                if let Some(event) = build_metadata_event(&metadata) {
-                    events.push(event);
+                if !metadata.is_empty() {
+                    events.push(build_metadata_event(&metadata));
                 }
             }
             Some(buck2_data::instant_event::Data::TestDiscovery(discovery)) => {
@@ -289,9 +319,7 @@ impl BazelEventConverter {
                 }
             }
             Some(buck2_data::instant_event::Data::TestResult(result)) => {
-                if let Some(test_result) = test_result_event(result) {
-                    events.push(test_result);
-                }
+                self.remember_test_case(result);
             }
             _ => {}
         }
@@ -305,24 +333,69 @@ impl BazelEventConverter {
     ) {
         match record.data.as_ref() {
             Some(buck2_data::record_event::Data::InvocationRecord(record)) => {
+                self.emit_pending_pattern_expanded(&[], events);
                 self.emit_completed_updates_for_actions(events);
-                if let Some(metadata) = build_metadata_event_from_invocation(record) {
-                    events.push(metadata);
-                }
+                events.push(build_metrics_event(record));
+                events.push(build_metadata_event_from_invocation(record));
                 events.push(finished_event_from_invocation_record(event, record));
+                events.push(build_tool_logs_event_from_invocation(record));
             }
             Some(buck2_data::record_event::Data::BuildGraphStats(stats)) => {
+                self.emit_pending_pattern_expanded(&stats.build_targets, events);
                 for target in &stats.build_targets {
-                    if let Some(configured) = configured_event_from_build_target(target) {
-                        events.push(configured);
-                    }
+                    self.push_configured_event(configured_event_from_build_target(target), events);
                     if let Some(completed) = completed_event_from_build_target(target) {
                         self.remember_completed(&completed);
-                        events.push(completed);
                     }
                 }
             }
             _ => {}
+        }
+    }
+
+    fn remember_target_patterns(&mut self, patterns: &buck2_data::ParsedTargetPatterns) {
+        let patterns = target_patterns_from_invocation_record(patterns);
+        if patterns.is_empty() {
+            return;
+        }
+        self.pending_patterns = Some(patterns);
+        self.pattern_expanded_emitted = false;
+    }
+
+    fn emit_pending_pattern_expanded(
+        &mut self,
+        targets: &[buck2_data::BuildTarget],
+        events: &mut Vec<bep::BuildEvent>,
+    ) {
+        if self.pattern_expanded_emitted {
+            return;
+        }
+        let Some(patterns) = self.pending_patterns.clone() else {
+            return;
+        };
+        events.push(pattern_expanded_event(
+            patterns,
+            configured_target_children_from_build_targets(targets),
+        ));
+        self.pattern_expanded_emitted = true;
+    }
+
+    fn push_configured_event(
+        &mut self,
+        event: Option<bep::BuildEvent>,
+        events: &mut Vec<bep::BuildEvent>,
+    ) {
+        let Some(event) = event else {
+            return;
+        };
+        let Some(build_event_id::Id::TargetConfigured(id)) =
+            event.id.as_ref().and_then(|id| id.id.as_ref())
+        else {
+            events.push(event);
+            return;
+        };
+        if self.emitted_configured_targets.insert(id.label.clone()) {
+            events.push(event);
         }
     }
 
@@ -342,9 +415,14 @@ impl BazelEventConverter {
         bep::BuildEvent {
             id: Some(started_id()),
             children: vec![
-                structured_command_line_id("original"),
+                unstructured_command_line_id(),
+                structured_command_line_id(ORIGINAL_COMMAND_LINE_LABEL),
+                structured_command_line_id(CANONICAL_COMMAND_LINE_LABEL),
+                options_parsed_id(),
                 workspace_status_id(),
                 build_metadata_id(),
+                configuration_event_id(DEFAULT_CONFIGURATION_ID),
+                workspace_config_id(),
                 build_finished_id(),
             ],
             payload: Some(build_event::Payload::Started(bep::BuildStarted {
@@ -447,29 +525,207 @@ impl BazelEventConverter {
     fn emit_completed_updates_for_actions(&mut self, events: &mut Vec<bep::BuildEvent>) {
         let keys = self.completed_targets.keys().cloned().collect::<Vec<_>>();
         for key in keys {
-            let Some(children_by_id) = self.action_children.get(&key) else {
-                continue;
-            };
-            let child_count = children_by_id.len();
-            if child_count == 0
-                || self
-                    .emitted_action_child_counts
-                    .get(&key)
-                    .is_some_and(|emitted| *emitted == child_count)
-            {
+            let children_by_id = self.action_children.get(&key);
+            let child_count = children_by_id.map(BTreeMap::len).unwrap_or_default();
+            let output_count = self
+                .target_outputs
+                .get(&key)
+                .map(BTreeMap::len)
+                .unwrap_or_default();
+            let is_first_completion = !self.emitted_completed_targets.contains(&key);
+            let child_count_unchanged = self
+                .emitted_action_child_counts
+                .get(&key)
+                .is_some_and(|emitted| *emitted == child_count);
+            let output_count_unchanged = self
+                .emitted_output_counts
+                .get(&key)
+                .is_some_and(|emitted| *emitted == output_count);
+            if !is_first_completion && child_count_unchanged && output_count_unchanged {
                 continue;
             }
             let Some(state) = self.completed_targets.get(&key) else {
                 continue;
             };
-            events.push(completed_event_with_children(
+            let mut children = children_by_id
+                .into_iter()
+                .flat_map(|children| children.values().cloned())
+                .collect::<Vec<_>>();
+            let (named_set_events, output_group) = self.output_group_events(&key, &mut children);
+            events.extend(named_set_events);
+            events.push(completed_event_with_children_and_outputs(
                 key.label.clone(),
                 key.configuration.clone(),
                 state.success,
-                children_by_id.values().cloned().collect(),
+                children,
+                output_group,
             ));
-            self.emitted_action_child_counts.insert(key, child_count);
+            self.emitted_action_child_counts
+                .insert(key.clone(), child_count);
+            self.emitted_output_counts.insert(key.clone(), output_count);
+            self.emitted_completed_targets.insert(key);
         }
+    }
+
+    fn remember_target_outputs(&mut self, action: &buck2_data::ActionExecutionEnd) {
+        let Some(key) = action.key.as_ref() else {
+            return;
+        };
+        let Some(target) = action_owner(key) else {
+            return;
+        };
+        let Some(label) = label_for_configured_target(target) else {
+            return;
+        };
+        let key = TargetKey {
+            label,
+            configuration: configuration_id_for_target(target),
+        };
+        let outputs = self.target_outputs.entry(key).or_default();
+        for output in &action.outputs {
+            let Some(file) = bep_file_from_action_output(output) else {
+                continue;
+            };
+            outputs.entry(file.name.clone()).or_insert(file);
+        }
+    }
+
+    fn output_group_events(
+        &self,
+        key: &TargetKey,
+        children: &mut Vec<bep::BuildEventId>,
+    ) -> (Vec<bep::BuildEvent>, Vec<bep::OutputGroup>) {
+        let Some(files) = self.target_outputs.get(key) else {
+            return (Vec::new(), Vec::new());
+        };
+        if files.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let named_set = named_set_id_for_target(key);
+        children.push(bep::BuildEventId {
+            id: Some(build_event_id::Id::NamedSet(named_set.clone())),
+        });
+        let named_set_event = bep::BuildEvent {
+            id: Some(bep::BuildEventId {
+                id: Some(build_event_id::Id::NamedSet(named_set.clone())),
+            }),
+            children: Vec::new(),
+            payload: Some(build_event::Payload::NamedSetOfFiles(
+                bep::NamedSetOfFiles {
+                    files: files.values().cloned().collect(),
+                    file_sets: Vec::new(),
+                },
+            )),
+            last_message: false,
+        };
+        (
+            vec![named_set_event],
+            vec![bep::OutputGroup {
+                name: "default".to_owned(),
+                file_sets: vec![named_set],
+                incomplete: false,
+                inline_files: Vec::new(),
+            }],
+        )
+    }
+
+    fn remember_test_case(&mut self, result: &buck2_data::TestResult) {
+        let Some(target) = result.target_label.as_ref() else {
+            return;
+        };
+        let Some(label) = label_for_configured_target(target) else {
+            return;
+        };
+        let key = TargetKey {
+            label,
+            configuration: configuration_id_for_target(target),
+        };
+        self.test_cases.entry(key).or_default().push(TestCaseState {
+            name: result.name.clone(),
+            status: result.status,
+            duration: result.duration.clone(),
+            details: result.details.clone(),
+            message: result.msg.as_ref().map(|message| message.msg.clone()),
+        });
+    }
+
+    fn test_result_event_from_test_end(
+        &mut self,
+        event: &buck2_data::BuckEvent,
+        span_end: &buck2_data::SpanEndEvent,
+        test_end: &buck2_data::TestRunEnd,
+    ) -> Option<bep::BuildEvent> {
+        let suite = test_end.suite.as_ref()?;
+        let target = suite.target_label.as_ref()?;
+        let label = label_for_configured_target(target)?;
+        let configuration = configuration_id_for_target(target);
+        let key = TargetKey {
+            label: label.clone(),
+            configuration: configuration.clone(),
+        };
+        let cases = self.test_cases.get(&key).cloned().unwrap_or_default();
+        let status = aggregate_test_status(test_end.command_report.as_ref(), &cases);
+        let end_time = event.timestamp.clone();
+        let outputs = test_action_outputs(&cases, test_end.command_report.as_ref(), status);
+
+        Some(bep::BuildEvent {
+            id: Some(test_result_id(label, configuration)),
+            children: Vec::new(),
+            payload: Some(build_event::Payload::TestResult(bep::TestResult {
+                status,
+                cached_locally: false,
+                test_attempt_start_millis_epoch: 0,
+                test_attempt_duration_millis: 0,
+                test_action_output: outputs,
+                warning: Vec::new(),
+                execution_info: test_execution_info(test_end.command_report.as_ref()),
+                status_details: test_status_details(&cases, test_end.command_report.as_ref()),
+                test_attempt_start: start_time_from_span_end(span_end, end_time.as_ref()),
+                test_attempt_duration: test_duration(test_end.command_report.as_ref())
+                    .or_else(|| span_end.duration.clone()),
+            })),
+            last_message: false,
+        })
+    }
+
+    fn test_summary_event(
+        &mut self,
+        event: &buck2_data::BuckEvent,
+        span_end: &buck2_data::SpanEndEvent,
+        test_end: &buck2_data::TestRunEnd,
+    ) -> Option<bep::BuildEvent> {
+        let suite = test_end.suite.as_ref()?;
+        let target = suite.target_label.as_ref()?;
+        let label = label_for_configured_target(target)?;
+        let configuration = configuration_id_for_target(target);
+        let key = TargetKey {
+            label: label.clone(),
+            configuration: configuration.clone(),
+        };
+        let cases = self.test_cases.remove(&key).unwrap_or_default();
+        let status = aggregate_test_status(test_end.command_report.as_ref(), &cases);
+        let end_time = event.timestamp.clone();
+        Some(bep::BuildEvent {
+            id: Some(test_summary_id(label, configuration)),
+            children: Vec::new(),
+            payload: Some(build_event::Payload::TestSummary(bep::TestSummary {
+                overall_status: status,
+                total_run_count: 1,
+                run_count: 1,
+                attempt_count: 1,
+                shard_count: 1,
+                passed: test_summary_files(status, test_end.command_report.as_ref(), true),
+                failed: test_summary_files(status, test_end.command_report.as_ref(), false),
+                total_num_cached: 0,
+                first_start_time_millis: 0,
+                last_stop_time_millis: 0,
+                total_run_duration_millis: 0,
+                first_start_time: start_time_from_span_end(span_end, end_time.as_ref()),
+                last_stop_time: end_time,
+                total_run_duration: test_duration(test_end.command_report.as_ref()),
+            })),
+            last_message: false,
+        })
     }
 }
 
@@ -509,10 +765,34 @@ fn structured_command_line_id(label: &str) -> bep::BuildEventId {
     }
 }
 
+fn unstructured_command_line_id() -> bep::BuildEventId {
+    bep::BuildEventId {
+        id: Some(build_event_id::Id::UnstructuredCommandLine(
+            build_event_id::UnstructuredCommandLineId {},
+        )),
+    }
+}
+
+fn options_parsed_id() -> bep::BuildEventId {
+    bep::BuildEventId {
+        id: Some(build_event_id::Id::OptionsParsed(
+            build_event_id::OptionsParsedId {},
+        )),
+    }
+}
+
 fn workspace_status_id() -> bep::BuildEventId {
     bep::BuildEventId {
         id: Some(build_event_id::Id::WorkspaceStatus(
             build_event_id::WorkspaceStatusId {},
+        )),
+    }
+}
+
+fn workspace_config_id() -> bep::BuildEventId {
+    bep::BuildEventId {
+        id: Some(build_event_id::Id::Workspace(
+            build_event_id::WorkspaceConfigId {},
         )),
     }
 }
@@ -533,8 +813,22 @@ fn build_finished_id() -> bep::BuildEventId {
     }
 }
 
+fn build_tool_logs_id() -> bep::BuildEventId {
+    bep::BuildEventId {
+        id: Some(build_event_id::Id::BuildToolLogs(
+            build_event_id::BuildToolLogsId {},
+        )),
+    }
+}
+
 fn configuration_id(id: impl Into<String>) -> build_event_id::ConfigurationId {
     build_event_id::ConfigurationId { id: id.into() }
+}
+
+fn configuration_event_id(id: impl Into<String>) -> bep::BuildEventId {
+    bep::BuildEventId {
+        id: Some(build_event_id::Id::Configuration(configuration_id(id))),
+    }
 }
 
 fn configuration_id_from_bep(configuration: Option<&build_event_id::ConfigurationId>) -> String {
@@ -570,6 +864,12 @@ fn action_child_key(id: &build_event_id::ActionCompletedId) -> String {
         id.primary_output,
         configuration_id_from_bep(id.configuration.as_ref())
     )
+}
+
+fn named_set_id_for_target(key: &TargetKey) -> build_event_id::NamedSetOfFilesId {
+    build_event_id::NamedSetOfFilesId {
+        id: format!("{}|{}|default", key.label, key.configuration),
+    }
 }
 
 fn target_configured_id(label: String) -> bep::BuildEventId {
@@ -647,13 +947,26 @@ fn command_name(command: &buck2_data::CommandStart) -> String {
         Some(Data::Explain(_)) => "explain",
         Some(Data::ExpandExternalCell(_)) => "expand-external-cell",
         Some(Data::Complete(_)) => "complete",
-        Some(Data::HydrationPageOut(_)) => "hydration-page-out",
+        Some(Data::Hydration(_)) => "hydration",
         None => "unknown",
     }
     .to_owned()
 }
 
-fn structured_command_line_event(command: &buck2_data::CommandStart) -> bep::BuildEvent {
+fn unstructured_command_line_event(command: &buck2_data::CommandStart) -> bep::BuildEvent {
+    bep::BuildEvent {
+        id: Some(unstructured_command_line_id()),
+        children: Vec::new(),
+        payload: Some(build_event::Payload::UnstructuredCommandLine(
+            bep::UnstructuredCommandLine {
+                args: command.cli_args.clone(),
+            },
+        )),
+        last_message: false,
+    }
+}
+
+fn original_structured_command_line_event(command: &buck2_data::CommandStart) -> bep::BuildEvent {
     let mut sections = Vec::new();
     if let Some(command) = command.cli_args.first() {
         sections.push(chunk_section("command", vec![command.clone()]));
@@ -663,11 +976,41 @@ fn structured_command_line_event(command: &buck2_data::CommandStart) -> bep::Bui
     }
 
     bep::BuildEvent {
-        id: Some(structured_command_line_id("original")),
+        id: Some(structured_command_line_id(ORIGINAL_COMMAND_LINE_LABEL)),
         children: Vec::new(),
         payload: Some(build_event::Payload::StructuredCommandLine(
             cl::CommandLine {
-                command_line_label: "original".to_owned(),
+                command_line_label: ORIGINAL_COMMAND_LINE_LABEL.to_owned(),
+                sections,
+            },
+        )),
+        last_message: false,
+    }
+}
+
+fn canonical_structured_command_line_event(command: &buck2_data::CommandStart) -> bep::BuildEvent {
+    let mut sections = Vec::new();
+    if let Some(executable) = command.cli_args.first() {
+        sections.push(chunk_section("executable", vec![executable.clone()]));
+    }
+    sections.push(chunk_section("command", vec![command_name(command)]));
+
+    let parsed = ParsedCliArgs::new(command);
+    let mut options = parsed.options;
+    options.extend(client_env_options(command));
+    if !options.is_empty() {
+        sections.push(option_section("command options", options));
+    }
+    if !parsed.residue.is_empty() {
+        sections.push(chunk_section("residue", parsed.residue));
+    }
+
+    bep::BuildEvent {
+        id: Some(structured_command_line_id(CANONICAL_COMMAND_LINE_LABEL)),
+        children: Vec::new(),
+        payload: Some(build_event::Payload::StructuredCommandLine(
+            cl::CommandLine {
+                command_line_label: CANONICAL_COMMAND_LINE_LABEL.to_owned(),
                 sections,
             },
         )),
@@ -684,17 +1027,213 @@ fn chunk_section(label: &str, chunks: Vec<String>) -> cl::CommandLineSection {
     }
 }
 
-fn workspace_status_event(command: &buck2_data::CommandStart) -> Option<bep::BuildEvent> {
+fn option_section(label: &str, options: Vec<cl::Option>) -> cl::CommandLineSection {
+    cl::CommandLineSection {
+        section_label: label.to_owned(),
+        section_type: Some(cl::command_line_section::SectionType::OptionList(
+            cl::OptionList { option: options },
+        )),
+    }
+}
+
+struct ParsedCliArgs {
+    options: Vec<cl::Option>,
+    residue: Vec<String>,
+}
+
+impl ParsedCliArgs {
+    fn new(command: &buck2_data::CommandStart) -> Self {
+        let args = command.cli_args.as_slice();
+        let mut options = Vec::new();
+        let mut residue = Vec::new();
+        let mut i = command_arg_start(args);
+        let mut force_residue = false;
+        while i < args.len() {
+            let arg = &args[i];
+            if force_residue {
+                residue.push(arg.clone());
+                i += 1;
+                continue;
+            }
+            if arg == "--" {
+                force_residue = true;
+                i += 1;
+                continue;
+            }
+            if let Some(mut option) = option_from_arg(arg) {
+                if option.option_value.is_empty()
+                    && i + 1 < args.len()
+                    && !args[i + 1].starts_with('-')
+                {
+                    option.option_value = args[i + 1].clone();
+                    option.combined_form = format!("{}={}", arg, option.option_value);
+                    i += 1;
+                }
+                if option.option_value.is_empty() {
+                    option.option_value = "1".to_owned();
+                }
+                options.push(option);
+            } else {
+                residue.push(arg.clone());
+            }
+            i += 1;
+        }
+
+        Self { options, residue }
+    }
+}
+
+fn command_arg_start(args: &[String]) -> usize {
+    if args.is_empty() {
+        return 0;
+    }
+    // Buck2 command args are generally: executable, command, command args...
+    if args.len() > 1 && !args[1].starts_with('-') {
+        2
+    } else {
+        1
+    }
+}
+
+fn option_from_arg(arg: &str) -> Option<cl::Option> {
+    let raw = arg.strip_prefix("--")?;
+    if raw.is_empty() {
+        return None;
+    }
+    let had_equals = raw.contains('=');
+    let (raw_name, value) = raw
+        .split_once('=')
+        .map(|(name, value)| (name, value.to_owned()))
+        .unwrap_or_else(|| (raw, String::new()));
+    let (name, value) = raw_name
+        .strip_prefix("no")
+        .filter(|name| !name.is_empty())
+        .map(|name| (name, "0".to_owned()))
+        .unwrap_or((raw_name, value));
+
+    Some(cl::Option {
+        combined_form: arg.to_owned(),
+        option_name: normalize_option_name(name),
+        option_value: if had_equals || value == "0" {
+            value
+        } else {
+            String::new()
+        },
+        effect_tags: Vec::new(),
+        metadata_tags: Vec::new(),
+        source: "command line options".to_owned(),
+    })
+}
+
+fn normalize_option_name(name: &str) -> String {
+    name.trim_start_matches('-').replace('-', "_")
+}
+
+fn client_env_options(command: &buck2_data::CommandStart) -> Vec<cl::Option> {
+    let mut values = BTreeMap::new();
+    insert_env_option(
+        &mut values,
+        "USER",
+        first_metadata(
+            &command.metadata,
+            &["USER", "BUILD_USER", "username", "user"],
+        )
+        .or_else(|| env::var("USER").ok()),
+    );
+    insert_env_option(
+        &mut values,
+        "HOST",
+        first_metadata(
+            &command.metadata,
+            &["HOST", "BUILD_HOST", "hostname", "host"],
+        )
+        .or_else(|| env::var("HOSTNAME").ok()),
+    );
+    for key in [
+        "CI",
+        "GITHUB_ACTOR",
+        "GITHUB_REPOSITORY",
+        "GITHUB_REF",
+        "GITHUB_HEAD_REF",
+        "GITHUB_SHA",
+        "BUILDKITE_BUILD_CREATOR",
+        "BUILDKITE_REPO",
+        "BUILDKITE_BRANCH",
+        "BUILDKITE_COMMIT",
+        "CIRCLE_USERNAME",
+        "CIRCLE_REPOSITORY_URL",
+        "CIRCLE_BRANCH",
+        "CIRCLE_SHA1",
+        "GIT_REPOSITORY_URL",
+        "GIT_URL",
+        "GIT_BRANCH",
+        "GIT_COMMIT",
+        "REPO_URL",
+        "COMMIT_SHA",
+    ] {
+        insert_env_option(
+            &mut values,
+            key,
+            first_metadata(&command.metadata, &[key]).or_else(|| env::var(key).ok()),
+        );
+    }
+
+    values
+        .into_iter()
+        .map(|(key, value)| cl::Option {
+            combined_form: format!("--client_env={key}={value}"),
+            option_name: "client_env".to_owned(),
+            option_value: format!("{key}={value}"),
+            effect_tags: Vec::new(),
+            metadata_tags: Vec::new(),
+            source: "Buck2 metadata".to_owned(),
+        })
+        .collect()
+}
+
+fn insert_env_option(values: &mut BTreeMap<String, String>, key: &str, value: Option<String>) {
+    if let Some(value) = value
+        && !value.is_empty()
+    {
+        values.insert(key.to_owned(), value);
+    }
+}
+
+fn options_parsed_event(command: &buck2_data::CommandStart) -> bep::BuildEvent {
+    bep::BuildEvent {
+        id: Some(options_parsed_id()),
+        children: Vec::new(),
+        payload: Some(build_event::Payload::OptionsParsed(bep::OptionsParsed {
+            startup_options: Vec::new(),
+            explicit_startup_options: Vec::new(),
+            cmd_line: command.cli_args.clone(),
+            explicit_cmd_line: command.cli_args.clone(),
+            invocation_policy: None,
+            tool_tag: String::new(),
+        })),
+        last_message: false,
+    }
+}
+
+fn workspace_status_event(command: &buck2_data::CommandStart) -> bep::BuildEvent {
     let mut items = Vec::new();
     add_workspace_item(
         &mut items,
         "BUILD_USER",
-        first_metadata(&command.metadata, &["USER", "BUILD_USER"]),
+        first_metadata(
+            &command.metadata,
+            &["USER", "BUILD_USER", "username", "user"],
+        )
+        .or_else(|| env::var("USER").ok()),
     );
     add_workspace_item(
         &mut items,
         "BUILD_HOST",
-        first_metadata(&command.metadata, &["HOST", "BUILD_HOST"]),
+        first_metadata(
+            &command.metadata,
+            &["HOST", "BUILD_HOST", "hostname", "host"],
+        )
+        .or_else(|| env::var("HOSTNAME").ok()),
     );
     add_workspace_item(
         &mut items,
@@ -704,18 +1243,39 @@ fn workspace_status_event(command: &buck2_data::CommandStart) -> Option<bep::Bui
             &["CWD", "PWD", "BUILD_WORKING_DIRECTORY"],
         ),
     );
-    if items.is_empty() {
-        return None;
+    add_workspace_item(
+        &mut items,
+        "ROLE",
+        first_metadata(&command.metadata, &["ROLE"]),
+    );
+    add_workspace_item(
+        &mut items,
+        "REPO_URL",
+        first_metadata(&command.metadata, &["REPO_URL", "GIT_REPOSITORY_URL"]),
+    );
+    add_workspace_item(
+        &mut items,
+        "GIT_BRANCH",
+        first_metadata(&command.metadata, &["BRANCH_NAME", "GIT_BRANCH"]),
+    );
+    add_workspace_item(
+        &mut items,
+        "COMMIT_SHA",
+        first_metadata(&command.metadata, &["COMMIT_SHA", "GIT_COMMIT"]),
+    );
+    let patterns = target_patterns_from_cli(command);
+    if !patterns.is_empty() {
+        add_workspace_item(&mut items, "PATTERN", Some(patterns.join(" ")));
     }
 
-    Some(bep::BuildEvent {
+    bep::BuildEvent {
         id: Some(workspace_status_id()),
         children: Vec::new(),
         payload: Some(build_event::Payload::WorkspaceStatus(
             bep::WorkspaceStatus { item: items },
         )),
         last_message: false,
-    })
+    }
 }
 
 fn add_workspace_item(
@@ -733,23 +1293,98 @@ fn add_workspace_item(
     }
 }
 
-fn build_metadata_event_from_command(
-    command: &buck2_data::CommandStart,
-) -> Option<bep::BuildEvent> {
+fn add_metadata_alias(metadata: &mut BTreeMap<String, String>, key: &str, value: Option<String>) {
+    if let Some(value) = value
+        && !value.is_empty()
+    {
+        metadata.entry(key.to_owned()).or_insert(value);
+    }
+}
+
+fn default_configuration_event() -> bep::BuildEvent {
+    bep::BuildEvent {
+        id: Some(configuration_event_id(DEFAULT_CONFIGURATION_ID)),
+        children: Vec::new(),
+        payload: Some(build_event::Payload::Configuration(bep::Configuration {
+            mnemonic: DEFAULT_CONFIGURATION_ID.to_owned(),
+            platform_name: String::new(),
+            cpu: env::consts::ARCH.to_owned(),
+            make_variable: HashMap::new(),
+            is_tool: false,
+        })),
+        last_message: false,
+    }
+}
+
+fn workspace_info_event(command: &buck2_data::CommandStart) -> bep::BuildEvent {
+    let local_exec_root = first_metadata(
+        &command.metadata,
+        &["BUCK_OUT", "BUCK2_EXEC_ROOT", "EXEC_ROOT", "REPO_ROOT"],
+    )
+    .unwrap_or_default();
+    bep::BuildEvent {
+        id: Some(workspace_config_id()),
+        children: Vec::new(),
+        payload: Some(build_event::Payload::WorkspaceInfo(bep::WorkspaceConfig {
+            local_exec_root,
+        })),
+        last_message: false,
+    }
+}
+
+fn build_metadata_event_from_command(command: &buck2_data::CommandStart) -> bep::BuildEvent {
     let mut metadata: BTreeMap<String, String> = command
         .metadata
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    add_metadata_alias(
+        &mut metadata,
+        "USER",
+        first_metadata(
+            &command.metadata,
+            &["USER", "BUILD_USER", "username", "user"],
+        )
+        .or_else(|| env::var("USER").ok()),
+    );
+    add_metadata_alias(
+        &mut metadata,
+        "HOST",
+        first_metadata(
+            &command.metadata,
+            &["HOST", "BUILD_HOST", "hostname", "host"],
+        )
+        .or_else(|| env::var("HOSTNAME").ok()),
+    );
+    add_metadata_alias(
+        &mut metadata,
+        "REPO_URL",
+        first_metadata(&command.metadata, &["REPO_URL", "GIT_REPOSITORY_URL"]),
+    );
+    add_metadata_alias(
+        &mut metadata,
+        "BRANCH_NAME",
+        first_metadata(&command.metadata, &["BRANCH_NAME", "GIT_BRANCH"]),
+    );
+    add_metadata_alias(
+        &mut metadata,
+        "COMMIT_SHA",
+        first_metadata(&command.metadata, &["COMMIT_SHA", "GIT_COMMIT"]),
+    );
+    let patterns = target_patterns_from_cli(command);
+    if !patterns.is_empty() {
+        metadata.insert("PATTERN".to_owned(), patterns.join(" "));
+    }
+    if env::var("CI").is_ok_and(|ci| !ci.is_empty()) {
+        metadata.entry("ROLE".to_owned()).or_insert("CI".to_owned());
+    }
     if !command.tags.is_empty() {
         metadata.insert("TAGS".to_owned(), command.tags.join(","));
     }
     build_metadata_event(&metadata)
 }
 
-fn build_metadata_event_from_invocation(
-    record: &buck2_data::InvocationRecord,
-) -> Option<bep::BuildEvent> {
+fn build_metadata_event_from_invocation(record: &buck2_data::InvocationRecord) -> bep::BuildEvent {
     let mut metadata = BTreeMap::new();
     if let Some(command_name) = record.command_name.as_ref()
         && !command_name.is_empty()
@@ -765,6 +1400,12 @@ fn build_metadata_event_from_invocation(
             record.re_session_id.clone(),
         );
     }
+    if let Some(parsed_target_patterns) = record.parsed_target_patterns.as_ref() {
+        let patterns = target_patterns_from_invocation_record(parsed_target_patterns);
+        if !patterns.is_empty() {
+            metadata.insert("PATTERN".to_owned(), patterns.join(" "));
+        }
+    }
     build_metadata_event(&metadata)
 }
 
@@ -773,14 +1414,11 @@ fn build_metadata_event_from_map(metadata: &HashMap<String, String>) -> Option<b
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    build_metadata_event(&metadata)
+    Some(build_metadata_event(&metadata))
 }
 
-fn build_metadata_event(metadata: &BTreeMap<String, String>) -> Option<bep::BuildEvent> {
-    if metadata.is_empty() {
-        return None;
-    }
-    Some(bep::BuildEvent {
+fn build_metadata_event(metadata: &BTreeMap<String, String>) -> bep::BuildEvent {
+    bep::BuildEvent {
         id: Some(build_metadata_id()),
         children: Vec::new(),
         payload: Some(build_event::Payload::BuildMetadata(bep::BuildMetadata {
@@ -790,20 +1428,295 @@ fn build_metadata_event(metadata: &BTreeMap<String, String>) -> Option<bep::Buil
                 .collect(),
         })),
         last_message: false,
+    }
+}
+
+fn target_patterns_from_cli(command: &buck2_data::CommandStart) -> Vec<String> {
+    ParsedCliArgs::new(command)
+        .residue
+        .into_iter()
+        .filter(|arg| arg.starts_with("//") || arg.starts_with(':') || arg.starts_with('@'))
+        .collect()
+}
+
+fn build_metrics_id() -> bep::BuildEventId {
+    bep::BuildEventId {
+        id: Some(build_event_id::Id::BuildMetrics(
+            build_event_id::BuildMetricsId {},
+        )),
+    }
+}
+
+fn action_cache_statistics(
+    record: &buck2_data::InvocationRecord,
+) -> Option<blaze::ActionCacheStatistics> {
+    let hits = i32_saturating_from_u64(record.run_action_cache_count);
+    let misses = i32_saturating_from_u64(
+        record
+            .run_local_count
+            .saturating_add(record.run_remote_count),
+    );
+    if hits == 0 && misses == 0 {
+        return None;
+    }
+
+    let miss_details = (misses > 0)
+        .then(|| blaze::action_cache_statistics::MissDetail {
+            reason: blaze::action_cache_statistics::MissReason::NotCached as i32,
+            count: misses,
+        })
+        .into_iter()
+        .collect();
+
+    Some(blaze::ActionCacheStatistics {
+        size_in_bytes: 0,
+        save_time_in_ms: 0,
+        hits,
+        misses,
+        miss_details,
+        load_time_in_ms: 0,
     })
 }
 
-fn pattern_expanded_event(patterns: &buck2_data::ParsedTargetPatterns) -> Option<bep::BuildEvent> {
-    let patterns = patterns
+fn i32_saturating_from_u64(count: u64) -> i32 {
+    i32::try_from(count).unwrap_or(i32::MAX)
+}
+
+fn build_metrics_event(record: &buck2_data::InvocationRecord) -> bep::BuildEvent {
+    let actions_executed =
+        record.run_local_count + record.run_remote_count + record.run_action_cache_count;
+    let runner_count = [
+        ("local", record.run_local_count, "local"),
+        ("remote", record.run_remote_count, "remote"),
+        (
+            "remote cache hit",
+            record.run_action_cache_count,
+            "remote-cache",
+        ),
+        ("skipped", record.run_skipped_count, "skipped"),
+    ]
+    .into_iter()
+    .filter(|(_, count, _)| *count > 0)
+    .map(
+        |(name, count, exec_kind)| bep::build_metrics::action_summary::RunnerCount {
+            name: name.to_owned(),
+            count: i32::try_from(count).unwrap_or(i32::MAX),
+            exec_kind: exec_kind.to_owned(),
+        },
+    )
+    .collect();
+
+    let wall_time_in_ms = record
+        .client_walltime
+        .as_ref()
+        .or(record.command_duration.as_ref())
+        .map(duration_millis)
+        .unwrap_or_default();
+    let execution_phase_time_in_ms = match (
+        record.time_to_first_action_execution_ms,
+        record.time_to_last_action_execution_end_ms,
+    ) {
+        (Some(start), Some(end)) if end >= start => i64::try_from(end - start).unwrap_or(i64::MAX),
+        _ => 0,
+    };
+
+    bep::BuildEvent {
+        id: Some(build_metrics_id()),
+        children: Vec::new(),
+        payload: Some(build_event::Payload::BuildMetrics(bep::BuildMetrics {
+            action_summary: Some(bep::build_metrics::ActionSummary {
+                actions_created: i64::try_from(actions_executed).unwrap_or(i64::MAX),
+                actions_created_not_including_aspects: i64::try_from(actions_executed)
+                    .unwrap_or(i64::MAX),
+                actions_executed: i64::try_from(actions_executed).unwrap_or(i64::MAX),
+                action_data: Vec::new(),
+                remote_cache_hits: i64::try_from(record.run_action_cache_count).unwrap_or(i64::MAX),
+                runner_count,
+                action_cache_statistics: action_cache_statistics(record),
+            }),
+            memory_metrics: record.peak_process_memory_bytes.map(|peak| {
+                bep::build_metrics::MemoryMetrics {
+                    used_heap_size_post_build: i64::try_from(peak).unwrap_or(i64::MAX),
+                    peak_post_gc_heap_size: i64::try_from(peak).unwrap_or(i64::MAX),
+                    peak_post_gc_tenured_space_heap_size: 0,
+                    garbage_metrics: Vec::new(),
+                }
+            }),
+            target_metrics: record.analysis_count.map(|count| {
+                let count = i64::try_from(count).unwrap_or(i64::MAX);
+                bep::build_metrics::TargetMetrics {
+                    targets_loaded: 0,
+                    targets_configured: count,
+                    targets_configured_not_including_aspects: count,
+                }
+            }),
+            package_metrics: None,
+            timing_metrics: Some(bep::build_metrics::TimingMetrics {
+                cpu_time_in_ms: 0,
+                wall_time_in_ms,
+                analysis_phase_time_in_ms: record
+                    .time_to_first_analysis_ms
+                    .and_then(|start| {
+                        record
+                            .time_to_first_action_execution_ms
+                            .and_then(|end| end.checked_sub(start))
+                    })
+                    .map(|duration| i64::try_from(duration).unwrap_or(i64::MAX))
+                    .unwrap_or_default(),
+                execution_phase_time_in_ms,
+                actions_execution_start_in_ms: record
+                    .time_to_first_action_execution_ms
+                    .map(|value| i64::try_from(value).unwrap_or(i64::MAX))
+                    .unwrap_or_default(),
+                critical_path_time: record.critical_path_duration.clone(),
+            }),
+            cumulative_metrics: record.analysis_count.map(|count| {
+                let count = i32::try_from(count).unwrap_or(i32::MAX);
+                bep::build_metrics::CumulativeMetrics {
+                    num_analyses: count,
+                    num_builds: count,
+                }
+            }),
+            artifact_metrics: Some(bep::build_metrics::ArtifactMetrics {
+                source_artifacts_read: None,
+                output_artifacts_seen: Some(bep::build_metrics::artifact_metrics::FilesMetric {
+                    size_in_bytes: record
+                        .materialization_output_size
+                        .map(|size| i64::try_from(size).unwrap_or(i64::MAX))
+                        .unwrap_or_default(),
+                    count: 0,
+                }),
+                output_artifacts_from_action_cache: None,
+                top_level_artifacts: None,
+            }),
+            build_graph_metrics: None,
+            worker_metrics: Vec::new(),
+            network_metrics: None,
+            worker_pool_metrics: None,
+            dynamic_execution_metrics: None,
+            remote_analysis_cache_statistics: None,
+        })),
+        last_message: false,
+    }
+}
+
+fn duration_millis(duration: &prost_types::Duration) -> i64 {
+    let millis = i128::from(duration.seconds) * 1_000 + i128::from(duration.nanos) / 1_000_000;
+    i64::try_from(millis).unwrap_or(if millis.is_negative() {
+        i64::MIN
+    } else {
+        i64::MAX
+    })
+}
+
+fn optional_duration_millis(duration: Option<&prost_types::Duration>) -> Option<i64> {
+    duration.map(duration_millis)
+}
+
+fn target_patterns_from_invocation_record(
+    patterns: &buck2_data::ParsedTargetPatterns,
+) -> Vec<String> {
+    patterns
         .target_patterns
         .iter()
-        .map(|p| p.value.clone())
-        .filter(|p| !p.is_empty())
-        .collect::<Vec<_>>();
-    if patterns.is_empty() {
-        return None;
+        .map(|pattern| pattern.value.clone())
+        .filter(|pattern| !pattern.is_empty())
+        .collect()
+}
+
+fn invocation_outcome_name(outcome: Option<i32>) -> &'static str {
+    match outcome.and_then(|outcome| buck2_data::InvocationOutcome::try_from(outcome).ok()) {
+        Some(buck2_data::InvocationOutcome::Success) => "success",
+        Some(buck2_data::InvocationOutcome::Failed) => "failed",
+        Some(buck2_data::InvocationOutcome::Cancelled) => "cancelled",
+        Some(buck2_data::InvocationOutcome::Crashed) => "crashed",
+        _ => "unknown",
     }
-    Some(bep::BuildEvent {
+}
+
+fn build_tool_logs_event_from_invocation(record: &buck2_data::InvocationRecord) -> bep::BuildEvent {
+    let target_patterns = record
+        .parsed_target_patterns
+        .as_ref()
+        .map(target_patterns_from_invocation_record)
+        .unwrap_or_default();
+    let summary = serde_json::json!({
+        "tool": BUILD_TOOL_VERSION,
+        "command": record.command_name.as_deref().unwrap_or_default(),
+        "outcome": invocation_outcome_name(record.outcome),
+        "exit_code": record.exit_code,
+        "exit_result_name": record.exit_result_name.as_deref(),
+        "target_patterns": target_patterns,
+        "tags": &record.tags,
+        "re_session_id": record.re_session_id.as_str(),
+        "filesystem": record.filesystem.as_str(),
+        "cache_hit_rate": record.cache_hit_rate,
+        "actions": {
+            "local": record.run_local_count,
+            "remote": record.run_remote_count,
+            "remote_cache": record.run_action_cache_count,
+            "remote_dep_file_cache": record.run_remote_dep_file_cache_count,
+            "skipped": record.run_skipped_count,
+            "fallback": record.run_fallback_count,
+            "uploads": record.cache_upload_count,
+            "upload_attempts": record.cache_upload_attempt_count,
+        },
+        "timings_ms": {
+            "command": optional_duration_millis(record.command_duration.as_ref()),
+            "client_walltime": optional_duration_millis(record.client_walltime.as_ref()),
+            "critical_path": optional_duration_millis(record.critical_path_duration.as_ref()),
+            "first_action_execution": record.time_to_first_action_execution_ms,
+            "last_action_execution_end": record.time_to_last_action_execution_end_ms,
+        },
+        "remote_execution": {
+            "upload_bytes": record.re_upload_bytes,
+            "download_bytes": record.re_download_bytes,
+            "max_upload_speed": record.re_max_upload_speed,
+            "max_download_speed": record.re_max_download_speed,
+            "avg_upload_speed": record.re_avg_upload_speed,
+            "avg_download_speed": record.re_avg_download_speed,
+        },
+        "sink": {
+            "success_count": record.sink_success_count,
+            "failure_count": record.sink_failure_count,
+            "dropped_count": record.sink_dropped_count,
+            "bytes_written": record.sink_bytes_written,
+            "max_buffer_depth": record.sink_max_buffer_depth,
+        },
+        "event_log": {
+            "compressed_size_bytes": record.compressed_event_log_size_bytes,
+            "event_count": record.event_count,
+            "has_end_of_stream": record.has_end_of_stream,
+        },
+    });
+    let summary = serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_owned());
+    bep::BuildEvent {
+        id: Some(build_tool_logs_id()),
+        children: Vec::new(),
+        payload: Some(build_event::Payload::BuildToolLogs(bep::BuildToolLogs {
+            log: vec![file_with_contents("buck2-invocation.json", summary)],
+        })),
+        last_message: false,
+    }
+}
+
+fn configured_target_children_from_build_targets(
+    targets: &[buck2_data::BuildTarget],
+) -> Vec<bep::BuildEventId> {
+    targets
+        .iter()
+        .filter_map(|target| normalize_buck_label(&target.target))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(target_configured_id)
+        .collect()
+}
+
+fn pattern_expanded_event(
+    patterns: Vec<String>,
+    children: Vec<bep::BuildEventId>,
+) -> bep::BuildEvent {
+    bep::BuildEvent {
         id: Some(bep::BuildEventId {
             id: Some(build_event_id::Id::Pattern(
                 build_event_id::PatternExpandedId {
@@ -811,12 +1724,12 @@ fn pattern_expanded_event(patterns: &buck2_data::ParsedTargetPatterns) -> Option
                 },
             )),
         }),
-        children: Vec::new(),
+        children,
         payload: Some(build_event::Payload::Expanded(bep::PatternExpanded {
             test_suite_expansions: Vec::new(),
         })),
         last_message: false,
-    })
+    }
 }
 
 fn configured_event_from_analysis_start(
@@ -893,6 +1806,16 @@ fn completed_event_with_children(
     success: bool,
     children: Vec<bep::BuildEventId>,
 ) -> bep::BuildEvent {
+    completed_event_with_children_and_outputs(label, configuration, success, children, Vec::new())
+}
+
+fn completed_event_with_children_and_outputs(
+    label: String,
+    configuration: String,
+    success: bool,
+    children: Vec<bep::BuildEventId>,
+    output_group: Vec<bep::OutputGroup>,
+) -> bep::BuildEvent {
     bep::BuildEvent {
         id: Some(target_completed_id(label.clone(), configuration)),
         children,
@@ -900,12 +1823,13 @@ fn completed_event_with_children(
             success,
             target_kind: String::new(),
             test_size: bep::TestSize::Unknown as i32,
-            output_group: Vec::new(),
+            output_group,
             important_output: Vec::new(),
             tag: Vec::new(),
             test_timeout_seconds: 0,
             directory_output: Vec::new(),
-            failure_detail: None,
+            failure_detail: (!success)
+                .then(|| execution_failure_detail(format!("Target failed: {label}"))),
             test_timeout: None,
         })),
         last_message: false,
@@ -946,6 +1870,14 @@ fn action_event(
     let command_line = last_command
         .map(command_line_from_execution)
         .unwrap_or_default();
+    let mnemonic = action_mnemonic(action);
+    let strategy_details =
+        action_strategy_details(action, last_command, &label, &mnemonic, exit_code);
+    let failure_detail = action.failed.then(|| {
+        execution_failure_detail(action_failure_detail_message(
+            action, &label, &stderr, exit_code,
+        ))
+    });
 
     Some(bep::BuildEvent {
         id: Some(bep::BuildEventId {
@@ -966,76 +1898,42 @@ fn action_event(
             label,
             primary_output: Some(file_with_contents("primary_output", primary_output)),
             configuration: Some(configuration_id(configuration)),
-            r#type: action_mnemonic(action),
+            r#type: mnemonic,
             command_line,
             action_metadata_logs: Vec::new(),
-            failure_detail: None,
+            failure_detail,
             start_time,
             end_time,
-            strategy_details: Vec::new(),
+            strategy_details,
         })),
         last_message: false,
     })
 }
 
-fn test_result_event(result: &buck2_data::TestResult) -> Option<bep::BuildEvent> {
-    let label = label_for_configured_target(result.target_label.as_ref()?)?;
-    let configuration = configuration_id_for_target(result.target_label.as_ref()?);
-    Some(bep::BuildEvent {
-        id: Some(test_result_id(label, configuration)),
-        children: Vec::new(),
-        payload: Some(build_event::Payload::TestResult(bep::TestResult {
-            status: test_status(result.status),
-            cached_locally: false,
-            test_attempt_start_millis_epoch: 0,
-            test_attempt_duration_millis: 0,
-            test_action_output: Vec::new(),
-            warning: Vec::new(),
-            execution_info: None,
-            status_details: result.details.clone(),
-            test_attempt_start: None,
-            test_attempt_duration: result.duration.clone(),
-        })),
-        last_message: false,
+fn bep_file_from_action_output(output: &buck2_data::ActionOutput) -> Option<bep::File> {
+    let name = if output.path.is_empty() {
+        output.tiny_digest.clone()
+    } else {
+        output.path.clone()
+    };
+    if name.is_empty() {
+        return None;
+    }
+    Some(bep::File {
+        name,
+        path_prefix: Vec::new(),
+        file: action_output_uri(output).map(bep::file::File::Uri),
+        digest: output.digest.clone(),
+        length: i64::try_from(output.size).unwrap_or(i64::MAX),
     })
 }
 
-fn test_summary_event(
-    event: &buck2_data::BuckEvent,
-    span_end: &buck2_data::SpanEndEvent,
-    test_end: &buck2_data::TestRunEnd,
-) -> Option<bep::BuildEvent> {
-    let suite = test_end.suite.as_ref()?;
-    let label = label_for_configured_target(suite.target_label.as_ref()?)?;
-    let configuration = configuration_id_for_target(suite.target_label.as_ref()?);
-    let status = test_status_from_command_report(test_end.command_report.as_ref());
-    let end_time = event.timestamp.clone();
-    Some(bep::BuildEvent {
-        id: Some(test_summary_id(label, configuration)),
-        children: Vec::new(),
-        payload: Some(build_event::Payload::TestSummary(bep::TestSummary {
-            overall_status: status,
-            total_run_count: suite.test_names.len().max(1) as i32,
-            run_count: 1,
-            attempt_count: 1,
-            shard_count: 1,
-            passed: test_summary_files(status, test_end.command_report.as_ref(), true),
-            failed: test_summary_files(status, test_end.command_report.as_ref(), false),
-            total_num_cached: 0,
-            first_start_time_millis: 0,
-            last_stop_time_millis: 0,
-            total_run_duration_millis: 0,
-            first_start_time: start_time_from_span_end(span_end, end_time.as_ref()),
-            last_stop_time: end_time,
-            total_run_duration: test_end
-                .command_report
-                .as_ref()
-                .and_then(|command| command.details.as_ref())
-                .and_then(|details| details.metadata.as_ref())
-                .and_then(|metadata| metadata.wall_time.clone()),
-        })),
-        last_message: false,
-    })
+fn action_output_uri(output: &buck2_data::ActionOutput) -> Option<String> {
+    // Buck2 does not yet know the BES bytestream authority here, so keep this
+    // empty for now. The full digest and size are still useful for consumers
+    // that can map Buck2 output digests to their own CAS.
+    let _ = output;
+    None
 }
 
 fn finished_event_from_invocation_record(
@@ -1082,6 +1980,7 @@ fn finished_event(
     exit_code: i32,
     exit_name: impl Into<String>,
 ) -> bep::BuildEvent {
+    let exit_name = exit_name.into();
     bep::BuildEvent {
         id: Some(build_finished_id()),
         children: Vec::new(),
@@ -1090,14 +1989,61 @@ fn finished_event(
             finish_time_millis: 0,
             anomaly_report: None,
             exit_code: Some(bep::build_finished::ExitCode {
-                name: exit_name.into(),
+                name: exit_name.clone(),
                 code: exit_code,
             }),
             finish_time: timestamp,
-            failure_detail: None,
+            failure_detail: (exit_code != 0).then(|| {
+                execution_failure_detail(format!(
+                    "Buck2 invocation failed with {exit_name} ({exit_code})"
+                ))
+            }),
         })),
         last_message: true,
     }
+}
+
+fn execution_failure_detail(message: impl Into<String>) -> failure::FailureDetail {
+    failure::FailureDetail {
+        message: message.into(),
+        category: Some(failure::failure_detail::Category::Execution(
+            failure::Execution {
+                code: failure::execution::Code::NonActionExecutionFailure as i32,
+            },
+        )),
+    }
+}
+
+fn action_failure_detail_message(
+    action: &buck2_data::ActionExecutionEnd,
+    label: &str,
+    stderr: &str,
+    exit_code: i32,
+) -> String {
+    if let Some(message) = action.error.as_ref().and_then(action_error_detail_message) {
+        return format!("Action failed for {label}: {message}");
+    }
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        return format!("Action failed for {label}: {}", first_line(stderr));
+    }
+    format!("Action failed for {label} with exit code {exit_code}")
+}
+
+fn action_error_detail_message(error: &buck2_data::action_execution_end::Error) -> Option<String> {
+    match error {
+        buck2_data::action_execution_end::Error::Unknown(message) => {
+            (!message.is_empty()).then(|| message.clone())
+        }
+        buck2_data::action_execution_end::Error::MissingOutputs(_) => {
+            Some("missing outputs".to_owned())
+        }
+        buck2_data::action_execution_end::Error::CommandExecutionError(_) => None,
+    }
+}
+
+fn first_line(value: &str) -> &str {
+    value.lines().next().unwrap_or(value)
 }
 
 fn action_owner(key: &buck2_data::ActionKey) -> Option<&buck2_data::ConfiguredTargetLabel> {
@@ -1219,6 +2165,243 @@ fn command_line_from_execution(command: &buck2_data::CommandExecution) -> Vec<St
     }
 }
 
+fn action_strategy_details(
+    action: &buck2_data::ActionExecutionEnd,
+    command: Option<&buck2_data::CommandExecution>,
+    label: &str,
+    mnemonic: &str,
+    exit_code: i32,
+) -> Vec<Any> {
+    let mut fields = BTreeMap::new();
+    insert_string_field(&mut fields, "tool", "buck2");
+    insert_string_field(&mut fields, "label", label);
+    insert_string_field(&mut fields, "mnemonic", mnemonic);
+    insert_bool_field(&mut fields, "success", !action.failed);
+    insert_number_field(&mut fields, "exit_code", f64::from(exit_code));
+    insert_number_field(&mut fields, "output_count", action.outputs.len() as f64);
+    insert_number_field(&mut fields, "output_size_bytes", action.output_size as f64);
+    insert_bool_field(&mut fields, "prefers_local", action.prefers_local);
+    insert_bool_field(&mut fields, "requires_local", action.requires_local);
+    insert_bool_field(
+        &mut fields,
+        "allows_cache_upload",
+        action.allows_cache_upload,
+    );
+
+    let command_kind = command
+        .and_then(|command| command.details.as_ref())
+        .and_then(|details| details.command_kind.as_ref())
+        .and_then(|kind| kind.command.as_ref());
+
+    insert_string_field(
+        &mut fields,
+        "strategy",
+        action_execution_strategy(command_kind),
+    );
+
+    if let Some(command) = command {
+        insert_command_metadata_fields(&mut fields, command);
+    }
+
+    if let Some(command_kind) = command_kind {
+        insert_command_kind_fields(&mut fields, command_kind);
+    }
+
+    vec![struct_any(fields)]
+}
+
+fn insert_command_metadata_fields(
+    fields: &mut BTreeMap<String, Value>,
+    command: &buck2_data::CommandExecution,
+) {
+    let Some(metadata) = command
+        .details
+        .as_ref()
+        .and_then(|details| details.metadata.as_ref())
+    else {
+        return;
+    };
+
+    insert_optional_duration_field(fields, "wall_time_ms", metadata.wall_time.as_ref());
+    insert_optional_duration_field(
+        fields,
+        "execution_time_ms",
+        metadata.execution_time.as_ref(),
+    );
+    insert_optional_duration_field(
+        fields,
+        "input_materialization_ms",
+        metadata.input_materialization_duration.as_ref(),
+    );
+    insert_optional_duration_field(
+        fields,
+        "queue_duration_ms",
+        metadata.queue_duration.as_ref(),
+    );
+}
+
+fn insert_command_kind_fields(
+    fields: &mut BTreeMap<String, Value>,
+    command: &buck2_data::command_execution_kind::Command,
+) {
+    match command {
+        buck2_data::command_execution_kind::Command::LocalCommand(command) => {
+            insert_string_field(fields, "runner", "local");
+            insert_argv_fields(fields, &command.argv);
+            insert_non_empty_string_field(fields, "action_digest", &command.action_digest);
+        }
+        buck2_data::command_execution_kind::Command::WorkerCommand(command) => {
+            insert_string_field(fields, "runner", "worker");
+            insert_argv_fields(fields, &command.argv);
+            insert_non_empty_string_field(fields, "action_digest", &command.action_digest);
+            insert_number_field(
+                fields,
+                "fallback_arg_count",
+                command.fallback_exe.len() as f64,
+            );
+        }
+        buck2_data::command_execution_kind::Command::WorkerInitCommand(command) => {
+            insert_string_field(fields, "runner", "worker-init");
+            insert_argv_fields(fields, &command.argv);
+        }
+        buck2_data::command_execution_kind::Command::RemoteCommand(command) => {
+            insert_string_field(fields, "runner", "remote");
+            insert_non_empty_string_field(fields, "action_digest", &command.action_digest);
+            insert_bool_field(fields, "cache_hit", command.cache_hit);
+            if let Ok(cache_hit_type) = buck2_data::CacheHitType::try_from(command.cache_hit_type) {
+                insert_string_field(fields, "cache_hit_type", cache_hit_type.as_str_name());
+            }
+            insert_optional_duration_field(fields, "queue_time_ms", command.queue_time.as_ref());
+            if let Some(remote_dep_file_key) = command.remote_dep_file_key.as_ref() {
+                insert_non_empty_string_field(fields, "remote_dep_file_key", remote_dep_file_key);
+            }
+            insert_number_field(
+                fields,
+                "materialized_failed_input_count",
+                command.materialized_inputs_for_failed.len() as f64,
+            );
+            insert_number_field(
+                fields,
+                "materialized_failed_output_count",
+                command.materialized_outputs_for_failed_actions.len() as f64,
+            );
+            if let Some(details) = command.details.as_ref() {
+                if let Some(session_id) = details.session_id.as_ref() {
+                    insert_non_empty_string_field(fields, "remote_session_id", session_id);
+                }
+                insert_non_empty_string_field(fields, "remote_use_case", &details.use_case);
+                insert_bool_field(
+                    fields,
+                    "remote_persistent_worker",
+                    details.persistent_worker,
+                );
+                insert_platform_field(fields, details.platform.as_ref());
+            }
+        }
+        buck2_data::command_execution_kind::Command::OmittedLocalCommand(command) => {
+            insert_string_field(fields, "runner", "local-omitted");
+            insert_non_empty_string_field(fields, "action_digest", &command.action_digest);
+        }
+    }
+}
+
+fn action_execution_strategy(
+    command: Option<&buck2_data::command_execution_kind::Command>,
+) -> &'static str {
+    let Some(command) = command else {
+        return "unknown";
+    };
+    match command {
+        buck2_data::command_execution_kind::Command::LocalCommand(_)
+        | buck2_data::command_execution_kind::Command::OmittedLocalCommand(_) => "local",
+        buck2_data::command_execution_kind::Command::WorkerCommand(_)
+        | buck2_data::command_execution_kind::Command::WorkerInitCommand(_) => "worker",
+        buck2_data::command_execution_kind::Command::RemoteCommand(command) => {
+            match buck2_data::CacheHitType::try_from(command.cache_hit_type) {
+                Ok(buck2_data::CacheHitType::ActionCache) => "remote-cache",
+                Ok(buck2_data::CacheHitType::RemoteDepFileCache) => "remote-dep-file-cache",
+                Ok(buck2_data::CacheHitType::Executed) | Err(_) => "remote",
+            }
+        }
+    }
+}
+
+fn insert_platform_field(
+    fields: &mut BTreeMap<String, Value>,
+    platform: Option<&buck2_data::RePlatform>,
+) {
+    let Some(platform) = platform else {
+        return;
+    };
+    let platform = platform
+        .properties
+        .iter()
+        .filter(|property| !property.name.is_empty())
+        .map(|property| format!("{}={}", property.name, property.value))
+        .collect::<Vec<_>>();
+    if platform.is_empty() {
+        return;
+    }
+    insert_string_field(fields, "remote_platform", platform.join(","));
+}
+
+fn insert_argv_fields(fields: &mut BTreeMap<String, Value>, argv: &[String]) {
+    if let Some(argv0) = argv.first() {
+        insert_non_empty_string_field(fields, "argv0", argv0);
+    }
+    insert_number_field(fields, "argv_count", argv.len() as f64);
+}
+
+fn insert_optional_duration_field(
+    fields: &mut BTreeMap<String, Value>,
+    name: &str,
+    duration: Option<&prost_types::Duration>,
+) {
+    if let Some(duration) = duration {
+        insert_number_field(fields, name, duration_millis(duration) as f64);
+    }
+}
+
+fn insert_non_empty_string_field(fields: &mut BTreeMap<String, Value>, name: &str, value: &str) {
+    if !value.is_empty() {
+        insert_string_field(fields, name, value);
+    }
+}
+
+fn insert_string_field(fields: &mut BTreeMap<String, Value>, name: &str, value: impl Into<String>) {
+    fields.insert(
+        name.to_owned(),
+        Value {
+            kind: Some(value::Kind::StringValue(value.into())),
+        },
+    );
+}
+
+fn insert_bool_field(fields: &mut BTreeMap<String, Value>, name: &str, value: bool) {
+    fields.insert(
+        name.to_owned(),
+        Value {
+            kind: Some(value::Kind::BoolValue(value)),
+        },
+    );
+}
+
+fn insert_number_field(fields: &mut BTreeMap<String, Value>, name: &str, value: f64) {
+    fields.insert(
+        name.to_owned(),
+        Value {
+            kind: Some(value::Kind::NumberValue(value)),
+        },
+    );
+}
+
+fn struct_any(fields: BTreeMap<String, Value>) -> Any {
+    Any {
+        type_url: STRUCT_TYPE_URL.to_owned(),
+        value: Struct { fields }.encode_to_vec(),
+    }
+}
+
 fn action_mnemonic(action: &buck2_data::ActionExecutionEnd) -> String {
     if let Some(name) = action.name.as_ref()
         && !name.category.is_empty()
@@ -1301,6 +2484,54 @@ fn test_status_from_command_report(command: Option<&buck2_data::CommandExecution
     }
 }
 
+fn aggregate_test_status(
+    command: Option<&buck2_data::CommandExecution>,
+    cases: &[TestCaseState],
+) -> i32 {
+    let command_status = test_status_from_command_report(command);
+    if command_status != bep::TestStatus::NoStatus as i32 {
+        return command_status;
+    }
+    if cases.is_empty() {
+        return bep::TestStatus::NoStatus as i32;
+    }
+    if cases.iter().any(|case| {
+        matches!(
+            test_status(case.status),
+            status if status == bep::TestStatus::Failed as i32
+                || status == bep::TestStatus::Timeout as i32
+                || status == bep::TestStatus::RemoteFailure as i32
+                || status == bep::TestStatus::FailedToBuild as i32
+        )
+    }) {
+        return bep::TestStatus::Failed as i32;
+    }
+    if cases
+        .iter()
+        .all(|case| test_status(case.status) == bep::TestStatus::Passed as i32)
+    {
+        return bep::TestStatus::Passed as i32;
+    }
+    bep::TestStatus::NoStatus as i32
+}
+
+fn test_action_outputs(
+    cases: &[TestCaseState],
+    command: Option<&buck2_data::CommandExecution>,
+    status: i32,
+) -> Vec<bep::File> {
+    let mut outputs = Vec::new();
+    let log = test_log_contents(cases, command);
+    if !log.is_empty() {
+        outputs.push(file_with_contents("test.log", log));
+    }
+    let xml = test_xml_contents(cases, status);
+    if !xml.is_empty() {
+        outputs.push(file_with_contents("test.xml", xml));
+    }
+    outputs
+}
+
 fn test_summary_files(
     status: i32,
     command: Option<&buck2_data::CommandExecution>,
@@ -1311,17 +2542,163 @@ fn test_summary_files(
     if is_passed != passed {
         return Vec::new();
     }
-    let Some(details) = command.and_then(|command| command.details.as_ref()) else {
-        return Vec::new();
+    let log = test_log_contents(&[], command);
+    if log.is_empty() {
+        Vec::new()
+    } else {
+        vec![file_with_contents("test.log", log)]
+    }
+}
+
+fn test_log_contents(
+    cases: &[TestCaseState],
+    command: Option<&buck2_data::CommandExecution>,
+) -> String {
+    let mut log = String::new();
+    if let Some(details) = command.and_then(|command| command.details.as_ref()) {
+        if !details.cmd_stdout.is_empty() {
+            log.push_str("stdout:\n");
+            log.push_str(&details.cmd_stdout);
+            if !details.cmd_stdout.ends_with('\n') {
+                log.push('\n');
+            }
+        }
+        if !details.cmd_stderr.is_empty() {
+            log.push_str("stderr:\n");
+            log.push_str(&details.cmd_stderr);
+            if !details.cmd_stderr.ends_with('\n') {
+                log.push('\n');
+            }
+        }
+    }
+    for case in cases {
+        let details = case
+            .message
+            .as_deref()
+            .filter(|message| !message.is_empty())
+            .or_else(|| (!case.details.is_empty()).then_some(case.details.as_str()));
+        if let Some(details) = details {
+            log.push_str(&case.name);
+            log.push_str(": ");
+            log.push_str(details);
+            if !details.ends_with('\n') {
+                log.push('\n');
+            }
+        }
+    }
+    log
+}
+
+fn test_xml_contents(cases: &[TestCaseState], status: i32) -> String {
+    if cases.is_empty() {
+        return String::new();
+    }
+    let failures = cases
+        .iter()
+        .filter(|case| test_status(case.status) != bep::TestStatus::Passed as i32)
+        .count();
+    let mut xml = format!(
+        r#"<testsuite tests="{}" failures="{}" errors="0" skipped="{}">"#,
+        cases.len(),
+        failures,
+        if status == bep::TestStatus::Incomplete as i32 {
+            failures
+        } else {
+            0
+        }
+    );
+    for case in cases {
+        xml.push_str(&format!(
+            r#"<testcase name="{}" time="{}">"#,
+            xml_escape(&case.name),
+            duration_seconds(case.duration.as_ref())
+        ));
+        if test_status(case.status) != bep::TestStatus::Passed as i32 {
+            let message = case.message.as_deref().unwrap_or(&case.details);
+            xml.push_str(&format!(
+                r#"<failure message="{}">{}</failure>"#,
+                xml_escape(message),
+                xml_escape(&case.details)
+            ));
+        }
+        xml.push_str("</testcase>");
+    }
+    xml.push_str("</testsuite>");
+    xml
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\'', "&apos;")
+}
+
+fn duration_seconds(duration: Option<&prost_types::Duration>) -> String {
+    let Some(duration) = duration else {
+        return "0".to_owned();
     };
-    let mut files = Vec::new();
-    if !details.cmd_stdout.is_empty() {
-        files.push(file_with_contents("stdout", details.cmd_stdout.clone()));
+    let seconds = duration.seconds as f64 + f64::from(duration.nanos) / 1_000_000_000.0;
+    format!("{seconds:.3}")
+}
+
+fn test_status_details(
+    cases: &[TestCaseState],
+    command: Option<&buck2_data::CommandExecution>,
+) -> String {
+    let failed_cases = cases
+        .iter()
+        .filter(|case| test_status(case.status) != bep::TestStatus::Passed as i32)
+        .map(|case| case.name.clone())
+        .collect::<Vec<_>>();
+    if !failed_cases.is_empty() {
+        return format!("failed tests: {}", failed_cases.join(", "));
     }
-    if !details.cmd_stderr.is_empty() {
-        files.push(file_with_contents("stderr", details.cmd_stderr.clone()));
+    command
+        .and_then(|command| command.details.as_ref())
+        .map(|details| details.cmd_stderr.clone())
+        .filter(|stderr| !stderr.is_empty())
+        .unwrap_or_default()
+}
+
+fn test_duration(command: Option<&buck2_data::CommandExecution>) -> Option<prost_types::Duration> {
+    command
+        .and_then(|command| command.details.as_ref())
+        .and_then(|details| details.metadata.as_ref())
+        .and_then(|metadata| metadata.wall_time.clone())
+}
+
+fn test_execution_info(
+    command: Option<&buck2_data::CommandExecution>,
+) -> Option<bep::test_result::ExecutionInfo> {
+    let details = command.and_then(|command| command.details.as_ref())?;
+    Some(bep::test_result::ExecutionInfo {
+        timeout_seconds: 0,
+        strategy: details
+            .command_kind
+            .as_ref()
+            .and_then(|kind| kind.command.as_ref())
+            .map(test_strategy)
+            .unwrap_or_default(),
+        cached_remotely: false,
+        exit_code: details.signed_exit_code.unwrap_or_default(),
+        hostname: String::new(),
+        timing_breakdown: None,
+        resource_usage: Vec::new(),
+    })
+}
+
+fn test_strategy(command: &buck2_data::command_execution_kind::Command) -> String {
+    match command {
+        buck2_data::command_execution_kind::Command::LocalCommand(_) => "local",
+        buck2_data::command_execution_kind::Command::WorkerCommand(_)
+        | buck2_data::command_execution_kind::Command::WorkerInitCommand(_) => "worker",
+        buck2_data::command_execution_kind::Command::RemoteCommand(_) => "remote",
+        buck2_data::command_execution_kind::Command::OmittedLocalCommand(_) => "local",
     }
-    files
+    .to_owned()
 }
 
 fn action_error_message(action_error: &buck2_data::ActionError) -> String {
@@ -1389,6 +2766,20 @@ mod tests {
         }
     }
 
+    fn struct_string_field<'a>(details: &'a Struct, field: &str) -> Option<&'a str> {
+        match details.fields.get(field)?.kind.as_ref()? {
+            value::Kind::StringValue(value) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+
+    fn struct_number_field(details: &Struct, field: &str) -> Option<f64> {
+        match details.fields.get(field)?.kind.as_ref()? {
+            value::Kind::NumberValue(value) => Some(*value),
+            _ => None,
+        }
+    }
+
     #[test]
     fn command_start_emits_started_and_metadata() {
         let mut converter = BazelEventConverter::default();
@@ -1399,8 +2790,13 @@ mod tests {
                         cli_args: vec![
                             "buck2".to_owned(),
                             "build".to_owned(),
+                            "--remote-cache=grpc://cache.example.com".to_owned(),
                             "//:main".to_owned(),
                         ],
+                        metadata: HashMap::from([
+                            ("username".to_owned(), "alice".to_owned()),
+                            ("hostname".to_owned(), "workstation".to_owned()),
+                        ]),
                         data: Some(buck2_data::command_start::Data::Build(
                             buck2_data::BuildCommandStart {},
                         )),
@@ -1419,6 +2815,44 @@ mod tests {
             event.payload,
             Some(build_event::Payload::StructuredCommandLine(_))
         )));
+        let canonical = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::StructuredCommandLine(command_line))
+                    if command_line.command_line_label == CANONICAL_COMMAND_LINE_LABEL =>
+                {
+                    Some(command_line)
+                }
+                _ => None,
+            })
+            .expect("canonical structured command line");
+        let options = canonical
+            .sections
+            .iter()
+            .flat_map(|section| match section.section_type.as_ref() {
+                Some(cl::command_line_section::SectionType::OptionList(options)) => {
+                    options.option.as_slice()
+                }
+                _ => &[],
+            })
+            .collect::<Vec<_>>();
+        assert!(options.iter().any(|option| {
+            option.option_name == "remote_cache"
+                && option.option_value == "grpc://cache.example.com"
+        }));
+        assert!(options.iter().any(|option| {
+            option.option_name == "client_env" && option.option_value == "USER=alice"
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.payload, Some(build_event::Payload::OptionsParsed(_))))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.payload, Some(build_event::Payload::Configuration(_))))
+        );
 
         let any = encode_bep_event(&events[0]);
         assert_eq!(any.type_url, BEP_EVENT_TYPE_URL);
@@ -1427,6 +2861,134 @@ mod tests {
             decoded.payload,
             Some(build_event::Payload::Started(_))
         ));
+    }
+
+    #[test]
+    fn pattern_expanded_links_resolved_targets() {
+        let mut converter = BazelEventConverter::default();
+        let patterns = trace_event(buck2_data::buck_event::Data::Instant(
+            buck2_data::InstantEvent {
+                data: Some(buck2_data::instant_event::Data::TargetPatterns(
+                    buck2_data::ParsedTargetPatterns {
+                        target_patterns: vec![buck2_data::TargetPattern {
+                            value: "//:main".to_owned(),
+                        }],
+                    },
+                )),
+            },
+        ));
+
+        let events = converter.convert(1, &patterns);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.payload, Some(build_event::Payload::Expanded(_))))
+        );
+
+        let build_graph = trace_event(buck2_data::buck_event::Data::Record(
+            buck2_data::RecordEvent {
+                data: Some(buck2_data::record_event::Data::BuildGraphStats(
+                    buck2_data::BuildGraphStats {
+                        build_targets: vec![buck2_data::BuildTarget {
+                            target: "//:main".to_owned(),
+                            configuration: "cfg".to_owned(),
+                            configured_graph_size: None,
+                        }],
+                    },
+                )),
+            },
+        ));
+        let events = converter.convert(2, &build_graph);
+        let expanded = events
+            .iter()
+            .find(|event| matches!(event.payload, Some(build_event::Payload::Expanded(_))))
+            .expect("PatternExpanded event");
+
+        let Some(build_event_id::Id::Pattern(pattern_id)) =
+            expanded.id.as_ref().and_then(|id| id.id.as_ref())
+        else {
+            panic!("expected PatternExpanded id");
+        };
+        assert_eq!(pattern_id.pattern, vec!["//:main"]);
+        assert!(
+            expanded
+                .children
+                .iter()
+                .any(|child| child == &target_configured_id("//:main".to_owned()))
+        );
+    }
+
+    #[test]
+    fn invocation_record_emits_build_metrics() {
+        let mut converter = BazelEventConverter::default();
+        let event = trace_event(buck2_data::buck_event::Data::Record(
+            buck2_data::RecordEvent {
+                data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
+                    buck2_data::InvocationRecord {
+                        outcome: Some(buck2_data::InvocationOutcome::Success as i32),
+                        run_local_count: 2,
+                        run_remote_count: 3,
+                        run_action_cache_count: 5,
+                        client_walltime: Some(prost_types::Duration {
+                            seconds: 1,
+                            nanos: 500_000_000,
+                        }),
+                        analysis_count: Some(7),
+                        command_name: Some("build".to_owned()),
+                        re_session_id: "re-session".to_owned(),
+                        tags: vec!["ci".to_owned()],
+                        ..Default::default()
+                    },
+                ))),
+            },
+        ));
+
+        let events = converter.convert(1, &event);
+        let metrics = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::BuildMetrics(metrics)) => Some(metrics),
+                _ => None,
+            })
+            .expect("build metrics event");
+        let action_summary = metrics.action_summary.as_ref().unwrap();
+        assert_eq!(action_summary.actions_executed, 10);
+        assert_eq!(action_summary.remote_cache_hits, 5);
+        let action_cache_statistics = action_summary.action_cache_statistics.as_ref().unwrap();
+        assert_eq!(action_cache_statistics.hits, 5);
+        assert_eq!(action_cache_statistics.misses, 5);
+        assert_eq!(action_cache_statistics.miss_details.len(), 1);
+        assert_eq!(
+            action_cache_statistics.miss_details[0].reason,
+            blaze::action_cache_statistics::MissReason::NotCached as i32
+        );
+        assert_eq!(action_cache_statistics.miss_details[0].count, 5);
+        assert_eq!(
+            metrics.timing_metrics.as_ref().unwrap().wall_time_in_ms,
+            1500
+        );
+        assert_eq!(
+            metrics.target_metrics.as_ref().unwrap().targets_configured,
+            7
+        );
+        let logs = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::BuildToolLogs(logs)) => Some(logs),
+                _ => None,
+            })
+            .expect("build tool logs event");
+        assert_eq!(logs.log[0].name, "buck2-invocation.json");
+        let contents = match logs.log[0].file.as_ref() {
+            Some(bep::file::File::Contents(contents)) => contents,
+            other => panic!("expected inline invocation summary, got {other:?}"),
+        };
+        let summary: serde_json::Value =
+            serde_json::from_slice(contents).expect("valid summary json");
+        assert_eq!(summary["command"], "build");
+        assert_eq!(summary["outcome"], "success");
+        assert_eq!(summary["re_session_id"], "re-session");
+        assert_eq!(summary["actions"]["remote_cache"], 5);
     }
 
     #[test]
@@ -1604,6 +3166,10 @@ mod tests {
                             }),
                             outputs: vec![buck2_data::ActionOutput {
                                 tiny_digest: "buck-out/main.o".to_owned(),
+                                path: "buck-out/main.o".to_owned(),
+                                digest: "abcd:10".to_owned(),
+                                size: 10,
+                                is_directory: false,
                             }],
                             ..Default::default()
                         },
@@ -1648,8 +3214,101 @@ mod tests {
             panic!("expected TargetCompleted id");
         };
         assert_eq!(completed_id.label, "//:main");
-        assert_eq!(completed_update.children.len(), 1);
-        assert_eq!(completed_update.children[0], action[0].id.clone().unwrap());
+        assert!(
+            completed_update
+                .children
+                .iter()
+                .any(|child| child == &action[0].id.clone().unwrap())
+        );
+        let Some(build_event::Payload::Completed(completed)) = completed_update.payload.as_ref()
+        else {
+            panic!("expected TargetComplete payload");
+        };
+        assert_eq!(completed.output_group.len(), 1);
+        assert!(final_events.iter().any(|event| matches!(
+            event.payload,
+            Some(build_event::Payload::NamedSetOfFiles(_))
+        )));
+    }
+
+    #[test]
+    fn analysis_only_target_completes_at_invocation_end() {
+        let mut converter = BazelEventConverter::default();
+        let target = configured_target_with_package("root//", "main", "cfg");
+
+        let analysis_end = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::Analysis(
+                        buck2_data::AnalysisEnd {
+                            rule: "cxx_binary".to_owned(),
+                            target: Some(buck2_data::analysis_end::Target::StandardTarget(target)),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+        );
+        assert!(
+            !analysis_end
+                .iter()
+                .any(|event| matches!(event.payload, Some(build_event::Payload::Completed(_))))
+        );
+
+        let final_events = converter.convert(
+            2,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
+                        buck2_data::InvocationRecord {
+                            outcome: Some(buck2_data::InvocationOutcome::Success as i32),
+                            ..Default::default()
+                        },
+                    ))),
+                },
+            )),
+        );
+
+        let completed = final_events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::Completed(completed)) => Some(completed),
+                _ => None,
+            })
+            .expect("analysis-only target completion");
+        assert!(completed.success);
+    }
+
+    #[test]
+    fn configured_targets_are_deduplicated() {
+        let mut converter = BazelEventConverter::default();
+        let target = configured_target_with_package("root//", "main", "cfg");
+        let event = trace_event(buck2_data::buck_event::Data::SpanStart(
+            buck2_data::SpanStartEvent {
+                data: Some(buck2_data::span_start_event::Data::Analysis(
+                    buck2_data::AnalysisStart {
+                        rule: "cxx_binary".to_owned(),
+                        target: Some(buck2_data::analysis_start::Target::StandardTarget(target)),
+                    },
+                )),
+            },
+        ));
+
+        let first = converter.convert(1, &event);
+        assert!(
+            first
+                .iter()
+                .any(|event| matches!(event.payload, Some(build_event::Payload::Configured(_))))
+        );
+
+        let second = converter.convert(2, &event);
+        assert!(
+            !second
+                .iter()
+                .any(|event| matches!(event.payload, Some(build_event::Payload::Configured(_))))
+        );
     }
 
     #[test]
@@ -1725,6 +3384,10 @@ mod tests {
                             failed: true,
                             outputs: vec![buck2_data::ActionOutput {
                                 tiny_digest: "buck-out/main.o".to_owned(),
+                                path: "buck-out/main.o".to_owned(),
+                                digest: "abcd:10".to_owned(),
+                                size: 10,
+                                is_directory: false,
                             }],
                             commands: vec![buck2_data::CommandExecution {
                                 details: Some(buck2_data::CommandExecutionDetails {
@@ -1754,18 +3417,59 @@ mod tests {
                 },
             )),
         );
-        let test_result = converter.convert(
+        let testcase = converter.convert(
             5,
             &trace_event(buck2_data::buck_event::Data::Instant(
                 buck2_data::InstantEvent {
                     data: Some(buck2_data::instant_event::Data::TestResult(
                         buck2_data::TestResult {
+                            name: "test_passes".to_owned(),
                             status: buck2_data::TestStatus::Pass as i32,
                             target_label: Some(target.clone()),
                             details: "passed".to_owned(),
                             ..Default::default()
                         },
                     )),
+                },
+            )),
+        );
+        assert!(testcase.is_empty());
+        let test_result = converter.convert(
+            6,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::TestRun(
+                        buck2_data::TestRunEnd {
+                            suite: Some(buck2_data::TestSuite {
+                                suite_name: "suite".to_owned(),
+                                test_names: vec!["test_passes".to_owned()],
+                                target_label: Some(target.clone()),
+                            }),
+                            command_report: Some(buck2_data::CommandExecution {
+                                details: Some(buck2_data::CommandExecutionDetails {
+                                    signed_exit_code: Some(0),
+                                    cmd_stdout: "test stdout".to_owned(),
+                                    command_kind: Some(buck2_data::CommandExecutionKind {
+                                        command: Some(
+                                            buck2_data::command_execution_kind::Command::LocalCommand(
+                                                buck2_data::LocalCommand {
+                                                    argv: vec!["test-binary".to_owned()],
+                                                    ..Default::default()
+                                                },
+                                            ),
+                                        ),
+                                    }),
+                                    ..Default::default()
+                                }),
+                                status: Some(buck2_data::command_execution::Status::Success(
+                                    buck2_data::command_execution::Success {},
+                                )),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
                 },
             )),
         );
@@ -1781,13 +3485,7 @@ mod tests {
             Some(build_event::Payload::Configured(_))
         ));
 
-        let Some(build_event_id::Id::TargetCompleted(completed_id)) =
-            completed[0].id.as_ref().and_then(|id| id.id.as_ref())
-        else {
-            panic!("expected TargetCompleted id");
-        };
-        assert_eq!(completed_id.label, "//pkg:main");
-        assert_eq!(completed_id.configuration.as_ref().unwrap().id, "cfg");
+        assert!(completed.is_empty());
 
         let Some(build_event_id::Id::ActionCompleted(action_id)) =
             action[0].id.as_ref().and_then(|id| id.id.as_ref())
@@ -1803,6 +3501,41 @@ mod tests {
                 ..
             }))
         ));
+        let Some(build_event::Payload::Action(action_payload)) = action[0].payload.as_ref() else {
+            panic!("expected ActionExecuted payload");
+        };
+        assert_eq!(
+            action_payload
+                .failure_detail
+                .as_ref()
+                .map(|detail| detail.message.as_str()),
+            Some("Action failed for //pkg:main: compile failed")
+        );
+        assert_eq!(action_payload.strategy_details.len(), 1);
+        assert_eq!(action_payload.strategy_details[0].type_url, STRUCT_TYPE_URL);
+        let strategy_details = Struct::decode(action_payload.strategy_details[0].value.as_slice())
+            .expect("strategy details struct");
+        assert_eq!(
+            struct_string_field(&strategy_details, "strategy"),
+            Some("local")
+        );
+        assert_eq!(
+            struct_string_field(&strategy_details, "runner"),
+            Some("local")
+        );
+        assert_eq!(
+            struct_string_field(&strategy_details, "label"),
+            Some("//pkg:main")
+        );
+        assert_eq!(
+            struct_string_field(&strategy_details, "mnemonic"),
+            Some("cxx_compile")
+        );
+        assert_eq!(struct_string_field(&strategy_details, "argv0"), Some("cc"));
+        assert_eq!(
+            struct_number_field(&strategy_details, "exit_code"),
+            Some(1.0)
+        );
 
         let Some(build_event_id::Id::TestResult(test_id)) =
             test_result[0].id.as_ref().and_then(|id| id.id.as_ref())
@@ -1818,5 +3551,66 @@ mod tests {
                 ..
             })) if status == bep::TestStatus::Passed as i32
         ));
+        let Some(build_event::Payload::TestResult(result)) = test_result[0].payload.as_ref() else {
+            panic!("expected TestResult payload");
+        };
+        assert!(
+            result
+                .test_action_output
+                .iter()
+                .any(|file| file.name == "test.log")
+        );
+        assert!(
+            result
+                .test_action_output
+                .iter()
+                .any(|file| file.name == "test.xml")
+        );
+
+        let final_events = converter.convert(
+            7,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
+                        buck2_data::InvocationRecord {
+                            outcome: Some(buck2_data::InvocationOutcome::Failed as i32),
+                            exit_code: Some(1),
+                            exit_result_name: Some("FAILED".to_owned()),
+                            ..Default::default()
+                        },
+                    ))),
+                },
+            )),
+        );
+        let completed = final_events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::Completed(completed)) if !event.children.is_empty() => {
+                    Some(completed)
+                }
+                _ => None,
+            })
+            .expect("failed target completion");
+        assert_eq!(
+            completed
+                .failure_detail
+                .as_ref()
+                .map(|detail| detail.message.as_str()),
+            Some("Target failed: //pkg:main")
+        );
+        let finished = final_events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::Finished(finished)) => Some(finished),
+                _ => None,
+            })
+            .expect("build finished");
+        assert_eq!(
+            finished
+                .failure_detail
+                .as_ref()
+                .map(|detail| detail.message.as_str()),
+            Some("Buck2 invocation failed with FAILED (1)")
+        );
     }
 }
