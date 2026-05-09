@@ -9,6 +9,7 @@ version = "0.1.0"
 [dependencies]
 anyhow = { workspace = true }
 async-compression = { workspace = true }
+blake3 = { workspace = true }
 dupe = { workspace = true }
 futures = { workspace = true }
 gazebo = { workspace = true }
@@ -23,6 +24,8 @@ prost = { workspace = true }
 prost-types = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
