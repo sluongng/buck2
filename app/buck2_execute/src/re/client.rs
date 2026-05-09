@@ -439,12 +439,9 @@ impl RemoteExecutionClient {
         metadata: RemoteExecutionMetadata,
     ) -> buck2_error::Result<Vec<(TDigest, DateTime<Utc>)>> {
         let now = Utc::now();
+        let expected_digests = digests.clone();
         let ttls = self.get_digests_ttl(digests, metadata).await?;
-        Ok(ttls
-            .digests_with_ttl
-            .into_iter()
-            .map(|t| (t.digest, now + chrono::Duration::seconds(t.ttl)))
-            .collect())
+        validate_digest_expirations(expected_digests, ttls, now)
     }
 
     pub async fn extend_digest_ttl(
@@ -2140,6 +2137,49 @@ fn validate_inlined_blob(
     Ok(())
 }
 
+fn compare_digest(left: &TDigest, right: &TDigest) -> std::cmp::Ordering {
+    left.hash
+        .cmp(&right.hash)
+        .then_with(|| left.size_in_bytes.cmp(&right.size_in_bytes))
+}
+
+fn validate_digest_expirations(
+    mut expected_digests: Vec<TDigest>,
+    response: GetDigestsTtlResponse,
+    now: DateTime<Utc>,
+) -> buck2_error::Result<Vec<(TDigest, DateTime<Utc>)>> {
+    let mut digests_with_ttl = response.digests_with_ttl;
+
+    if expected_digests.len() != digests_with_ttl.len() {
+        return Err(buck2_error!(
+            buck2_error::ErrorTag::DigestTtlMismatch,
+            "Invalid response from get_digests_ttl: expected {}, got {} digests",
+            expected_digests.len(),
+            digests_with_ttl.len()
+        ));
+    }
+
+    expected_digests.sort_by(compare_digest);
+    digests_with_ttl.sort_by(|left, right| compare_digest(&left.digest, &right.digest));
+
+    digests_with_ttl
+        .into_iter()
+        .zip(expected_digests)
+        .map(|(t, expected_digest)| {
+            if t.digest.hash != expected_digest.hash
+                || t.digest.size_in_bytes != expected_digest.size_in_bytes
+            {
+                return Err(buck2_error!(
+                    buck2_error::ErrorTag::DigestTtlInvalidResponse,
+                    "Invalid response from get_digests_ttl"
+                ));
+            }
+
+            Ok((t.digest, now + chrono::Duration::seconds(t.ttl)))
+        })
+        .collect::<buck2_error::Result<_>>()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2147,6 +2187,14 @@ mod tests {
     fn test_digest(size: i64) -> TDigest {
         TDigest {
             hash: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            size_in_bytes: size,
+            ..Default::default()
+        }
+    }
+
+    fn test_digest_with_hash(hash: &str, size: i64) -> TDigest {
+        TDigest {
+            hash: hash.to_owned(),
             size_in_bytes: size,
             ..Default::default()
         }
@@ -2222,5 +2270,76 @@ mod tests {
         blob.status.message = "corrupt blob".to_owned();
 
         assert!(validate_inlined_blob(&digest, &blob).is_err());
+    }
+
+    #[test]
+    fn validate_digest_expirations_accepts_out_of_order_response() {
+        let now = Utc::now();
+        let digest_a = test_digest_with_hash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1);
+        let digest_b = test_digest_with_hash("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 2);
+
+        let expirations = validate_digest_expirations(
+            vec![digest_b.clone(), digest_a.clone()],
+            GetDigestsTtlResponse {
+                digests_with_ttl: vec![
+                    remote_execution::DigestWithTtl {
+                        digest: digest_a.clone(),
+                        ttl: 10,
+                    },
+                    remote_execution::DigestWithTtl {
+                        digest: digest_b.clone(),
+                        ttl: 20,
+                    },
+                ],
+            },
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(
+            expirations,
+            vec![
+                (digest_a, now + chrono::Duration::seconds(10)),
+                (digest_b, now + chrono::Duration::seconds(20))
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_digest_expirations_rejects_wrong_count() {
+        let now = Utc::now();
+        let digest = test_digest(1);
+
+        assert!(
+            validate_digest_expirations(
+                vec![digest],
+                GetDigestsTtlResponse {
+                    digests_with_ttl: Vec::new(),
+                },
+                now,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_digest_expirations_rejects_wrong_digest() {
+        let now = Utc::now();
+        let digest = test_digest_with_hash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1);
+        let returned_digest = test_digest_with_hash("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 1);
+
+        assert!(
+            validate_digest_expirations(
+                vec![digest],
+                GetDigestsTtlResponse {
+                    digests_with_ttl: vec![remote_execution::DigestWithTtl {
+                        digest: returned_digest,
+                        ttl: 10,
+                    }],
+                },
+                now,
+            )
+            .is_err()
+        );
     }
 }
