@@ -14,6 +14,7 @@ use std::env::VarError;
 use std::io;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -378,6 +379,8 @@ pub struct RERuntimeOpts {
     download_hash_digest_function: Option<digest_function::Value>,
     /// Digest functions selected from daemon config for RE request fields.
     request_digest_function_config: DigestFunctionConfig,
+    /// Whether to chunk large remote-cache blobs using FastCDC 2020 and SpliceBlob.
+    remote_cache_chunking: bool,
 }
 
 impl RERuntimeOpts {
@@ -528,6 +531,122 @@ struct FastCdc2020Config {
     seed: u32,
 }
 
+#[derive(Debug)]
+struct LocalChunkCache {
+    root: PathBuf,
+}
+
+impl LocalChunkCache {
+    fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    fn path_for(&self, digest: &TDigest) -> Option<PathBuf> {
+        if digest.size_in_bytes < 0 || digest.hash.is_empty() {
+            return None;
+        }
+        if !digest.hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let hash = digest.hash.to_ascii_lowercase();
+        let prefix_len = hash.len().min(2);
+        let prefix = &hash[..prefix_len];
+        Some(
+            self.root
+                .join(hash.len().to_string())
+                .join(prefix)
+                .join(format!("{}-{}", hash, digest.size_in_bytes)),
+        )
+    }
+
+    async fn read(
+        &self,
+        digest: &TDigest,
+        selected_digest_function: Option<digest_function::Value>,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let Some(path) = self.path_for(digest) else {
+            return Ok(None);
+        };
+        match tokio::fs::read(&path).await {
+            Ok(blob) => match validate_downloaded_blob(digest, &blob, selected_digest_function) {
+                Ok(()) => Ok(Some(blob)),
+                Err(error) => {
+                    tracing::debug!(
+                        path = %path.display(),
+                        digest = %digest,
+                        %error,
+                        "Ignoring corrupt local FastCDC chunk cache entry"
+                    );
+                    let _ = tokio::fs::remove_file(&path).await;
+                    Ok(None)
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    digest = %digest,
+                    %error,
+                    "Failed to read local FastCDC chunk cache entry"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    async fn write(
+        &self,
+        digest: &TDigest,
+        blob: &[u8],
+        selected_digest_function: Option<digest_function::Value>,
+    ) {
+        let Some(path) = self.path_for(digest) else {
+            return;
+        };
+        if let Err(error) = validate_downloaded_blob(digest, blob, selected_digest_function) {
+            tracing::debug!(
+                path = %path.display(),
+                digest = %digest,
+                %error,
+                "Skipping invalid local FastCDC chunk cache write"
+            );
+            return;
+        }
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if let Err(error) = tokio::fs::create_dir_all(parent).await {
+            tracing::debug!(
+                path = %parent.display(),
+                digest = %digest,
+                %error,
+                "Failed to create local FastCDC chunk cache directory"
+            );
+            return;
+        }
+        let tmp_path = parent.join(format!(".{}.tmp", Uuid::new_v4()));
+        if let Err(error) = tokio::fs::write(&tmp_path, blob).await {
+            tracing::debug!(
+                path = %tmp_path.display(),
+                digest = %digest,
+                %error,
+                "Failed to write local FastCDC chunk cache entry"
+            );
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return;
+        }
+        if let Err(error) = tokio::fs::rename(&tmp_path, &path).await {
+            tracing::debug!(
+                path = %path.display(),
+                digest = %digest,
+                %error,
+                "Failed to commit local FastCDC chunk cache entry"
+            );
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+        }
+    }
+}
+
 impl FastCdc2020Config {
     fn min_chunk_size_bytes(&self) -> u64 {
         self.avg_chunk_size_bytes / 4
@@ -543,6 +662,10 @@ impl FastCdc2020Config {
 
     fn chunking_function(&self) -> TChunkingFunction {
         TChunkingFunction::FastCdc2020
+    }
+
+    fn normalization_level(&self) -> fastcdc::v2020::Normalization {
+        fastcdc::v2020::Normalization::Level2
     }
 }
 
@@ -590,6 +713,116 @@ fn validate_chunking_function_supported(
             "RepMaxCDC chunking is not supported by this client"
         )),
     }
+}
+
+fn validate_remote_cache_chunking_enabled(
+    remote_cache_chunking: bool,
+    capabilities: &RECapabilities,
+) -> anyhow::Result<()> {
+    if !remote_cache_chunking {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        capabilities.capabilities_queried,
+        "remote_cache_chunking requires RE server capabilities to be enabled"
+    );
+    validate_blob_split_supported(capabilities.blob_split_supported)?;
+    validate_blob_splice_supported(capabilities.blob_splice_supported)?;
+    anyhow::ensure!(
+        capabilities.fast_cdc_2020.is_some(),
+        "remote_cache_chunking requires FastCDC 2020 parameters from the remote server"
+    );
+    Ok(())
+}
+
+fn digest_blob(data: &[u8], digest_function: digest_function::Value) -> anyhow::Result<TDigest> {
+    let hash = match digest_function {
+        digest_function::Value::Sha1 => format!("{:x}", Sha1::digest(data)),
+        digest_function::Value::Sha256 => format!("{:x}", Sha256::digest(data)),
+        digest_function::Value::Blake3 => blake3::hash(data).to_hex().to_string(),
+        _ => {
+            anyhow::bail!(
+                "Digest function {} is not supported for FastCDC chunk digests",
+                digest_function_name(digest_function)
+            )
+        }
+    };
+    Ok(TDigest {
+        hash,
+        size_in_bytes: i64::try_from(data.len()).context("Blob is too large to digest")?,
+        ..Default::default()
+    })
+}
+
+fn chunk_inlined_blob_fast_cdc_2020(
+    blob: &InlinedBlobWithDigest,
+    config: &FastCdc2020Config,
+    digest_function: digest_function::Value,
+) -> anyhow::Result<Vec<InlinedBlobWithDigest>> {
+    let min_size = usize::try_from(config.min_chunk_size_bytes())
+        .context("FastCDC minimum chunk size does not fit usize")?;
+    let avg_size = usize::try_from(config.avg_chunk_size_bytes)
+        .context("FastCDC average chunk size does not fit usize")?;
+    let max_size = usize::try_from(config.max_chunk_size_bytes())
+        .context("FastCDC maximum chunk size does not fit usize")?;
+    let chunker = fastcdc::v2020::FastCDC::with_level_and_seed(
+        &blob.blob,
+        min_size,
+        avg_size,
+        max_size,
+        config.normalization_level(),
+        u64::from(config.seed),
+    );
+    let mut chunks = Vec::new();
+    for chunk in chunker {
+        let end = chunk
+            .offset
+            .checked_add(chunk.length)
+            .context("FastCDC chunk range overflowed")?;
+        let data = blob
+            .blob
+            .get(chunk.offset..end)
+            .context("FastCDC chunk range was outside the blob")?
+            .to_vec();
+        chunks.push(InlinedBlobWithDigest {
+            digest: digest_blob(&data, digest_function)?,
+            blob: data,
+            ..Default::default()
+        });
+    }
+    Ok(chunks)
+}
+
+fn chunk_file_fast_cdc_2020(
+    path: &str,
+    config: &FastCdc2020Config,
+    digest_function: digest_function::Value,
+) -> anyhow::Result<Vec<InlinedBlobWithDigest>> {
+    let min_size = usize::try_from(config.min_chunk_size_bytes())
+        .context("FastCDC minimum chunk size does not fit usize")?;
+    let avg_size = usize::try_from(config.avg_chunk_size_bytes)
+        .context("FastCDC average chunk size does not fit usize")?;
+    let max_size = usize::try_from(config.max_chunk_size_bytes())
+        .context("FastCDC maximum chunk size does not fit usize")?;
+    let file = std::fs::File::open(path).with_context(|| format!("Opening `{path}` failed"))?;
+    let chunker = fastcdc::v2020::StreamCDC::with_level_and_seed(
+        file,
+        min_size,
+        avg_size,
+        max_size,
+        config.normalization_level(),
+        u64::from(config.seed),
+    );
+    let mut chunks = Vec::new();
+    for chunk in chunker {
+        let chunk = chunk.with_context(|| format!("Reading FastCDC chunk from `{path}` failed"))?;
+        chunks.push(InlinedBlobWithDigest {
+            digest: digest_blob(&chunk.data, digest_function)?,
+            blob: chunk.data,
+            ..Default::default()
+        });
+    }
+    Ok(chunks)
 }
 
 fn priority_ranges(capabilities: &PriorityCapabilities) -> Vec<PriorityRange> {
@@ -1104,6 +1337,20 @@ impl REClientBuilder {
         )?;
         let request_digest_function_config =
             DigestFunctionConfig::from_configured_algorithms(&opts.digest_algorithms);
+        validate_remote_cache_chunking_enabled(opts.remote_cache_chunking, &capabilities)?;
+        let local_chunk_cache = opts
+            .remote_cache_chunk_cache_dir
+            .as_deref()
+            .map(|path| {
+                let path =
+                    substitute_env_vars(path).context("Invalid `remote_cache_chunk_cache_dir`")?;
+                anyhow::ensure!(
+                    !path.is_empty(),
+                    "`remote_cache_chunk_cache_dir` must not be empty"
+                );
+                Ok(LocalChunkCache::new(PathBuf::from(path)))
+            })
+            .transpose()?;
 
         let max_decoding_msg_size = opts
             .max_decoding_message_size
@@ -1157,6 +1404,9 @@ impl REClientBuilder {
             fast_cdc_2020_seed = ?capabilities.fast_cdc_2020
                 .as_ref()
                 .map(|config| config.seed),
+            local_fast_cdc_chunk_cache_dir = ?local_chunk_cache
+                .as_ref()
+                .map(|cache| cache.root.display().to_string()),
             "RE server capabilities"
         );
 
@@ -1188,6 +1438,7 @@ impl REClientBuilder {
                 retry_max_delay_ms,
                 download_hash_digest_function,
                 request_digest_function_config,
+                remote_cache_chunking: opts.remote_cache_chunking,
             },
             capabilities,
             instance_name,
@@ -1198,6 +1449,7 @@ impl REClientBuilder {
             cas_address,
             engine_address.clone(),
             action_cache_address,
+            local_chunk_cache,
         ))
     }
 
@@ -1243,7 +1495,7 @@ impl REClientBuilder {
             cache_digest_functions_from_capabilities(resp.cache_capabilities.as_ref());
         if assumed_sha256_cache_digest_function {
             tracing::warn!(
-                "Remote cache capabilities did not advertise digest functions; assuming SHA256. +                Configure [buck2] digest_algorithms only when the remote cache advertises +                matching digest function support."
+                "Remote cache capabilities did not advertise digest functions; assuming SHA256. Configure [buck2] digest_algorithms only when the remote cache advertises matching digest function support."
             );
         }
 
@@ -1422,6 +1674,7 @@ pub struct REClient {
     engine_address: String,
     action_cache_address: String,
     query_write_status_supported: AtomicBool,
+    local_chunk_cache: Option<LocalChunkCache>,
 }
 
 impl Drop for REClient {
@@ -1726,6 +1979,7 @@ impl REClient {
         cas_address: String,
         engine_address: String,
         action_cache_address: String,
+        local_chunk_cache: Option<LocalChunkCache>,
     ) -> Self {
         REClient {
             runtime_opts,
@@ -1744,6 +1998,7 @@ impl REClient {
             engine_address,
             action_cache_address,
             query_write_status_supported: AtomicBool::new(true),
+            local_chunk_cache,
         }
     }
 
@@ -2060,6 +2315,22 @@ impl REClient {
                 .filter_upload_request_to_missing(metadata.clone(), request)
                 .await?;
         }
+        let (request, spliced_digests) = self
+            .upload_chunked_inlined_blobs(metadata.clone(), request)
+            .await?;
+        let (request, file_spliced_digests) =
+            self.upload_chunked_files(metadata.clone(), request).await?;
+        let response = self.upload_direct(metadata, request).await?;
+        self.mark_digests_exist_on_remote(spliced_digests);
+        self.mark_digests_exist_on_remote(file_spliced_digests);
+        Ok(response)
+    }
+
+    async fn upload_direct(
+        &self,
+        metadata: RemoteExecutionMetadata,
+        request: UploadRequest,
+    ) -> anyhow::Result<UploadResponse> {
         validate_upload_request_sizes(&request, self.capabilities.max_cas_blob_size_bytes)?;
 
         let uploaded_digests = upload_payload_digests(&request);
@@ -2138,6 +2409,243 @@ impl REClient {
         .await?;
         self.mark_digests_exist_on_remote(uploaded_digests);
         Ok(response)
+    }
+
+    async fn upload_chunked_inlined_blobs(
+        &self,
+        metadata: RemoteExecutionMetadata,
+        mut request: UploadRequest,
+    ) -> anyhow::Result<(UploadRequest, Vec<TDigest>)> {
+        let Some(config) = self.fast_cdc_2020_upload_config() else {
+            return Ok((request, Vec::new()));
+        };
+        let inlined_blobs = request.inlined_blobs_with_digest.take().unwrap_or_default();
+        if inlined_blobs.is_empty() {
+            return Ok((request, Vec::new()));
+        }
+
+        let mut remaining_blobs = Vec::new();
+        let mut spliced_digests = Vec::new();
+        for blob in inlined_blobs {
+            if blob.digest.size_in_bytes <= 0
+                || blob.digest.size_in_bytes as u64 <= config.chunking_threshold_bytes()
+            {
+                remaining_blobs.push(blob);
+                continue;
+            }
+            let Some(digest_function) = self
+                .runtime_opts
+                .request_digest_function_config
+                .for_digest(&tdigest_to(blob.digest.clone()))
+            else {
+                tracing::debug!(
+                    digest = %blob.digest,
+                    "Skipping FastCDC chunked upload because the digest function is ambiguous"
+                );
+                remaining_blobs.push(blob);
+                continue;
+            };
+            if !supports_hash_validation(digest_function) {
+                tracing::debug!(
+                    digest = %blob.digest,
+                    digest_function = %digest_function_name(digest_function),
+                    "Skipping FastCDC chunked upload because the digest function is unsupported"
+                );
+                remaining_blobs.push(blob);
+                continue;
+            }
+
+            let chunked_digest = blob.digest.clone();
+            let chunks = chunk_inlined_blob_fast_cdc_2020(&blob, &config, digest_function)
+                .with_context(|| format!("Failed to chunk `{chunked_digest}` for upload"))?;
+            if chunks.is_empty() {
+                remaining_blobs.push(blob);
+                continue;
+            }
+            self.upload_fast_cdc_chunks(
+                metadata.clone(),
+                chunked_digest.clone(),
+                chunks,
+                &config,
+                digest_function,
+            )
+            .await?;
+            spliced_digests.push(chunked_digest);
+        }
+        request.inlined_blobs_with_digest = if remaining_blobs.is_empty() {
+            None
+        } else {
+            Some(remaining_blobs)
+        };
+        Ok((request, spliced_digests))
+    }
+
+    async fn upload_chunked_files(
+        &self,
+        metadata: RemoteExecutionMetadata,
+        mut request: UploadRequest,
+    ) -> anyhow::Result<(UploadRequest, Vec<TDigest>)> {
+        let Some(config) = self.fast_cdc_2020_upload_config() else {
+            return Ok((request, Vec::new()));
+        };
+        let files = request.files_with_digest.take().unwrap_or_default();
+        if files.is_empty() {
+            return Ok((request, Vec::new()));
+        }
+
+        let mut remaining_files = Vec::new();
+        let mut spliced_digests = Vec::new();
+        for file in files {
+            if file.digest.size_in_bytes <= 0
+                || file.digest.size_in_bytes as u64 <= config.chunking_threshold_bytes()
+            {
+                remaining_files.push(file);
+                continue;
+            }
+            let Some(digest_function) = self
+                .runtime_opts
+                .request_digest_function_config
+                .for_digest(&tdigest_to(file.digest.clone()))
+            else {
+                tracing::debug!(
+                    digest = %file.digest,
+                    path = %file.name,
+                    "Skipping FastCDC chunked upload because the digest function is ambiguous"
+                );
+                remaining_files.push(file);
+                continue;
+            };
+            if !supports_hash_validation(digest_function) {
+                tracing::debug!(
+                    digest = %file.digest,
+                    path = %file.name,
+                    digest_function = %digest_function_name(digest_function),
+                    "Skipping FastCDC chunked upload because the digest function is unsupported"
+                );
+                remaining_files.push(file);
+                continue;
+            }
+
+            let chunked_digest = file.digest.clone();
+            let path = file.name.clone();
+            let chunk_config = config.clone();
+            let chunks = tokio::task::spawn_blocking(move || {
+                chunk_file_fast_cdc_2020(&path, &chunk_config, digest_function)
+            })
+            .await
+            .context("FastCDC chunking task failed")?
+            .with_context(|| format!("Failed to chunk `{chunked_digest}` for upload"))?;
+            if chunks.is_empty() {
+                remaining_files.push(file);
+                continue;
+            }
+            self.upload_fast_cdc_chunks(
+                metadata.clone(),
+                chunked_digest.clone(),
+                chunks,
+                &config,
+                digest_function,
+            )
+            .await?;
+            spliced_digests.push(chunked_digest);
+        }
+        request.files_with_digest = if remaining_files.is_empty() {
+            None
+        } else {
+            Some(remaining_files)
+        };
+        Ok((request, spliced_digests))
+    }
+
+    async fn upload_fast_cdc_chunks(
+        &self,
+        metadata: RemoteExecutionMetadata,
+        blob_digest: TDigest,
+        chunks: Vec<InlinedBlobWithDigest>,
+        config: &FastCdc2020Config,
+        digest_function: digest_function::Value,
+    ) -> anyhow::Result<()> {
+        let chunk_digests = chunks
+            .iter()
+            .map(|chunk| chunk.digest.clone())
+            .collect::<Vec<_>>();
+        self.write_fast_cdc_chunks_to_local_cache(&chunks, digest_function)
+            .await;
+        let missing = self
+            .get_digests_ttl(
+                metadata.clone(),
+                GetDigestsTtlRequest {
+                    digests: chunk_digests.clone(),
+                    _dot_dot: (),
+                },
+            )
+            .await?
+            .digests_with_ttl
+            .into_iter()
+            .filter(|digest| digest.ttl == 0)
+            .map(|digest| digest.digest)
+            .collect::<HashSet<_>>();
+        let mut uploaded = HashSet::new();
+        let missing_chunks = chunks
+            .into_iter()
+            .filter(|chunk| missing.contains(&chunk.digest))
+            .filter(|chunk| uploaded.insert(chunk.digest.clone()))
+            .collect::<Vec<_>>();
+        if !missing_chunks.is_empty() {
+            self.upload_direct(
+                metadata.clone(),
+                UploadRequest {
+                    inlined_blobs_with_digest: Some(missing_chunks),
+                    upload_only_missing: false,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+        self.splice_blob(
+            metadata,
+            SpliceBlobRequest {
+                blob_digest,
+                chunk_digests,
+                chunking_function: config.chunking_function(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn write_fast_cdc_chunks_to_local_cache(
+        &self,
+        chunks: &[InlinedBlobWithDigest],
+        digest_function: digest_function::Value,
+    ) {
+        let Some(cache) = &self.local_chunk_cache else {
+            return;
+        };
+        for chunk in chunks {
+            cache
+                .write(&chunk.digest, &chunk.blob, Some(digest_function))
+                .await;
+        }
+    }
+
+    fn fast_cdc_2020_upload_config(&self) -> Option<FastCdc2020Config> {
+        if !self.runtime_opts.remote_cache_chunking || !self.capabilities.blob_splice_supported {
+            return None;
+        }
+        self.capabilities.fast_cdc_2020.clone()
+    }
+
+    fn fast_cdc_2020_download_config(&self) -> Option<FastCdc2020Config> {
+        if !self.runtime_opts.remote_cache_chunking || !self.capabilities.blob_split_supported {
+            return None;
+        }
+        self.capabilities.fast_cdc_2020.clone()
+    }
+
+    fn should_chunk_blob(&self, digest: &TDigest, config: &FastCdc2020Config) -> bool {
+        digest.size_in_bytes > 0 && digest.size_in_bytes as u64 > config.chunking_threshold_bytes()
     }
 
     async fn filter_upload_request_to_missing(
@@ -2322,6 +2830,33 @@ impl REClient {
         metadata: RemoteExecutionMetadata,
         request: DownloadRequest,
     ) -> anyhow::Result<DownloadResponse> {
+        let (request, chunked_inlined_blobs) = self
+            .download_chunked_blobs(metadata.clone(), request)
+            .await?;
+        let mut response = self.download_direct(metadata, request).await?;
+        if !chunked_inlined_blobs.is_empty() {
+            let mut chunked_inlined_blobs =
+                chunked_inlined_blobs.into_iter().collect::<HashMap<_, _>>();
+            let direct_inlined_blobs = response.inlined_blobs.take().unwrap_or_default();
+            let mut direct_inlined_blobs = direct_inlined_blobs.into_iter();
+            let mut inlined_blobs = Vec::new();
+            for index in 0..chunked_inlined_blobs.len() + direct_inlined_blobs.len() {
+                if let Some(chunked_blob) = chunked_inlined_blobs.remove(&index) {
+                    inlined_blobs.push(chunked_blob);
+                } else if let Some(direct_blob) = direct_inlined_blobs.next() {
+                    inlined_blobs.push(direct_blob);
+                }
+            }
+            response.inlined_blobs = Some(inlined_blobs);
+        }
+        Ok(response)
+    }
+
+    async fn download_direct(
+        &self,
+        metadata: RemoteExecutionMetadata,
+        request: DownloadRequest,
+    ) -> anyhow::Result<DownloadResponse> {
         download_impl(
             &self.instance_name,
             request,
@@ -2385,6 +2920,231 @@ impl REClient {
             },
         )
         .await
+    }
+
+    async fn download_chunked_blobs(
+        &self,
+        metadata: RemoteExecutionMetadata,
+        mut request: DownloadRequest,
+    ) -> anyhow::Result<(DownloadRequest, Vec<(usize, InlinedDigestWithStatus)>)> {
+        let Some(config) = self.fast_cdc_2020_download_config() else {
+            return Ok((request, Vec::new()));
+        };
+        let inlined_digests = request.inlined_digests.take().unwrap_or_default();
+        let file_digests = request.file_digests.take().unwrap_or_default();
+        if inlined_digests.is_empty() && file_digests.is_empty() {
+            return Ok((request, Vec::new()));
+        }
+
+        let mut remaining_inlined_digests = Vec::new();
+        let mut chunked_inlined_blobs = Vec::new();
+        for (index, digest) in inlined_digests.into_iter().enumerate() {
+            if !self.should_chunk_blob(&digest, &config) {
+                remaining_inlined_digests.push(digest);
+                continue;
+            }
+            let blob = self
+                .download_fast_cdc_blob(metadata.clone(), digest.clone(), &config)
+                .await?;
+            chunked_inlined_blobs.push((
+                index,
+                InlinedDigestWithStatus {
+                    digest,
+                    status: tstatus_ok(),
+                    blob,
+                },
+            ));
+        }
+
+        let mut remaining_file_digests = Vec::new();
+        for file in file_digests {
+            if !self.should_chunk_blob(&file.named_digest.digest, &config) {
+                remaining_file_digests.push(file);
+                continue;
+            }
+            self.download_fast_cdc_file(metadata.clone(), file, &config)
+                .await?;
+        }
+        request.inlined_digests = if remaining_inlined_digests.is_empty() {
+            None
+        } else {
+            Some(remaining_inlined_digests)
+        };
+        request.file_digests = if remaining_file_digests.is_empty() {
+            None
+        } else {
+            Some(remaining_file_digests)
+        };
+        Ok((request, chunked_inlined_blobs))
+    }
+
+    async fn download_fast_cdc_blob(
+        &self,
+        metadata: RemoteExecutionMetadata,
+        digest: TDigest,
+        config: &FastCdc2020Config,
+    ) -> anyhow::Result<Vec<u8>> {
+        let split = self
+            .split_blob(
+                metadata.clone(),
+                SplitBlobRequest {
+                    blob_digest: digest.clone(),
+                    chunking_function: config.chunking_function(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let chunk_digests = split.chunk_digests;
+        let chunk_blobs = self
+            .download_fast_cdc_chunks(metadata, &chunk_digests)
+            .await?;
+        let mut blob = Vec::new();
+        for chunk_digest in chunk_digests {
+            let chunk_blob = chunk_blobs
+                .get(&chunk_digest)
+                .with_context(|| format!("Chunked download missing chunk `{chunk_digest}`"))?;
+            blob.extend_from_slice(chunk_blob);
+        }
+        validate_downloaded_blob(
+            &digest,
+            &blob,
+            self.runtime_opts
+                .download_hash_digest_function_for_hash(&digest.hash),
+        )?;
+        Ok(blob)
+    }
+
+    async fn download_fast_cdc_chunks(
+        &self,
+        metadata: RemoteExecutionMetadata,
+        chunk_digests: &[TDigest],
+    ) -> anyhow::Result<HashMap<TDigest, Vec<u8>>> {
+        let mut chunk_blobs = HashMap::new();
+        let mut missing_digests = Vec::new();
+        let mut queued_missing = HashSet::new();
+        for digest in chunk_digests {
+            if chunk_blobs.contains_key(digest) {
+                continue;
+            }
+            if let Some(cache) = &self.local_chunk_cache {
+                if let Some(blob) = cache
+                    .read(
+                        digest,
+                        self.runtime_opts
+                            .download_hash_digest_function_for_hash(&digest.hash),
+                    )
+                    .await?
+                {
+                    chunk_blobs.insert(digest.clone(), blob);
+                    continue;
+                }
+            }
+            if queued_missing.insert(digest.clone()) {
+                missing_digests.push(digest.clone());
+            }
+        }
+        if missing_digests.is_empty() {
+            return Ok(chunk_blobs);
+        }
+        let response = self
+            .download_direct(
+                metadata,
+                DownloadRequest {
+                    inlined_digests: Some(missing_digests.clone()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let remote_chunk_blobs = response.inlined_blobs.unwrap_or_default();
+        anyhow::ensure!(
+            remote_chunk_blobs.len() == missing_digests.len(),
+            "Chunked download received {} chunks, expected {}",
+            remote_chunk_blobs.len(),
+            missing_digests.len()
+        );
+        for (expected_digest, chunk_blob) in missing_digests.into_iter().zip(remote_chunk_blobs) {
+            anyhow::ensure!(
+                chunk_blob.digest == expected_digest,
+                "Chunked download received digest `{}`, expected `{expected_digest}`",
+                chunk_blob.digest
+            );
+            if let Some(cache) = &self.local_chunk_cache {
+                cache
+                    .write(
+                        &expected_digest,
+                        &chunk_blob.blob,
+                        self.runtime_opts
+                            .download_hash_digest_function_for_hash(&expected_digest.hash),
+                    )
+                    .await;
+            }
+            chunk_blobs.insert(expected_digest, chunk_blob.blob);
+        }
+        Ok(chunk_blobs)
+    }
+
+    async fn download_fast_cdc_file(
+        &self,
+        metadata: RemoteExecutionMetadata,
+        file: NamedDigestWithPermissions,
+        config: &FastCdc2020Config,
+    ) -> anyhow::Result<()> {
+        let split = self
+            .split_blob(
+                metadata.clone(),
+                SplitBlobRequest {
+                    blob_digest: file.named_digest.digest.clone(),
+                    chunking_function: config.chunking_function(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let chunk_digests = split.chunk_digests;
+        let chunk_blobs = self
+            .download_fast_cdc_chunks(metadata, &chunk_digests)
+            .await?;
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            if file.is_executable {
+                opts.mode(0o755);
+            } else {
+                opts.mode(0o644);
+            }
+        }
+        let mut output = opts
+            .open(&file.named_digest.name)
+            .await
+            .context("Error opening")?;
+        let mut hash_validators = BlobHashValidators::new(
+            &file.named_digest.digest.hash,
+            self.runtime_opts
+                .download_hash_digest_function_for_hash(&file.named_digest.digest.hash),
+        )?;
+        let mut copied_bytes = 0usize;
+        for chunk_digest in chunk_digests {
+            let chunk_blob = chunk_blobs
+                .get(&chunk_digest)
+                .with_context(|| format!("Chunked download missing chunk `{chunk_digest}`"))?;
+            copied_bytes = copied_bytes
+                .checked_add(chunk_blob.len())
+                .with_context(|| {
+                    format!(
+                        "Downloaded blob is too large to validate on this platform: {}",
+                        file.named_digest.digest
+                    )
+                })?;
+            hash_validators.update(chunk_blob);
+            output
+                .write_all(chunk_blob)
+                .await
+                .with_context(|| format!("Error writing chunk of: {}", file.named_digest.digest))?;
+        }
+        validate_downloaded_blob_size(&file.named_digest.digest, copied_bytes)?;
+        hash_validators.finish(&file.named_digest.digest)?;
+        output.flush().await.context("Error flushing")?;
+        Ok(())
     }
 
     pub async fn get_digests_ttl(
@@ -4135,6 +4895,7 @@ mod tests {
             retry_max_delay_ms: 0,
             download_hash_digest_function: Some(digest_function::Value::Sha256),
             request_digest_function_config: digest_function_config,
+            remote_cache_chunking: false,
         };
 
         assert_eq!(

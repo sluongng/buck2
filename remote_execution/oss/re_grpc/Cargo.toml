@@ -11,6 +11,7 @@ anyhow = { workspace = true }
 async-compression = { workspace = true }
 blake3 = { workspace = true }
 dupe = { workspace = true }
+fastcdc = { workspace = true }
 futures = { workspace = true }
 gazebo = { workspace = true }
 http = { workspace = true }
