@@ -419,6 +419,16 @@ impl InvocationRecorder {
                 bes_headers: Vec::new(),
                 #[cfg(not(fbcode_build))]
                 event_format: Default::default(),
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload: false,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload_backend: None,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload_instance_name: None,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_uri_authority: None,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload_max_bytes: 1024 * 1024,
             },
             critical_path_backend: None,
             bxl_ensure_artifacts_duration: None,
@@ -635,6 +645,16 @@ impl InvocationRecorder {
                 bes_headers: Vec::new(),
                 #[cfg(not(fbcode_build))]
                 event_format: Default::default(),
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload: false,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload_backend: None,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload_instance_name: None,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_uri_authority: None,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload_max_bytes: 1024 * 1024,
             },
         );
         self.health_check_tags_receiver = health_check_tags_receiver;
