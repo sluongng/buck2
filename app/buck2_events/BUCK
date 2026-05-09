@@ -56,6 +56,7 @@ rust_library(
         "//buck2/app/buck2_wrapper_common:buck2_wrapper_common",
         "//buck2/gazebo/dupe:dupe",
         "//buck2/gazebo/gazebo:gazebo",
+        "//buck2/remote_execution/oss/bazel_bep_proto:bazel_bep_proto",
         "//buck2/remote_execution/oss/bes_grpc_proto:bes_grpc_proto",
         # @oss-disable[end= ]: "//buck2/shed/scribe_client:scribe_client",
         # @oss-disable[end= ]: "//common/rust/devserver_fingerprint/devserver_fingerprint:devserver_fingerprint",
