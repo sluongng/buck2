@@ -479,7 +479,7 @@ impl DaemonState {
                 }
             });
 
-            let digest_algorithms = init_ctx
+            let digest_algorithm_families = init_ctx
                 .daemon_startup_config
                 .digest_algorithms
                 .as_ref()
@@ -491,8 +491,13 @@ impl DaemonState {
                 })
                 .transpose()
                 .buck_error_context("Invalid digest_algorithms")?
-                .unwrap_or_else(|| vec![default_digest_algorithm])
-                .into_try_map(convert_algorithm_kind)?;
+                .unwrap_or_else(|| vec![default_digest_algorithm]);
+            let digest_algorithm_names = digest_algorithm_families
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let digest_algorithms =
+                digest_algorithm_families.into_try_map(convert_algorithm_kind)?;
 
             let preferred_source_algorithm = init_ctx
                 .daemon_startup_config
@@ -509,6 +514,7 @@ impl DaemonState {
             // TODO(rafaelc): merge configs from all cells once they are consistent
             let static_metadata = Arc::new(RemoteExecutionStaticMetadata::from_legacy_config(
                 root_config,
+                digest_algorithm_names,
             )?);
 
             let mut ignore_specs: StdBuckHashMap<CellName, IgnoreSet> = StdBuckHashMap::default();
