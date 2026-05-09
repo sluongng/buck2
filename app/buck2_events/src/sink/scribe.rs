@@ -38,6 +38,8 @@ use crate::metadata;
 use crate::schedule_type::SandcastleScheduleType;
 #[cfg(not(fbcode_build))]
 pub use crate::sink::bes_client::BesConfig as RemoteEventConfig;
+#[cfg(not(fbcode_build))]
+pub use crate::sink::bes_client::BesEventFormat;
 use crate::sink::smart_truncate_event::smart_truncate_event;
 
 // 1 MiB limit

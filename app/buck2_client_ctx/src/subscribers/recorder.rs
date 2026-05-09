@@ -417,6 +417,8 @@ impl InvocationRecorder {
                 bes_backend: None,
                 #[cfg(not(fbcode_build))]
                 bes_headers: Vec::new(),
+                #[cfg(not(fbcode_build))]
+                event_format: Default::default(),
             },
             critical_path_backend: None,
             bxl_ensure_artifacts_duration: None,
@@ -626,6 +628,8 @@ impl InvocationRecorder {
                 bes_backend: None,
                 #[cfg(not(fbcode_build))]
                 bes_headers: Vec::new(),
+                #[cfg(not(fbcode_build))]
+                event_format: Default::default(),
             },
         );
         self.health_check_tags_receiver = health_check_tags_receiver;
