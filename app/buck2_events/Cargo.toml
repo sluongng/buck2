@@ -40,6 +40,8 @@ buck2_util = { workspace = true }
 buck2_wrapper_common = { workspace = true }
 bazel_bep_proto = { workspace = true }
 bes_grpc_proto = { workspace = true }
+google_grpc_proto = { workspace = true }
+sha2 = { workspace = true }
 
 [target."cfg(windows)".dependencies]
 winver = "1"
