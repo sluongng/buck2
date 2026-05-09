@@ -38,6 +38,7 @@ buck2_error = { workspace = true }
 buck2_hash = { workspace = true }
 buck2_util = { workspace = true }
 buck2_wrapper_common = { workspace = true }
+bazel_bep_proto = { workspace = true }
 bes_grpc_proto = { workspace = true }
 
 [target."cfg(windows)".dependencies]
