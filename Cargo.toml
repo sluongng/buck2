@@ -115,6 +115,9 @@ members = [
     "integrations/rust-project",
     "pagable",
     "pagable_derive",
+    "remote_execution/oss/bazel_bep_proto",
+    "remote_execution/oss/bes_grpc_proto",
+    "remote_execution/oss/google_grpc_proto",
     "remote_execution/oss/re_grpc",
     "remote_execution/oss/re_grpc_proto",
     "starlark-rust/starlark",
@@ -372,6 +375,9 @@ lock_free_hashtable = { version = "0.1.4", path = "shed/lock_free_hashtable" }
 lock_free_vec = { path = "shed/lock_free_vec" }
 pagable = { version = "0.3.3", path = "pagable", features = ["tokio"] }
 provider = { path = "shed/provider" }
+bazel_bep_proto = { path = "remote_execution/oss/bazel_bep_proto" }
+bes_grpc_proto = { path = "remote_execution/oss/bes_grpc_proto" }
+google_grpc_proto = { path = "remote_execution/oss/google_grpc_proto" }
 remote_execution = { path = "remote_execution/oss/re_grpc" }
 setsketch = { path = "shed/setsketch" }
 sled = "0.34"
