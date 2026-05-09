@@ -383,6 +383,13 @@ impl DaemonState {
                     section: "bes",
                     property: "header",
                 })?)?;
+            #[cfg(not(fbcode_build))]
+            let bes_event_format = root_config
+                .parse::<remote::BesEventFormat>(BuckconfigKeyRef {
+                    section: "bes",
+                    property: "event_format",
+                })?
+                .unwrap_or_default();
             tracing::info!("Initializing scribe sink...");
             let scribe_sink = Self::init_scribe_sink(
                 fb,
@@ -399,6 +406,8 @@ impl DaemonState {
                     bes_backend,
                     #[cfg(not(fbcode_build))]
                     bes_headers,
+                    #[cfg(not(fbcode_build))]
+                    event_format: bes_event_format,
                 },
             )
             .buck_error_context("failed to init scribe sink")?;
