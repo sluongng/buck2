@@ -7,9 +7,13 @@ rust_protobuf_library(
     srcs = glob(["src/**/*.rs"]),
     build_script = "build.rs",
     protos = glob(["proto/**/*.proto"]),
+    build_env = {
+        "GOOGLE_PROTO_ROOT": "$(location //remote_execution/oss/google_grpc_proto:google_grpc_proto_sources)",
+    },
     deps = [
         "fbsource//third-party/rust:prost-types",
         "fbsource//third-party/rust:serde",
         "//buck2/app/buck2_data:buck2_data",
+        "//buck2/remote_execution/oss/google_grpc_proto:google_grpc_proto",
     ],
 )
