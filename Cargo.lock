@@ -4619,6 +4619,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastcdc"
+version = "4.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77af40d8a8dadb92dc178569a5f5edb5f3056e98255c2de48ab5d59a52892e0c"
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7517,23 +7523,24 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-compression",
+ "blake3",
  "buck2_re_configuration",
  "buck2_util",
  "dupe",
+ "fastcdc",
  "futures 0.3.34",
  "gazebo",
  "h2",
  "http",
- "http-body",
- "http-body-util",
  "hyper",
  "hyper-util",
  "lru",
  "prost",
  "prost-types",
- "rand 0.10.3",
  "re_grpc_proto",
  "regex",
+ "sha1",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
