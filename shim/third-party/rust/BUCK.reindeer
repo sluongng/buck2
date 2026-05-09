@@ -5280,6 +5280,30 @@ cargo.rust_library(
     ],
 )
 
+alias(
+    name = "fastcdc",
+    actual = ":fastcdc-4",
+    visibility = ["PUBLIC"],
+)
+
+http_archive(
+    name = "fastcdc-4.0.1.crate",
+    sha256 = "77af40d8a8dadb92dc178569a5f5edb5f3056e98255c2de48ab5d59a52892e0c",
+    strip_prefix = "fastcdc-4.0.1",
+    urls = ["https://static.crates.io/crates/fastcdc/4.0.1/download"],
+    visibility = [],
+)
+
+cargo.rust_library(
+    name = "fastcdc-4",
+    srcs = [":fastcdc-4.0.1.crate"],
+    crate = "fastcdc",
+    crate_root = "fastcdc-4.0.1.crate/src/lib.rs",
+    edition = "2024",
+    features = ["default"],
+    visibility = [],
+)
+
 http_archive(
     name = "fastrand-2.4.1.crate",
     sha256 = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6",
@@ -15149,6 +15173,7 @@ cargo.rust_binary(
         ":erased-serde-0.4",
         ":faccess-0.2",
         ":fancy-regex-0.16",
+        ":fastcdc-4",
         ":fbinit-0.2",
         ":flate2-1",
         ":fnv-1",
