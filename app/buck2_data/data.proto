@@ -1769,6 +1769,10 @@ message CommandExecutionError {}
 
 message ActionOutput {
   string tiny_digest = 1;
+  string path = 2;
+  string digest = 3;
+  uint64 size = 4;
+  bool is_directory = 5;
 }
 
 message ActionExecutionEnd {
