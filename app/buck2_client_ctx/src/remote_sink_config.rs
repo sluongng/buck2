@@ -11,12 +11,23 @@
 use buck2_common::invocation_paths::InvocationPaths;
 #[cfg(not(fbcode_build))]
 use buck2_error::ErrorTag;
+#[cfg(not(fbcode_build))]
+use buck2_events::sink::remote::BesEventFormat;
 use buck2_events::sink::remote::RemoteEventConfig;
 
 #[cfg(not(fbcode_build))]
 struct BuckconfigBesSettings {
     bes_backend: Option<String>,
     bes_headers: Vec<(String, String)>,
+    bes_event_format: Option<BesEventFormat>,
+    bazel_artifact_upload: Option<bool>,
+    upload_successful_action_events: Option<bool>,
+    bazel_artifact_upload_backend: Option<String>,
+    re_client_cas_address: Option<String>,
+    bazel_artifact_upload_instance_name: Option<String>,
+    re_client_instance_name: Option<String>,
+    bazel_artifact_uri_authority: Option<String>,
+    bazel_artifact_upload_max_bytes: Option<usize>,
     bes_results_url: Option<String>,
 }
 
@@ -31,6 +42,34 @@ pub fn with_buckconfig_overrides(
                 config.bes_backend = Some(bes_backend);
             }
             config.bes_headers = settings.bes_headers;
+            if let Some(bes_event_format) = settings.bes_event_format {
+                config.event_format = bes_event_format;
+            }
+            if let Some(bazel_artifact_upload) = settings.bazel_artifact_upload {
+                config.bazel_artifact_upload = bazel_artifact_upload;
+            }
+            if let Some(upload_successful_action_events) = settings.upload_successful_action_events
+            {
+                config.upload_successful_action_events = upload_successful_action_events;
+            }
+            if let Some(backend) = settings.bazel_artifact_upload_backend {
+                config.bazel_artifact_upload_backend = Some(backend);
+            }
+            if let Some(re_client_cas_address) = settings.re_client_cas_address {
+                config.re_client_cas_address = Some(re_client_cas_address);
+            }
+            if let Some(instance_name) = settings.bazel_artifact_upload_instance_name {
+                config.bazel_artifact_upload_instance_name = Some(instance_name);
+            }
+            if let Some(re_client_instance_name) = settings.re_client_instance_name {
+                config.re_client_instance_name = Some(re_client_instance_name);
+            }
+            if let Some(authority) = settings.bazel_artifact_uri_authority {
+                config.bazel_artifact_uri_authority = Some(authority);
+            }
+            if let Some(max_bytes) = settings.bazel_artifact_upload_max_bytes {
+                config.bazel_artifact_upload_max_bytes = max_bytes;
+            }
             config
         }
         Err(e) => {
@@ -81,6 +120,15 @@ fn read_buckconfig_bes_settings(
         return Ok(BuckconfigBesSettings {
             bes_backend: None,
             bes_headers: Vec::new(),
+            bes_event_format: None,
+            bazel_artifact_upload: None,
+            upload_successful_action_events: None,
+            bazel_artifact_upload_backend: None,
+            re_client_cas_address: None,
+            bazel_artifact_upload_instance_name: None,
+            re_client_instance_name: None,
+            bazel_artifact_uri_authority: None,
+            bazel_artifact_upload_max_bytes: None,
             bes_results_url: None,
         });
     };
@@ -106,6 +154,16 @@ fn read_buckconfig_bes_settings(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
+    let re_client_default_address: Option<String> = root_config.parse(BuckconfigKeyRef {
+        section: "buck2_re_client",
+        property: "address",
+    })?;
+    let re_client_cas_address = root_config
+        .parse::<String>(BuckconfigKeyRef {
+            section: "buck2_re_client",
+            property: "cas_address",
+        })?
+        .or(re_client_default_address);
 
     Ok(BuckconfigBesSettings {
         bes_backend: root_config
@@ -118,6 +176,51 @@ fn read_buckconfig_bes_settings(
             section: "bes",
             property: "header",
         })?)?,
+        bes_event_format: root_config.parse::<BesEventFormat>(BuckconfigKeyRef {
+            section: "bes",
+            property: "event_format",
+        })?,
+        bazel_artifact_upload: root_config.parse::<bool>(BuckconfigKeyRef {
+            section: "bes",
+            property: "bazel_artifact_upload",
+        })?,
+        upload_successful_action_events: root_config.parse::<bool>(BuckconfigKeyRef {
+            section: "bes",
+            property: "upload_successful_action_events",
+        })?,
+        bazel_artifact_upload_backend: root_config
+            .get(BuckconfigKeyRef {
+                section: "bes",
+                property: "bazel_artifact_upload_backend",
+            })
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        re_client_cas_address,
+        bazel_artifact_upload_instance_name: root_config
+            .get(BuckconfigKeyRef {
+                section: "bes",
+                property: "bazel_artifact_upload_instance_name",
+            })
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        re_client_instance_name: root_config.parse(BuckconfigKeyRef {
+            section: "buck2_re_client",
+            property: "instance_name",
+        })?,
+        bazel_artifact_uri_authority: root_config
+            .get(BuckconfigKeyRef {
+                section: "bes",
+                property: "bazel_artifact_uri_authority",
+            })
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        bazel_artifact_upload_max_bytes: root_config.parse::<usize>(BuckconfigKeyRef {
+            section: "bes",
+            property: "bazel_artifact_upload_max_bytes",
+        })?,
         bes_results_url,
     })
 }
