@@ -711,12 +711,39 @@ pub enum MaterializationMethodError {
 impl MaterializationMethod {
     pub fn try_new_from_config_value(config_value: Option<&str>) -> buck2_error::Result<Self> {
         match config_value {
-            None | Some("") | Some("deferred") => Ok(MaterializationMethod::Deferred),
+            None | Some("") | Some("all") | Some("deferred") => Ok(MaterializationMethod::Deferred),
             Some("deferred_skip_final_artifacts") => {
                 Ok(MaterializationMethod::DeferredSkipFinalArtifacts)
             }
             Some(v) => Err(MaterializationMethodError::InvalidValueForConfig(v.to_owned()).into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod materialization_method_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_all_policy_spelling() {
+        assert!(matches!(
+            MaterializationMethod::try_new_from_config_value(Some("all")).unwrap(),
+            MaterializationMethod::Deferred
+        ));
+    }
+
+    #[test]
+    fn accepts_skip_final_artifacts_policy_spelling() {
+        assert!(matches!(
+            MaterializationMethod::try_new_from_config_value(Some("deferred_skip_final_artifacts"))
+                .unwrap(),
+            MaterializationMethod::DeferredSkipFinalArtifacts
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_policy_spelling() {
+        assert!(MaterializationMethod::try_new_from_config_value(Some("minimal")).is_err());
     }
 }
 
