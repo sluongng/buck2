@@ -17,12 +17,15 @@ use buck2_data::ActionExecutionEnd;
 use buck2_data::InstantEvent;
 use buck2_data::Location;
 use buck2_data::StructuredError;
+#[cfg(fbcode_build)]
 use buck2_error::ErrorTag;
+#[cfg(fbcode_build)]
 use buck2_error::conversion::from_any_with_tag;
 use buck2_util::truncate::truncate;
 use fbinit::FacebookInit;
 use prost::Message;
-pub use scribe_client::ScribeConfig;
+#[cfg(fbcode_build)]
+pub use scribe_client::ScribeConfig as RemoteEventConfig;
 
 use crate::BuckEvent;
 use crate::Event;
@@ -33,6 +36,8 @@ use crate::TraceId;
 use crate::daemon_id::get_daemon_id_for_panics;
 use crate::metadata;
 use crate::schedule_type::SandcastleScheduleType;
+#[cfg(not(fbcode_build))]
+pub use crate::sink::bes_client::BesConfig as RemoteEventConfig;
 use crate::sink::smart_truncate_event::smart_truncate_event;
 
 // 1 MiB limit
@@ -40,22 +45,28 @@ static SCRIBE_MESSAGE_SIZE_LIMIT: usize = 1024 * 1024;
 // 50k characters
 static TRUNCATED_SCRIBE_MESSAGE_SIZE: usize = 50000;
 
-/// RemoteEventSink is a ScribeSink backed by the Thrift-based client in the `buck2_scribe_client` crate.
+/// RemoteEventSink forwards events to a remote backend.
 pub struct RemoteEventSink {
     category: String,
+    #[cfg(fbcode_build)]
     client: scribe_client::ScribeClient,
+    #[cfg(not(fbcode_build))]
+    client: crate::sink::bes_client::BesClient,
     schedule_type: SandcastleScheduleType,
 }
 
 impl RemoteEventSink {
-    /// Creates a new RemoteEventSink that forwards messages onto the Thrift-backed Scribe client.
+    /// Creates a new RemoteEventSink that forwards messages onto a remote backend.
     pub fn new(
         fb: FacebookInit,
         category: String,
-        config: ScribeConfig,
+        config: RemoteEventConfig,
     ) -> buck2_error::Result<RemoteEventSink> {
+        #[cfg(fbcode_build)]
         let client = scribe_client::ScribeClient::new(fb, config)
             .map_err(|e| from_any_with_tag(e, ErrorTag::Tier0))?;
+        #[cfg(not(fbcode_build))]
+        let client = crate::sink::bes_client::BesClient::new(fb, config)?;
 
         let schedule_type = SandcastleScheduleType::new()?;
         Ok(RemoteEventSink {
@@ -72,34 +83,59 @@ impl RemoteEventSink {
 
     // Send multiple events now, bypassing internal message queue.
     pub async fn send_messages_now(&self, events: Vec<BuckEvent>) -> buck2_error::Result<()> {
-        let messages = events
-            .into_iter()
-            .map(|e| {
-                let message_key = e.trace_id().unwrap().hash();
-                scribe_client::Message {
-                    category: self.category.clone(),
-                    message: Self::encode_message(e),
-                    message_key: Some(message_key),
-                }
-            })
-            .collect();
-        self.client
-            .send_messages_now(messages)
-            .await
-            .map_err(|e| from_any_with_tag(e, ErrorTag::Tier0))
+        #[cfg(fbcode_build)]
+        {
+            let messages = events
+                .into_iter()
+                .map(|e| {
+                    let message_key = e.trace_id().unwrap().hash();
+                    scribe_client::Message {
+                        category: self.category.clone(),
+                        message: Self::encode_message(e),
+                        message_key: Some(message_key),
+                    }
+                })
+                .collect();
+            self.client
+                .send_messages_now(messages)
+                .await
+                .map_err(|e| from_any_with_tag(e, ErrorTag::Tier0))
+        }
+        #[cfg(not(fbcode_build))]
+        {
+            let messages = events
+                .into_iter()
+                .map(|e| {
+                    let message_key = e.trace_id().unwrap().hash();
+                    crate::sink::bes_client::Message {
+                        category: self.category.clone(),
+                        message: Self::encode_message(e),
+                        message_key: Some(message_key),
+                    }
+                })
+                .collect();
+            self.client.send_messages_now(messages).await
+        }
     }
 
     // Send this event by placing it on the internal message queue.
     pub fn offer(&self, event: BuckEvent) {
         let message_key = event.trace_id().unwrap().hash();
+        #[cfg(fbcode_build)]
         self.client.offer(scribe_client::Message {
+            category: self.category.clone(),
+            message: Self::encode_message(event),
+            message_key: Some(message_key),
+        });
+        #[cfg(not(fbcode_build))]
+        self.client.offer(crate::sink::bes_client::Message {
             category: self.category.clone(),
             message: Self::encode_message(event),
             message_key: Some(message_key),
         });
     }
 
-    // Encodes message into something scribe understands.
+    // Encodes message for transport.
     fn encode_message(mut event: BuckEvent) -> Vec<u8> {
         smart_truncate_event(event.data_mut());
         let mut proto: Box<buck2_data::BuckEvent> = event.into();
@@ -181,6 +217,14 @@ impl RemoteEventSink {
 
                 match &s.data {
                     Some(Data::Command(..)) => true,
+                    // Buck2->BuildBuddy OSS integration needs this to capture
+                    // metadata sourced from buckconfigs.
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::CommandCritical(..)) => true,
+                    // Buck2->BuildBuddy target mapping uses analysis start to
+                    // synthesize target configured events.
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::Analysis(..)) => true,
                     None => false,
                     _ => false,
                 }
@@ -220,6 +264,31 @@ impl RemoteEventSink {
 
                 match i.data {
                     Some(Data::BuildGraphInfo(..)) => true,
+                    // Required by BuildBuddy Buck2 mapping for target/test
+                    // details and invocation metadata.
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::TestDiscovery(..)) => true,
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::TestResult(..)) => true,
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::TargetPatterns(..)) => true,
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::TargetCfg(..)) => true,
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::CommandOptions(..)) => true,
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::VersionControlRevision(..)) => true,
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::BuckconfigInputValues(..)) => true,
+                    // Required for BuildBuddy build log rendering.
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::ConsoleMessage(..)) => true,
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::ConsoleWarning(..)) => true,
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::StreamingOutput(..)) => true,
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::ActionError(..)) => true,
                     Some(Data::RageResult(..)) => true,
                     Some(Data::ReSession(..)) => true,
                     Some(Data::StructuredError(..)) => true,
