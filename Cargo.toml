@@ -198,6 +198,7 @@ equivalent = "1.0.2"
 erased-serde = "0.4.9"
 faccess = "0.2.4"
 fancy-regex = "0.16.2"
+fastcdc = "4.0.1"
 flate2 = "1.1.9"
 fnv = "1.0"
 fs4 = { version = "0.9.1", features = ["sync"] }
