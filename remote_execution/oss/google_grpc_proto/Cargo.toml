@@ -1,8 +1,8 @@
 [package]
-description = "A library providing gRPC client for Bazel remote execution"
+description = "Shared Google protobufs used by Buck2 gRPC clients"
 edition = "2024"
 license = { workspace = true }
-name = "re_grpc_proto"
+name = "google_grpc_proto"
 repository = { workspace = true }
 version = "0.1.0"
 
@@ -14,7 +14,6 @@ tonic = { workspace = true }
 tonic-prost = { workspace = true }
 
 buck2_data = { workspace = true }
-google_grpc_proto = { path = "../google_grpc_proto" }
 
 [build-dependencies]
 buck2_protoc_dev = { workspace = true }
