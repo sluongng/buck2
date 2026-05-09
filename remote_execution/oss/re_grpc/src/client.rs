@@ -343,6 +343,28 @@ fn tcode_from_grpc_code(code: tonic::Code) -> TCode {
     }
 }
 
+fn re_client_error_from_tonic_status(status: &tonic::Status) -> REClientError {
+    REClientError {
+        code: tcode_from_grpc_code(status.code()),
+        message: status.message().to_owned(),
+        group: TCodeReasonGroup::UNKNOWN,
+    }
+}
+
+fn normalize_grpc_error(err: anyhow::Error) -> anyhow::Error {
+    if err.downcast_ref::<REClientError>().is_some() {
+        return err;
+    }
+
+    let re_client_error = err
+        .downcast_ref::<tonic::Status>()
+        .map(re_client_error_from_tonic_status);
+    match re_client_error {
+        Some(re_client_error) => anyhow::Error::from(re_client_error),
+        None => err,
+    }
+}
+
 fn error_tcode(err: &anyhow::Error) -> Option<TCode> {
     err.downcast_ref::<REClientError>()
         .map(|status| status.code)
@@ -380,7 +402,7 @@ where
             Ok(response) => return Ok(response),
             Err(err) => {
                 if retry_attempt >= retries || !is_retryable_grpc_error(&err) {
-                    return Err(err);
+                    return Err(normalize_grpc_error(err));
                 }
 
                 let delay = jittered_retry_delay(next_delay);
@@ -741,12 +763,16 @@ impl REClientBuilder {
                 }
                 let connector = CountingConnector::new(http);
 
-                anyhow::Ok(
+                let channel =
                     endpoint
                         .connect_with_connector(connector)
                         .await
-                        .with_context(|| format!("Error connecting to `{address}`"))?,
-                )
+                        .map_err(|error| REClientError {
+                            code: TCode::UNAVAILABLE,
+                            message: format!("Error connecting to `{address}`: {error:#}"),
+                            group: TCodeReasonGroup::RE_CONNECTION,
+                        })?;
+                anyhow::Ok(channel)
             }
         };
 
@@ -2567,6 +2593,21 @@ mod tests {
             None
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_grpc_request_preserves_exhausted_status_code() {
+        let result: anyhow::Result<()> =
+            retry_grpc_request(0, Duration::from_millis(1), || async {
+                Err(anyhow::Error::from(tonic::Status::unavailable(
+                    "cache down",
+                )))
+            })
+            .await;
+
+        let err = result.unwrap_err();
+        let err = err.downcast_ref::<REClientError>().expect("REClientError");
+        assert_eq!(err.code, TCode::UNAVAILABLE);
     }
 
     fn digest_for_test_data(data: &[u8]) -> TDigest {

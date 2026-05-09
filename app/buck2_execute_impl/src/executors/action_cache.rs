@@ -16,6 +16,7 @@ use buck2_action_metadata_proto::REMOTE_DEP_FILE_KEY;
 use buck2_action_metadata_proto::RemoteDepFile;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
+use buck2_error::ErrorTag;
 use buck2_execute::execute::action_digest::ActionDigest;
 use buck2_execute::execute::action_digest::ActionDigestKind;
 use buck2_execute::execute::dep_file_digest::DepFileDigest;
@@ -30,6 +31,7 @@ use buck2_execute::execute::result::CommandExecutionResult;
 use buck2_execute::knobs::ExecutorGlobalKnobs;
 use buck2_execute::materialize::materializer::Materializer;
 use buck2_execute::re::action_identity::ReActionIdentity;
+use buck2_execute::re::error::RemoteExecutionError;
 use buck2_execute::re::manager::ManagedRemoteExecutionClient;
 use buck2_execute::re::output_trees_download_config::OutputTreesDownloadConfig;
 use buck2_execute::re::remote_action_result::ActionCacheResult;
@@ -37,6 +39,8 @@ use buck2_util::time_span::TimeSpan;
 use dice_futures::cancellation::CancellationContext;
 use dupe::Dupe;
 use prost::Message;
+use remote_execution::TCode;
+use remote_execution::TCodeReasonGroup;
 
 use crate::incremental_actions_helper::save_content_based_incremental_state;
 use crate::re::download::DownloadResult;
@@ -51,6 +55,7 @@ pub struct ActionCacheChecker {
     pub re_client: ManagedRemoteExecutionClient,
     pub re_action_key: Option<String>,
     pub upload_all_actions: bool,
+    pub remote_cache_unavailable_fallback: bool,
     pub knobs: ExecutorGlobalKnobs,
     pub paranoid: Option<ParanoidDownloader>,
     pub deduplicate_get_digests_ttl_calls: bool,
@@ -85,6 +90,7 @@ async fn query_action_cache_and_download_result(
     manager: CommandExecutionManager,
     cancellations: &CancellationContext,
     upload_all_actions: bool,
+    remote_cache_unavailable_fallback: bool,
     log_action_keys: bool,
     details: RemoteCommandExecutionDetails,
     deduplicate_get_digests_ttl_calls: bool,
@@ -117,6 +123,18 @@ async fn query_action_cache_and_download_result(
         ),
     )
     .await;
+
+    if let Err(e) = &action_cache_response
+        && remote_cache_unavailable_fallback
+        && is_remote_cache_unavailable(e)
+    {
+        tracing::info!(
+            "Ignoring unavailable remote cache for action `{}` and continuing execution: {:#}",
+            digest,
+            e
+        );
+        return ControlFlow::Continue(manager);
+    }
 
     if upload_all_actions {
         if let Err(e) = re_client
@@ -284,6 +302,7 @@ impl PreparedCommandOptionalExecutor for ActionCacheChecker {
             manager,
             cancellations,
             self.upload_all_actions,
+            self.remote_cache_unavailable_fallback,
             self.knobs.log_action_keys,
             details,
             self.deduplicate_get_digests_ttl_calls,
@@ -300,6 +319,7 @@ pub struct RemoteDepFileCacheChecker {
     pub re_client: ManagedRemoteExecutionClient,
     pub re_action_key: Option<String>,
     pub upload_all_actions: bool,
+    pub remote_cache_unavailable_fallback: bool,
     pub knobs: ExecutorGlobalKnobs,
     pub paranoid: Option<ParanoidDownloader>,
     pub deduplicate_get_digests_ttl_calls: bool,
@@ -350,12 +370,73 @@ impl PreparedCommandOptionalExecutor for RemoteDepFileCacheChecker {
             manager,
             cancellations,
             self.upload_all_actions,
+            self.remote_cache_unavailable_fallback,
             self.knobs.log_action_keys,
             details,
             self.deduplicate_get_digests_ttl_calls,
             &self.output_trees_download_config,
         )
         .await
+    }
+}
+
+fn is_remote_cache_unavailable(error: &buck2_error::Error) -> bool {
+    error.has_tag(ErrorTag::ReUnavailable)
+        || error.has_tag(ErrorTag::ReDeadlineExceeded)
+        || error.has_tag(ErrorTag::ReConnection)
+        || error
+            .find_typed_context::<RemoteExecutionError>()
+            .is_some_and(|re_client_error| {
+                matches!(
+                    re_client_error.code,
+                    TCode::UNAVAILABLE | TCode::DEADLINE_EXCEEDED
+                ) || re_client_error.group == TCodeReasonGroup::RE_CONNECTION
+            })
+}
+
+#[cfg(test)]
+mod tests {
+    use buck2_execute::re::error::test_re_error;
+
+    use super::*;
+
+    #[test]
+    fn treats_unavailable_cache_errors_as_fallbackable() {
+        let error = test_re_error("remote cache unavailable", TCode::UNAVAILABLE);
+
+        assert!(is_remote_cache_unavailable(&error));
+    }
+
+    #[test]
+    fn treats_deadline_cache_errors_as_fallbackable() {
+        let error = test_re_error("remote cache timeout", TCode::DEADLINE_EXCEEDED);
+
+        assert!(is_remote_cache_unavailable(&error));
+    }
+
+    #[test]
+    fn does_not_fallback_on_cache_permission_errors() {
+        let error = test_re_error("remote cache denied", TCode::PERMISSION_DENIED);
+
+        assert!(!is_remote_cache_unavailable(&error));
+    }
+
+    #[test]
+    fn treats_transport_tags_as_fallbackable() {
+        let unavailable = buck2_error::buck2_error!(
+            buck2_error::ErrorTag::ReUnavailable,
+            "transport unavailable"
+        );
+        let deadline = buck2_error::buck2_error!(
+            buck2_error::ErrorTag::ReDeadlineExceeded,
+            "transport deadline"
+        );
+        let connection =
+            buck2_error::buck2_error!(buck2_error::ErrorTag::ReConnection, "connection failed");
+
+        assert!(is_remote_cache_unavailable(&unavailable));
+        assert!(is_remote_cache_unavailable(&deadline));
+        assert!(is_remote_cache_unavailable(&connection));
     }
 }
 
