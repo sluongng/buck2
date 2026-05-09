@@ -10,6 +10,7 @@ license.workspace = true
 [dependencies]
 allocative.workspace = true
 async-trait.workspace = true
+bazel_bep_proto.workspace = true
 bes_grpc_proto.workspace = true
 buck2_build_info.workspace = true
 buck2_cli_proto.workspace = true
