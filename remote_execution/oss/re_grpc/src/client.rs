@@ -16,6 +16,8 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -68,6 +70,7 @@ use re_grpc_proto::build::bazel::remote::execution::v2::compressor;
 use re_grpc_proto::build::bazel::remote::execution::v2::content_addressable_storage_client::ContentAddressableStorageClient;
 use re_grpc_proto::build::bazel::remote::execution::v2::execution_client::ExecutionClient;
 use re_grpc_proto::build::bazel::remote::execution::v2::execution_stage;
+use re_grpc_proto::google::bytestream::QueryWriteStatusRequest;
 use re_grpc_proto::google::bytestream::ReadRequest;
 use re_grpc_proto::google::bytestream::ReadResponse;
 use re_grpc_proto::google::bytestream::WriteRequest;
@@ -90,6 +93,7 @@ use tonic::metadata::MetadataKey;
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
 use tonic::transport::Channel;
+use uuid::Uuid;
 
 use crate::error::*;
 use crate::metadata::*;
@@ -102,6 +106,10 @@ use crate::request::*;
 use crate::response::*;
 
 const DEFAULT_MAX_TOTAL_BATCH_SIZE: usize = 4 * 1000 * 1000;
+const DEFAULT_RETRIES: usize = 5;
+const GRPC_RETRY_INITIAL_DELAY_MILLIS: u64 = 100;
+const DEFAULT_RETRY_MAX_DELAY_MILLIS: u64 = 5000;
+const GRPC_RETRY_JITTER: f64 = 0.1;
 
 fn tdigest_to(tdigest: TDigest) -> Digest {
     Digest {
@@ -173,6 +181,10 @@ pub struct RERuntimeOpts {
     max_concurrent_uploads_per_action: Option<usize>,
     /// Time that digests are assumed to live in CAS after being touched.
     cas_ttl_secs: i64,
+    /// Number of retry attempts for transient gRPC errors.
+    retries: usize,
+    /// Maximum backoff delay in milliseconds between retry attempts.
+    retry_max_delay_ms: u64,
 }
 
 struct InstanceName(Option<String>);
@@ -249,12 +261,18 @@ impl REClientBuilder {
         }
 
         let instance_name = InstanceName(opts.instance_name.clone());
+        let retries = opts.retries.unwrap_or(DEFAULT_RETRIES);
+        let retry_max_delay_ms = opts
+            .retry_max_delay_ms
+            .unwrap_or(DEFAULT_RETRY_MAX_DELAY_MILLIS);
 
         let capabilities = if opts.capabilities.unwrap_or(true) {
             Self::fetch_rbe_capabilities(
                 &mut capabilities_client,
                 &instance_name,
                 opts.max_total_batch_size,
+                retries,
+                retry_max_delay_ms,
             )
             .await?
         } else {
@@ -318,6 +336,8 @@ impl REClientBuilder {
                 // NOTE: This is an arbitrary number because RBE does not return information
                 // on the TTL of the remote blob.
                 cas_ttl_secs: opts.cas_ttl_secs.unwrap_or(3 * 60 * 60),
+                retries,
+                retry_max_delay_ms,
             },
             capabilities,
             instance_name,
@@ -335,16 +355,20 @@ impl REClientBuilder {
         client: &mut CapabilitiesClient<InterceptedService<Channel, InjectHeadersInterceptor>>,
         instance_name: &InstanceName,
         max_total_batch_size: Option<usize>,
+        retries: usize,
+        retry_max_delay_ms: u64,
     ) -> anyhow::Result<RECapabilities> {
         // TODO use more of the capabilities of the remote build executor
 
-        let resp = client
-            .get_capabilities(GetCapabilitiesRequest {
+        let resp = retry_grpc_request(retries, Duration::from_millis(retry_max_delay_ms), || {
+            let mut client = client.clone();
+            let request = GetCapabilitiesRequest {
                 instance_name: instance_name.as_str().to_owned(),
-            })
-            .await
-            .context("Failed to query capabilities of remote")?
-            .into_inner();
+            };
+            async move { Ok(client.get_capabilities(request).await?.into_inner()) }
+        })
+        .await
+        .context("Failed to query capabilities of remote")?;
 
         let supported_compressors = if let Some(cache_cap) = &resp.cache_capabilities {
             cache_cap
@@ -474,6 +498,7 @@ pub struct REClient {
     cas_address: String,
     engine_address: String,
     action_cache_address: String,
+    query_write_status_supported: AtomicBool,
 }
 
 impl Drop for REClient {
@@ -613,6 +638,137 @@ where
     unreachable!()
 }
 
+fn tcode_is_retryable(code: TCode) -> bool {
+    matches!(
+        code,
+        TCode::CANCELLED
+            | TCode::UNKNOWN
+            | TCode::DEADLINE_EXCEEDED
+            | TCode::ABORTED
+            | TCode::INTERNAL
+            | TCode::UNAVAILABLE
+            | TCode::RESOURCE_EXHAUSTED
+    )
+}
+
+fn tcode_from_grpc_code(code: tonic::Code) -> TCode {
+    match code {
+        tonic::Code::Ok => TCode::OK,
+        tonic::Code::Cancelled => TCode::CANCELLED,
+        tonic::Code::Unknown => TCode::UNKNOWN,
+        tonic::Code::InvalidArgument => TCode::INVALID_ARGUMENT,
+        tonic::Code::DeadlineExceeded => TCode::DEADLINE_EXCEEDED,
+        tonic::Code::NotFound => TCode::NOT_FOUND,
+        tonic::Code::AlreadyExists => TCode::ALREADY_EXISTS,
+        tonic::Code::PermissionDenied => TCode::PERMISSION_DENIED,
+        tonic::Code::ResourceExhausted => TCode::RESOURCE_EXHAUSTED,
+        tonic::Code::FailedPrecondition => TCode::FAILED_PRECONDITION,
+        tonic::Code::Aborted => TCode::ABORTED,
+        tonic::Code::OutOfRange => TCode::OUT_OF_RANGE,
+        tonic::Code::Unimplemented => TCode::UNIMPLEMENTED,
+        tonic::Code::Internal => TCode::INTERNAL,
+        tonic::Code::Unavailable => TCode::UNAVAILABLE,
+        tonic::Code::DataLoss => TCode::DATA_LOSS,
+        tonic::Code::Unauthenticated => TCode::UNAUTHENTICATED,
+    }
+}
+
+fn error_tcode(err: &anyhow::Error) -> Option<TCode> {
+    err.downcast_ref::<REClientError>()
+        .map(|status| status.code)
+        .or_else(|| {
+            err.downcast_ref::<tonic::Status>()
+                .map(|status| tcode_from_grpc_code(status.code()))
+        })
+}
+
+fn is_retryable_grpc_error(err: &anyhow::Error) -> bool {
+    error_tcode(err).is_some_and(tcode_is_retryable)
+}
+
+fn jittered_retry_delay(base_delay: Duration) -> Duration {
+    let random_bytes = Uuid::new_v4().into_bytes();
+    let random = u16::from_be_bytes([random_bytes[0], random_bytes[1]]) as f64 / u16::MAX as f64;
+    let jitter_ratio = GRPC_RETRY_JITTER * ((2.0 * random) - 1.0);
+    base_delay.mul_f64(1.0 + jitter_ratio)
+}
+
+async fn retry_grpc_request<T, Fut, F>(
+    retries: usize,
+    retry_max_delay: Duration,
+    mut request: F,
+) -> anyhow::Result<T>
+where
+    Fut: Future<Output = anyhow::Result<T>>,
+    F: FnMut() -> Fut,
+{
+    let mut retry_attempt = 0usize;
+    let mut next_delay = Duration::from_millis(GRPC_RETRY_INITIAL_DELAY_MILLIS);
+
+    loop {
+        match request().await {
+            Ok(response) => return Ok(response),
+            Err(err) => {
+                if retry_attempt >= retries || !is_retryable_grpc_error(&err) {
+                    return Err(err);
+                }
+
+                let delay = jittered_retry_delay(next_delay);
+                tracing::debug!(
+                    retry_attempt = retry_attempt + 1,
+                    retries,
+                    delay_ms = delay.as_millis(),
+                    "Retrying transient gRPC failure"
+                );
+                tokio::time::sleep(delay).await;
+                retry_attempt += 1;
+                next_delay = std::cmp::min(next_delay.saturating_mul(2), retry_max_delay);
+            }
+        }
+    }
+}
+
+enum BystreamWritePlan {
+    Write(Vec<WriteRequest>),
+    AlreadyCommitted(i64),
+}
+
+fn total_bystream_write_size(segments: &[WriteRequest]) -> i64 {
+    segments
+        .last()
+        .map(|segment| segment.write_offset + segment.data.len() as i64)
+        .unwrap_or(0)
+}
+
+fn trim_bystream_write_segments(
+    segments: Vec<WriteRequest>,
+    committed_size: i64,
+) -> Vec<WriteRequest> {
+    if committed_size <= 0 {
+        return segments;
+    }
+
+    let mut resumed = Vec::with_capacity(segments.len());
+    for mut segment in segments {
+        let start = segment.write_offset;
+        let end = start + segment.data.len() as i64;
+
+        if end <= committed_size {
+            continue;
+        }
+
+        if start < committed_size {
+            let skip = (committed_size - start) as usize;
+            segment.data = segment.data[skip..].to_vec();
+            segment.write_offset = committed_size;
+        }
+
+        resumed.push(segment);
+    }
+
+    resumed
+}
+
 impl REClient {
     fn new(
         runtime_opts: RERuntimeOpts,
@@ -642,6 +798,61 @@ impl REClient {
             cas_address,
             engine_address,
             action_cache_address,
+            query_write_status_supported: AtomicBool::new(true),
+        }
+    }
+
+    async fn bystream_write_plan(
+        &self,
+        bytestream_client: &mut ByteStreamClient<GrpcService>,
+        metadata: RemoteExecutionMetadata,
+        segments: Vec<WriteRequest>,
+    ) -> anyhow::Result<BystreamWritePlan> {
+        if segments.is_empty() || !self.query_write_status_supported.load(Ordering::Relaxed) {
+            return Ok(BystreamWritePlan::Write(segments));
+        }
+
+        let resource_name = segments[0].resource_name.clone();
+        let total_size = total_bystream_write_size(&segments);
+
+        match bytestream_client
+            .query_write_status(with_re_metadata(
+                QueryWriteStatusRequest {
+                    resource_name: resource_name.clone(),
+                },
+                metadata,
+                self.runtime_opts.use_fbcode_metadata,
+            ))
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.into_inner();
+                if status.complete || status.committed_size >= total_size {
+                    return Ok(BystreamWritePlan::AlreadyCommitted(total_size));
+                }
+
+                Ok(BystreamWritePlan::Write(trim_bystream_write_segments(
+                    segments,
+                    status.committed_size,
+                )))
+            }
+            Err(status) if status.code() == tonic::Code::Unimplemented => {
+                self.query_write_status_supported
+                    .store(false, Ordering::Relaxed);
+                tracing::debug!(
+                    resource_name = %resource_name,
+                    "Bytestream QueryWriteStatus is not supported by server; disabling resume probes"
+                );
+                Ok(BystreamWritePlan::Write(segments))
+            }
+            Err(status) => {
+                tracing::debug!(
+                    resource_name = %resource_name,
+                    code = ?status.code(),
+                    "Bytestream QueryWriteStatus failed; retrying write from offset 0"
+                );
+                Ok(BystreamWritePlan::Write(segments))
+            }
         }
     }
 
@@ -650,27 +861,37 @@ impl REClient {
         metadata: RemoteExecutionMetadata,
         request: ActionResultRequest,
     ) -> anyhow::Result<ActionResultResponse> {
-        retry(|| async {
-            let res = self
-                .action_cache_client()
-                .await?
-                .get_action_result(with_re_metadata(
-                    GetActionResultRequest {
-                        instance_name: self.instance_name.as_str().to_owned(),
-                        action_digest: Some(tdigest_to(request.digest.clone())),
-                        ..Default::default()
-                    },
-                    metadata.clone(),
-                    self.runtime_opts.use_fbcode_metadata,
-                ))
-                .await?;
+        let action_digest = tdigest_to(request.digest);
+        let res = retry_grpc_request(
+            self.runtime_opts.retries,
+            Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
+            || {
+                let metadata = metadata.clone();
+                let action_digest = action_digest.clone();
+                async move {
+                    let res = self
+                        .action_cache_client()
+                        .await?
+                        .get_action_result(with_re_metadata(
+                            GetActionResultRequest {
+                                instance_name: self.instance_name.as_str().to_owned(),
+                                action_digest: Some(action_digest),
+                                ..Default::default()
+                            },
+                            metadata,
+                            self.runtime_opts.use_fbcode_metadata,
+                        ))
+                        .await?;
+                    anyhow::Ok(res)
+                }
+            },
+        )
+        .await?;
 
-            Ok(ActionResultResponse {
-                action_result: convert_action_result(res.into_inner())?,
-                ttl: 0,
-            })
+        Ok(ActionResultResponse {
+            action_result: convert_action_result(res.into_inner())?,
+            ttl: 0,
         })
-        .await
     }
 
     pub async fn write_action_result(
@@ -678,31 +899,42 @@ impl REClient {
         metadata: RemoteExecutionMetadata,
         request: WriteActionResultRequest,
     ) -> anyhow::Result<WriteActionResultResponse> {
+        let action_digest = tdigest_to(request.action_digest);
         let action_result = convert_t_action_result2(request.action_result)?;
 
-        retry(|| async {
-            let res = self
-                .action_cache_client()
-                .await?
-                .update_action_result(with_re_metadata(
-                    UpdateActionResultRequest {
-                        instance_name: self.instance_name.as_str().to_owned(),
-                        action_digest: Some(tdigest_to(request.action_digest.clone())),
-                        action_result: Some(action_result.clone()),
-                        results_cache_policy: None,
-                        ..Default::default()
-                    },
-                    metadata.clone(),
-                    self.runtime_opts.use_fbcode_metadata,
-                ))
-                .await?;
+        let res = retry_grpc_request(
+            self.runtime_opts.retries,
+            Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
+            || {
+                let metadata = metadata.clone();
+                let action_digest = action_digest.clone();
+                let action_result = action_result.clone();
+                async move {
+                    let res = self
+                        .action_cache_client()
+                        .await?
+                        .update_action_result(with_re_metadata(
+                            UpdateActionResultRequest {
+                                instance_name: self.instance_name.as_str().to_owned(),
+                                action_digest: Some(action_digest),
+                                action_result: Some(action_result),
+                                results_cache_policy: None,
+                                ..Default::default()
+                            },
+                            metadata,
+                            self.runtime_opts.use_fbcode_metadata,
+                        ))
+                        .await?;
+                    anyhow::Ok(res)
+                }
+            },
+        )
+        .await?;
 
-            Ok(WriteActionResultResponse {
-                actual_action_result: convert_action_result(res.into_inner())?,
-                ttl_seconds: 0,
-            })
+        Ok(WriteActionResultResponse {
+            actual_action_result: convert_action_result(res.into_inner())?,
+            ttl_seconds: 0,
         })
-        .await
     }
 
     pub async fn execute_with_progress(
@@ -719,26 +951,34 @@ impl REClient {
             .map(|ep| ep.priority)
             .unwrap_or_default();
 
-        let stream = retry(|| async {
-            let stream = self
-                .execution_client()
-                .await?
-                .execute(with_re_metadata(
-                    GExecuteRequest {
-                        instance_name: self.instance_name.as_str().to_owned(),
-                        skip_cache_lookup: execute_request.skip_cache_lookup,
-                        execution_policy: Some(ExecutionPolicy { priority }),
-                        results_cache_policy: Some(ResultsCachePolicy { priority: 0 }),
-                        action_digest: Some(action_digest.clone()),
-                        ..Default::default()
-                    },
-                    metadata.clone(),
-                    self.runtime_opts.use_fbcode_metadata,
-                ))
-                .await?
-                .into_inner();
-            anyhow::Ok(stream)
-        })
+        let stream = retry_grpc_request(
+            self.runtime_opts.retries,
+            Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
+            || {
+                let metadata = metadata.clone();
+                let action_digest = action_digest.clone();
+                async move {
+                    let stream = self
+                        .execution_client()
+                        .await?
+                        .execute(with_re_metadata(
+                            GExecuteRequest {
+                                instance_name: self.instance_name.as_str().to_owned(),
+                                skip_cache_lookup: execute_request.skip_cache_lookup,
+                                execution_policy: Some(ExecutionPolicy { priority }),
+                                results_cache_policy: Some(ResultsCachePolicy { priority: 0 }),
+                                action_digest: Some(action_digest),
+                                ..Default::default()
+                            },
+                            metadata,
+                            self.runtime_opts.use_fbcode_metadata,
+                        ))
+                        .await?
+                        .into_inner();
+                    anyhow::Ok(stream)
+                }
+            },
+        )
         .await?;
 
         let stream = futures::stream::try_unfold(stream, move |mut stream| async {
@@ -849,31 +1089,65 @@ impl REClient {
             |re_request| {
                 let metadata = metadata.clone();
                 async move {
-                    let resp = self
-                        .cas_client()
-                        .await?
-                        .batch_update_blobs(with_re_metadata(
-                            re_request,
-                            metadata,
-                            self.runtime_opts.use_fbcode_metadata,
-                        ))
-                        .await?;
-                    Ok(resp.into_inner())
+                    retry_grpc_request(
+                        self.runtime_opts.retries,
+                        Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
+                        || {
+                            let metadata = metadata.clone();
+                            let re_request = re_request.clone();
+                            async move {
+                                let resp = self
+                                    .cas_client()
+                                    .await?
+                                    .batch_update_blobs(with_re_metadata(
+                                        re_request,
+                                        metadata,
+                                        self.runtime_opts.use_fbcode_metadata,
+                                    ))
+                                    .await?;
+                                Ok(resp.into_inner())
+                            }
+                        },
+                    )
+                    .await
                 }
             },
             |segments| {
                 let metadata = metadata.clone();
                 async move {
-                    let resp = self
-                        .bytestream_client()
-                        .await?
-                        .write(with_re_metadata(
-                            futures::stream::iter(segments),
-                            metadata,
-                            self.runtime_opts.use_fbcode_metadata,
-                        ))
-                        .await?;
-                    Ok(resp.into_inner())
+                    retry_grpc_request(
+                        self.runtime_opts.retries,
+                        Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
+                        || {
+                            let metadata = metadata.clone();
+                            let segments = segments.clone();
+                            async move {
+                                let mut bytestream_client = self.bytestream_client().await?;
+                                let segments = match self
+                                    .bystream_write_plan(
+                                        &mut bytestream_client,
+                                        metadata.clone(),
+                                        segments,
+                                    )
+                                    .await?
+                                {
+                                    BystreamWritePlan::Write(segments) => segments,
+                                    BystreamWritePlan::AlreadyCommitted(committed_size) => {
+                                        return Ok(WriteResponse { committed_size });
+                                    }
+                                };
+                                let resp = bytestream_client
+                                    .write(with_re_metadata(
+                                        futures::stream::iter(segments),
+                                        metadata,
+                                        self.runtime_opts.use_fbcode_metadata,
+                                    ))
+                                    .await?;
+                                Ok(resp.into_inner())
+                            }
+                        },
+                    )
+                    .await
                 }
             },
         )
@@ -918,31 +1192,54 @@ impl REClient {
             |re_request| {
                 let metadata = metadata.clone();
                 async move {
-                    let resp = self
-                        .cas_client()
-                        .await?
-                        .batch_read_blobs(with_re_metadata(
-                            re_request,
-                            metadata,
-                            self.runtime_opts.use_fbcode_metadata,
-                        ))
-                        .await?;
-                    Ok(resp.into_inner())
+                    retry_grpc_request(
+                        self.runtime_opts.retries,
+                        Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
+                        || {
+                            let metadata = metadata.clone();
+                            let re_request = re_request.clone();
+                            async move {
+                                let resp = self
+                                    .cas_client()
+                                    .await?
+                                    .batch_read_blobs(with_re_metadata(
+                                        re_request,
+                                        metadata,
+                                        self.runtime_opts.use_fbcode_metadata,
+                                    ))
+                                    .await?;
+                                Ok(resp.into_inner())
+                            }
+                        },
+                    )
+                    .await
                 }
             },
             |read_request| {
                 let metadata = metadata.clone();
                 async move {
-                    let response = self
-                        .bytestream_client()
-                        .await?
-                        .read(with_re_metadata(
-                            read_request,
-                            metadata,
-                            self.runtime_opts.use_fbcode_metadata,
-                        ))
-                        .await?
-                        .into_inner();
+                    let response = retry_grpc_request(
+                        self.runtime_opts.retries,
+                        Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
+                        || {
+                            let metadata = metadata.clone();
+                            let read_request = read_request.clone();
+                            async move {
+                                let response = self
+                                    .bytestream_client()
+                                    .await?
+                                    .read(with_re_metadata(
+                                        read_request,
+                                        metadata,
+                                        self.runtime_opts.use_fbcode_metadata,
+                                    ))
+                                    .await?
+                                    .into_inner();
+                                Ok(response)
+                            }
+                        },
+                    )
+                    .await?;
                     Ok(Box::pin(response.into_stream()))
                 }
             },
@@ -980,25 +1277,37 @@ impl REClient {
             // Send a request and notify others of the result
             if !digests_to_check.is_empty() {
                 tracing::debug!(num_digests = digests_to_check.len(), "FindMissingBlobs");
-                let blob_digests: Vec<_> = digests_to_check.map(|b| tdigest_to(b.clone()));
-                let resp: FindMissingBlobsResponse = retry(|| async {
-                    let resp = self
-                        .cas_client()
-                        .await?
-                        .find_missing_blobs(with_re_metadata(
-                            FindMissingBlobsRequest {
-                                instance_name: self.instance_name.as_str().to_owned(),
-                                blob_digests: blob_digests.clone(),
-                                ..Default::default()
-                            },
-                            metadata.clone(),
-                            self.runtime_opts.use_fbcode_metadata,
-                        ))
-                        .await
-                        .context("Failed to request what blobs are not present on remote")?;
-                    Ok(resp.into_inner())
-                })
-                .await?;
+                let blobs_to_check = digests_to_check.clone();
+                let missing_blobs = retry_grpc_request(
+                    self.runtime_opts.retries,
+                    Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
+                    || {
+                        let metadata = metadata.clone();
+                        let blobs_to_check = blobs_to_check.clone();
+                        async move {
+                            let resp = self
+                                .cas_client()
+                                .await?
+                                .find_missing_blobs(with_re_metadata(
+                                    FindMissingBlobsRequest {
+                                        instance_name: self.instance_name.as_str().to_owned(),
+                                        blob_digests: blobs_to_check
+                                            .iter()
+                                            .map(|digest| tdigest_to(digest.clone()))
+                                            .collect(),
+                                        ..Default::default()
+                                    },
+                                    metadata,
+                                    self.runtime_opts.use_fbcode_metadata,
+                                ))
+                                .await?;
+                            anyhow::Ok(resp)
+                        }
+                    },
+                )
+                .await
+                .context("Failed to request what blobs are not present on remote")?;
+                let resp: FindMissingBlobsResponse = missing_blobs.into_inner();
 
                 // Update the results and the cache
                 let mut find_missing_cache = self.find_missing_cache.lock().unwrap();
@@ -2919,6 +3228,46 @@ mod tests {
         assert_eq!(substitute_env_vars_impl("foo", getter).unwrap(), "foo");
         assert_eq!(substitute_env_vars_impl("FOO", getter).unwrap(), "FOO");
         assert!(substitute_env_vars_impl("$FOO$BAZ", getter).is_err());
+    }
+
+    #[test]
+    fn test_trim_bystream_write_segments_partial() {
+        let resource_name = "uploads/uuid/blobs/hash/18".to_owned();
+        let segments = vec![
+            WriteRequest {
+                resource_name: resource_name.clone(),
+                write_offset: 0,
+                finish_write: false,
+                data: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            },
+            WriteRequest {
+                resource_name,
+                write_offset: 10,
+                finish_write: true,
+                data: vec![11, 12, 13, 14, 15, 16, 17, 18],
+            },
+        ];
+
+        assert_eq!(18, total_bystream_write_size(&segments));
+
+        let resumed = trim_bystream_write_segments(segments, 12);
+        assert_eq!(1, resumed.len());
+        assert_eq!(12, resumed[0].write_offset);
+        assert_eq!(vec![13, 14, 15, 16, 17, 18], resumed[0].data);
+        assert!(resumed[0].finish_write);
+    }
+
+    #[test]
+    fn test_trim_bystream_write_segments_no_trim() {
+        let segments = vec![WriteRequest {
+            resource_name: "uploads/uuid/blobs/hash/3".to_owned(),
+            write_offset: 0,
+            finish_write: true,
+            data: vec![1, 2, 3],
+        }];
+
+        let resumed = trim_bystream_write_segments(segments.clone(), 0);
+        assert_eq!(segments, resumed);
     }
 }
 
