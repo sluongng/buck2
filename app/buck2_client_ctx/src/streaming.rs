@@ -355,9 +355,10 @@ fn get_build_graph_stats<T: StreamingCommand>(
     ctx: &ClientCommandContext,
 ) -> Option<Box<dyn EventSubscriber>> {
     if should_handle_build_graph_stats(cmd) {
-        Some(Box::new(BuildGraphStats::new(
+        Some(Box::new(BuildGraphStats::new_with_paths(
             ctx.fbinit(),
             ctx.trace_id.dupe(),
+            ctx.paths().ok(),
         )))
     } else {
         None
