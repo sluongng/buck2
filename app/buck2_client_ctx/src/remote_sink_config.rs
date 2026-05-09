@@ -11,12 +11,15 @@
 use buck2_common::invocation_paths::InvocationPaths;
 #[cfg(not(fbcode_build))]
 use buck2_error::ErrorTag;
+#[cfg(not(fbcode_build))]
+use buck2_events::sink::remote::BesEventFormat;
 use buck2_events::sink::remote::RemoteEventConfig;
 
 #[cfg(not(fbcode_build))]
 struct BuckconfigBesSettings {
     bes_backend: Option<String>,
     bes_headers: Vec<(String, String)>,
+    bes_event_format: Option<BesEventFormat>,
     bes_results_url: Option<String>,
 }
 
@@ -31,6 +34,9 @@ pub fn with_buckconfig_overrides(
                 config.bes_backend = Some(bes_backend);
             }
             config.bes_headers = settings.bes_headers;
+            if let Some(bes_event_format) = settings.bes_event_format {
+                config.event_format = bes_event_format;
+            }
             config
         }
         Err(e) => {
@@ -81,6 +87,7 @@ fn read_buckconfig_bes_settings(
         return Ok(BuckconfigBesSettings {
             bes_backend: None,
             bes_headers: Vec::new(),
+            bes_event_format: None,
             bes_results_url: None,
         });
     };
@@ -118,6 +125,10 @@ fn read_buckconfig_bes_settings(
             section: "bes",
             property: "header",
         })?)?,
+        bes_event_format: root_config.parse::<BesEventFormat>(BuckconfigKeyRef {
+            section: "bes",
+            property: "event_format",
+        })?,
         bes_results_url,
     })
 }
