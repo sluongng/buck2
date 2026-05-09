@@ -72,6 +72,7 @@ use re_grpc_proto::build::bazel::remote::execution::v2::SplitBlobRequest as GSpl
 use re_grpc_proto::build::bazel::remote::execution::v2::SplitBlobResponse as GSplitBlobResponse;
 use re_grpc_proto::build::bazel::remote::execution::v2::ToolDetails;
 use re_grpc_proto::build::bazel::remote::execution::v2::UpdateActionResultRequest;
+use re_grpc_proto::build::bazel::remote::execution::v2::WaitExecutionRequest;
 use re_grpc_proto::build::bazel::remote::execution::v2::action_cache_client::ActionCacheClient;
 use re_grpc_proto::build::bazel::remote::execution::v2::batch_update_blobs_request::Request;
 use re_grpc_proto::build::bazel::remote::execution::v2::capabilities_client::CapabilitiesClient;
@@ -88,6 +89,7 @@ use re_grpc_proto::google::bytestream::ReadResponse;
 use re_grpc_proto::google::bytestream::WriteRequest;
 use re_grpc_proto::google::bytestream::WriteResponse;
 use re_grpc_proto::google::bytestream::byte_stream_client::ByteStreamClient;
+use re_grpc_proto::google::longrunning::Operation;
 use re_grpc_proto::google::longrunning::operation::Result as OpResult;
 use re_grpc_proto::google::rpc::Code;
 use re_grpc_proto::google::rpc::Status;
@@ -1884,6 +1886,10 @@ fn is_retryable_grpc_error(err: &anyhow::Error) -> bool {
     error_tcode(err).is_some_and(tcode_is_retryable)
 }
 
+fn is_operation_not_found(err: &anyhow::Error) -> bool {
+    error_tcode(err) == Some(TCode::NOT_FOUND)
+}
+
 fn jittered_retry_delay(base_delay: Duration) -> Duration {
     let random_bytes = Uuid::new_v4().into_bytes();
     let random = u16::from_be_bytes([random_bytes[0], random_bytes[1]]) as f64 / u16::MAX as f64;
@@ -1924,6 +1930,34 @@ where
             }
         }
     }
+}
+
+async fn wait_execution_stream(
+    client: ExecutionClient<GrpcService>,
+    metadata: RemoteExecutionMetadata,
+    use_fbcode_metadata: bool,
+    operation_name: String,
+    retries: usize,
+    retry_max_delay: Duration,
+) -> anyhow::Result<tonic::Streaming<Operation>> {
+    retry_grpc_request(retries, retry_max_delay, || {
+        let mut client = client.clone();
+        let metadata = metadata.clone();
+        let operation_name = operation_name.clone();
+        async move {
+            Ok(client
+                .wait_execution(with_re_metadata(
+                    WaitExecutionRequest {
+                        name: operation_name,
+                    },
+                    metadata,
+                    use_fbcode_metadata,
+                ))
+                .await?
+                .into_inner())
+        }
+    })
+    .await
 }
 
 enum BystreamWritePlan {
@@ -2211,79 +2245,134 @@ impl REClient {
         )
         .await?;
 
-        let stream = futures::stream::try_unfold(stream, move |mut stream| async {
-            let msg = match stream.try_next().await.context("RE channel error")? {
-                Some(msg) => msg,
-                None => return Ok(None),
-            };
+        let execution_client = self.execution_client().await?;
+        let metadata_for_wait_execution = metadata.clone();
+        let use_fbcode_metadata = self.runtime_opts.use_fbcode_metadata;
+        let retries = self.runtime_opts.retries;
+        let retry_max_delay = Duration::from_millis(self.runtime_opts.retry_max_delay_ms);
 
-            let status = if msg.done {
-                match msg
-                    .result
-                    .context("Missing `result` when message was `done`")?
-                {
-                    OpResult::Error(rpc_status) => {
-                        return Err(REClientError {
-                            code: TCode(rpc_status.code),
-                            message: rpc_status.message,
-                            group: TCodeReasonGroup::UNKNOWN,
+        let stream = futures::stream::try_unfold(
+            (stream, None::<String>),
+            move |(mut stream, mut operation_name)| {
+                let execution_client = execution_client.clone();
+                let metadata = metadata_for_wait_execution.clone();
+                async move {
+                    let msg = loop {
+                        match stream.try_next().await {
+                            Ok(Some(msg)) => break msg,
+                            Ok(None) => return Ok(None),
+                            Err(err) => {
+                                let err = anyhow::Error::from(err);
+                                let Some(name) = operation_name.clone() else {
+                                    return Err(err.context("RE channel error"));
+                                };
+                                if !is_retryable_grpc_error(&err) {
+                                    return Err(err.context("RE channel error"));
+                                }
+
+                                tracing::debug!(
+                                    operation_name = %name,
+                                    "Execute stream failed after operation creation; resuming with WaitExecution"
+                                );
+                                stream = match wait_execution_stream(
+                                    execution_client.clone(),
+                                    metadata.clone(),
+                                    use_fbcode_metadata,
+                                    name.clone(),
+                                    retries,
+                                    retry_max_delay,
+                                )
+                                .await
+                                {
+                                    Ok(stream) => stream,
+                                    Err(wait_err) if is_operation_not_found(&wait_err) => {
+                                        return Err(wait_err
+                                            .context(format!("RE operation `{name}` was lost")));
+                                    }
+                                    Err(wait_err) => {
+                                        return Err(wait_err.context(
+                                            "RE WaitExecution failed after Execute stream interruption",
+                                        ));
+                                    }
+                                };
+                            }
                         }
-                        .into());
+                    };
+
+                    if !msg.name.is_empty() {
+                        operation_name = Some(msg.name.clone());
                     }
-                    OpResult::Response(any) => {
-                        let execute_response_grpc: GExecuteResponse =
-                            GExecuteResponse::decode(&any.value[..])?;
 
-                        check_status(execute_response_grpc.status.unwrap_or_default())?;
-
-                        let action_result = execute_response_grpc
+                    let status = if msg.done {
+                        match msg
                             .result
-                            .with_context(|| "The action result is not defined.")?;
+                            .context("Missing `result` when message was `done`")?
+                        {
+                            OpResult::Error(rpc_status) => {
+                                return Err(REClientError {
+                                    code: TCode(rpc_status.code),
+                                    message: rpc_status.message,
+                                    group: TCodeReasonGroup::UNKNOWN,
+                                }
+                                .into());
+                            }
+                            OpResult::Response(any) => {
+                                let execute_response_grpc: GExecuteResponse =
+                                    GExecuteResponse::decode(&any.value[..])?;
 
-                        let action_result = convert_action_result(action_result)?;
+                                check_status(execute_response_grpc.status.unwrap_or_default())?;
 
-                        let execute_response = ExecuteResponse {
-                            action_result,
-                            action_result_digest: TDigest::default(),
-                            action_result_ttl: 0,
-                            status: TStatus {
-                                code: TCode::OK,
-                                message: execute_response_grpc.message,
-                                ..Default::default()
-                            },
-                            cached_result: execute_response_grpc.cached_result,
-                            action_digest: Default::default(), // Filled in below.
+                                let action_result = execute_response_grpc
+                                    .result
+                                    .with_context(|| "The action result is not defined.")?;
+
+                                let action_result = convert_action_result(action_result)?;
+
+                                let execute_response = ExecuteResponse {
+                                    action_result,
+                                    action_result_digest: TDigest::default(),
+                                    action_result_ttl: 0,
+                                    status: TStatus {
+                                        code: TCode::OK,
+                                        message: execute_response_grpc.message,
+                                        ..Default::default()
+                                    },
+                                    cached_result: execute_response_grpc.cached_result,
+                                    action_digest: Default::default(), // Filled in below.
+                                };
+
+                                ExecuteWithProgressResponse {
+                                    stage: Stage::COMPLETED,
+                                    execute_response: Some(execute_response),
+                                    ..Default::default()
+                                }
+                            }
+                        }
+                    } else {
+                        let meta = ExecuteOperationMetadata::decode(
+                            &msg.metadata.unwrap_or_default().value[..],
+                        )?;
+
+                        let stage = match execution_stage::Value::try_from(meta.stage) {
+                            Ok(execution_stage::Value::Unknown) => Stage::UNKNOWN,
+                            Ok(execution_stage::Value::CacheCheck) => Stage::CACHE_CHECK,
+                            Ok(execution_stage::Value::Queued) => Stage::QUEUED,
+                            Ok(execution_stage::Value::Executing) => Stage::EXECUTING,
+                            Ok(execution_stage::Value::Completed) => Stage::COMPLETED,
+                            _ => Stage::UNKNOWN,
                         };
 
                         ExecuteWithProgressResponse {
-                            stage: Stage::COMPLETED,
-                            execute_response: Some(execute_response),
+                            stage,
+                            execute_response: None,
                             ..Default::default()
                         }
-                    }
+                    };
+
+                    anyhow::Ok(Some((status, (stream, operation_name))))
                 }
-            } else {
-                let meta =
-                    ExecuteOperationMetadata::decode(&msg.metadata.unwrap_or_default().value[..])?;
-
-                let stage = match execution_stage::Value::try_from(meta.stage) {
-                    Ok(execution_stage::Value::Unknown) => Stage::UNKNOWN,
-                    Ok(execution_stage::Value::CacheCheck) => Stage::CACHE_CHECK,
-                    Ok(execution_stage::Value::Queued) => Stage::QUEUED,
-                    Ok(execution_stage::Value::Executing) => Stage::EXECUTING,
-                    Ok(execution_stage::Value::Completed) => Stage::COMPLETED,
-                    _ => Stage::UNKNOWN,
-                };
-
-                ExecuteWithProgressResponse {
-                    stage,
-                    execute_response: None,
-                    ..Default::default()
-                }
-            };
-
-            anyhow::Ok(Some((status, stream)))
-        });
+            },
+        );
 
         // We fill in the action digest a little later here. We do it this way so we don't have to
         // clone the execute_request into every future we create above.
@@ -3300,11 +3389,21 @@ impl REClient {
 
     pub async fn extend_digest_ttl(
         &self,
-        _metadata: RemoteExecutionMetadata,
-        _request: ExtendDigestsTtlRequest,
+        metadata: RemoteExecutionMetadata,
+        request: ExtendDigestsTtlRequest,
     ) -> anyhow::Result<TDigest> {
-        // TODO(arr)
-        Err(anyhow::anyhow!("Not implemented (RE extend_digest_ttl)"))
+        let response = self
+            .get_digests_ttl(
+                metadata,
+                GetDigestsTtlRequest {
+                    digests: request.digests.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("Failed to refresh CAS TTLs with FindMissingBlobs")?;
+        validate_extend_digests_ttl_response(&request.digests, response)?;
+        Ok(TDigest::default())
     }
 
     pub fn get_execution_client(&self) -> &Self {
@@ -3366,6 +3465,374 @@ impl REClient {
     pub fn get_experiment_name(&self) -> anyhow::Result<Option<String>> {
         Ok(None)
     }
+}
+
+fn validate_upload_digest_size(
+    digest: &TDigest,
+    max_cas_blob_size_bytes: Option<i64>,
+) -> anyhow::Result<()> {
+    let Some(max_cas_blob_size_bytes) = max_cas_blob_size_bytes else {
+        return Ok(());
+    };
+
+    if digest.size_in_bytes > max_cas_blob_size_bytes {
+        return Err(anyhow::anyhow!(
+            "CAS blob `{digest}` is {} bytes, exceeding server max_cas_blob_size_bytes {}",
+            digest.size_in_bytes,
+            max_cas_blob_size_bytes
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_upload_request_sizes(
+    request: &UploadRequest,
+    max_cas_blob_size_bytes: Option<i64>,
+) -> anyhow::Result<()> {
+    for blob in request.inlined_blobs_with_digest.iter().flatten() {
+        validate_upload_digest_size(&blob.digest, max_cas_blob_size_bytes)
+            .context("Upload request contains an oversized inlined blob")?;
+    }
+
+    for file in request.files_with_digest.iter().flatten() {
+        validate_upload_digest_size(&file.digest, max_cas_blob_size_bytes)
+            .with_context(|| format!("Upload request contains oversized file `{}`", file.name))?;
+    }
+
+    for directory in request.directories.iter().flatten() {
+        if let Some(digest) = &directory.digest {
+            validate_upload_digest_size(digest, max_cas_blob_size_bytes).with_context(|| {
+                format!(
+                    "Upload request contains oversized directory `{}`",
+                    directory.path
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn upload_request_digests(request: &UploadRequest) -> Vec<TDigest> {
+    let mut digests = Vec::new();
+
+    digests.extend(upload_payload_digests(request));
+    if let Some(directories) = &request.directories {
+        digests.extend(
+            directories
+                .iter()
+                .filter_map(|directory| directory.digest.clone()),
+        );
+    }
+
+    digests
+}
+
+fn upload_payload_digests(request: &UploadRequest) -> Vec<TDigest> {
+    let mut digests = Vec::new();
+
+    if let Some(blobs) = &request.inlined_blobs_with_digest {
+        digests.extend(blobs.iter().map(|blob| blob.digest.clone()));
+    }
+    if let Some(files) = &request.files_with_digest {
+        digests.extend(files.iter().map(|file| file.digest.clone()));
+    }
+
+    digests
+}
+
+fn filter_upload_request_by_missing_digests(
+    mut request: UploadRequest,
+    missing_digests: &HashSet<TDigest>,
+) -> UploadRequest {
+    request.upload_only_missing = false;
+
+    if let Some(blobs) = request.inlined_blobs_with_digest.take() {
+        request.inlined_blobs_with_digest = Some(
+            blobs
+                .into_iter()
+                .filter(|blob| missing_digests.contains(&blob.digest))
+                .collect(),
+        );
+    }
+    if let Some(files) = request.files_with_digest.take() {
+        request.files_with_digest = Some(
+            files
+                .into_iter()
+                .filter(|file| missing_digests.contains(&file.digest))
+                .collect(),
+        );
+    }
+    if let Some(directories) = request.directories.take() {
+        request.directories = Some(
+            directories
+                .into_iter()
+                .filter(|directory| {
+                    directory
+                        .digest
+                        .as_ref()
+                        .is_some_and(|digest| missing_digests.contains(digest))
+                })
+                .collect(),
+        );
+    }
+
+    request
+}
+
+fn digests_with_ttl_for_requested_digests(
+    requested_digests: &[TDigest],
+    remote_results: &HashMap<TDigest, DigestRemoteState>,
+    cas_ttl_secs: i64,
+) -> anyhow::Result<Vec<DigestWithTtl>> {
+    requested_digests
+        .iter()
+        .map(|digest| {
+            let state = remote_results.get(digest).with_context(|| {
+                format!("No FindMissingBlobs result recorded for requested digest `{digest}`")
+            })?;
+            let ttl = match state {
+                DigestRemoteState::Missing => 0,
+                DigestRemoteState::ExistsOnRemote => cas_ttl_secs,
+            };
+            Ok(DigestWithTtl {
+                digest: digest.clone(),
+                ttl,
+            })
+        })
+        .collect()
+}
+
+fn validate_extend_digests_ttl_response(
+    requested_digests: &[TDigest],
+    response: GetDigestsTtlResponse,
+) -> anyhow::Result<()> {
+    let response_count = response.digests_with_ttl.len();
+    anyhow::ensure!(
+        requested_digests.len() == response_count,
+        "Invalid CAS TTL refresh response: expected {} digests, got {}",
+        requested_digests.len(),
+        response_count,
+    );
+
+    let missing_digests = response
+        .digests_with_ttl
+        .into_iter()
+        .filter(|digest_ttl| digest_ttl.ttl <= 0)
+        .map(|digest_ttl| digest_ttl.digest.to_string())
+        .collect::<Vec<_>>();
+
+    anyhow::ensure!(
+        missing_digests.is_empty(),
+        "Cannot refresh CAS TTL for missing digests: {}",
+        missing_digests.join(", ")
+    );
+
+    Ok(())
+}
+
+fn digest_name(digest: &Digest) -> String {
+    format!("{}/{}", digest.hash, digest.size_bytes)
+}
+
+fn validate_find_missing_blobs_response_digests(
+    requested_digests: &[Digest],
+    response: &FindMissingBlobsResponse,
+) -> anyhow::Result<()> {
+    let mut unmatched_digests = requested_digests.to_vec();
+    let mut failures = Vec::new();
+
+    for digest in &response.missing_blob_digests {
+        let Some(index) = unmatched_digests
+            .iter()
+            .position(|requested| requested == digest)
+        else {
+            failures.push(format!(
+                "FindMissingBlobs response included unexpected digest `{}`",
+                digest_name(digest)
+            ));
+            continue;
+        };
+        unmatched_digests.swap_remove(index);
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("FindMissingBlobs failed: {:?}", failures))
+    }
+}
+
+fn validate_batch_read_blobs_response_digests(
+    requested_digests: &[Digest],
+    response: &BatchReadBlobsResponse,
+) -> anyhow::Result<()> {
+    let mut missing_digests = requested_digests.to_vec();
+    let mut failures = Vec::new();
+
+    for response in &response.responses {
+        let Some(digest) = &response.digest else {
+            failures.push("BatchReadBlobs response omitted a digest".to_owned());
+            continue;
+        };
+
+        let Some(index) = missing_digests
+            .iter()
+            .position(|requested| requested == digest)
+        else {
+            failures.push(format!(
+                "BatchReadBlobs response included unexpected digest `{}`",
+                digest_name(digest)
+            ));
+            continue;
+        };
+        missing_digests.swap_remove(index);
+    }
+
+    for digest in &missing_digests {
+        failures.push(format!(
+            "BatchReadBlobs response missing digest `{}`",
+            digest_name(digest)
+        ));
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("Batch download failed: {:?}", failures))
+    }
+}
+
+fn validate_batch_update_blobs_response(
+    requested_digests: &[Digest],
+    response: &BatchUpdateBlobsResponse,
+) -> anyhow::Result<()> {
+    let mut missing_digests = requested_digests.to_vec();
+    let mut failures = Vec::new();
+
+    for response in &response.responses {
+        let Some(digest) = &response.digest else {
+            failures.push("BatchUpdateBlobs response omitted a digest".to_owned());
+            continue;
+        };
+
+        let Some(index) = missing_digests
+            .iter()
+            .position(|requested| requested == digest)
+        else {
+            failures.push(format!(
+                "BatchUpdateBlobs response included unexpected digest `{}`",
+                digest_name(digest)
+            ));
+            continue;
+        };
+        missing_digests.swap_remove(index);
+
+        let status = response.status.as_ref().cloned().unwrap_or_default();
+        if status.code != Code::Ok as i32 {
+            failures.push(format!(
+                "Unable to upload blob '{}', rpc status code: {}, message: \"{}\"",
+                digest_name(digest),
+                status.code,
+                status.message
+            ));
+        }
+    }
+
+    for digest in &missing_digests {
+        failures.push(format!(
+            "BatchUpdateBlobs response missing digest `{}`",
+            digest_name(digest)
+        ));
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("Batch upload failed: {:?}", failures))
+    }
+}
+
+fn validate_splice_blob_response_digest(
+    requested_digest: &Digest,
+    response: GSpliceBlobResponse,
+) -> anyhow::Result<TDigest> {
+    let Some(response_digest) = response.blob_digest else {
+        return Err(anyhow::anyhow!("SpliceBlob response omitted blob digest"));
+    };
+
+    if &response_digest != requested_digest {
+        return Err(anyhow::anyhow!(
+            "SpliceBlob response included unexpected digest `{}`; requested `{}`",
+            digest_name(&response_digest),
+            digest_name(requested_digest),
+        ));
+    }
+
+    Ok(tdigest_from(response_digest))
+}
+
+fn validate_split_blob_response(
+    requested_digest: &Digest,
+    response: GSplitBlobResponse,
+) -> anyhow::Result<Vec<TDigest>> {
+    validate_chunk_digests_reconstruct_blob(
+        "SplitBlob response",
+        requested_digest,
+        &response.chunk_digests,
+    )?;
+
+    Ok(response.chunk_digests.into_map(tdigest_from))
+}
+
+fn validate_chunk_digests_reconstruct_blob(
+    context: &str,
+    requested_digest: &Digest,
+    chunk_digests: &[Digest],
+) -> anyhow::Result<()> {
+    if requested_digest.size_bytes > 0 && chunk_digests.is_empty() {
+        return Err(anyhow::anyhow!(
+            "{context} included no chunks for non-empty digest `{}`",
+            digest_name(requested_digest),
+        ));
+    }
+
+    let mut total_size = 0i64;
+    for chunk_digest in chunk_digests {
+        if chunk_digest.hash.len() != requested_digest.hash.len() {
+            return Err(anyhow::anyhow!(
+                "{context} included chunk digest `{}` with hash length {}, expected {}",
+                digest_name(chunk_digest),
+                chunk_digest.hash.len(),
+                requested_digest.hash.len(),
+            ));
+        }
+        if chunk_digest.size_bytes < 0 {
+            return Err(anyhow::anyhow!(
+                "{context} included negative-size chunk digest `{}`",
+                digest_name(chunk_digest),
+            ));
+        }
+        total_size = total_size
+            .checked_add(chunk_digest.size_bytes)
+            .with_context(|| {
+                format!(
+                    "{context} chunks are too large to sum for requested digest `{}`",
+                    digest_name(requested_digest),
+                )
+            })?;
+    }
+
+    if total_size != requested_digest.size_bytes {
+        return Err(anyhow::anyhow!(
+            "{context} chunks sum to {total_size} bytes; requested digest `{}` has {} bytes",
+            digest_name(requested_digest),
+            requested_digest.size_bytes,
+        ));
+    }
+
+    Ok(())
 }
 
 fn convert_action_result(action_result: ActionResult) -> anyhow::Result<TActionResult2> {
@@ -3844,330 +4311,6 @@ where
         directories: None,
         local_cache_stats: Default::default(),
     })
-}
-
-fn validate_upload_digest_size(
-    digest: &TDigest,
-    max_cas_blob_size_bytes: Option<i64>,
-) -> anyhow::Result<()> {
-    let Some(max_cas_blob_size_bytes) = max_cas_blob_size_bytes else {
-        return Ok(());
-    };
-
-    if digest.size_in_bytes > max_cas_blob_size_bytes {
-        return Err(anyhow::anyhow!(
-            "CAS blob `{digest}` is {} bytes, exceeding server max_cas_blob_size_bytes {}",
-            digest.size_in_bytes,
-            max_cas_blob_size_bytes
-        ));
-    }
-
-    Ok(())
-}
-
-fn validate_upload_request_sizes(
-    request: &UploadRequest,
-    max_cas_blob_size_bytes: Option<i64>,
-) -> anyhow::Result<()> {
-    for blob in request.inlined_blobs_with_digest.iter().flatten() {
-        validate_upload_digest_size(&blob.digest, max_cas_blob_size_bytes)
-            .context("Upload request contains an oversized inlined blob")?;
-    }
-    for file in request.files_with_digest.iter().flatten() {
-        validate_upload_digest_size(&file.digest, max_cas_blob_size_bytes)
-            .with_context(|| format!("Upload request contains oversized file `{}`", file.name))?;
-    }
-    for directory in request.directories.iter().flatten() {
-        if let Some(digest) = &directory.digest {
-            validate_upload_digest_size(digest, max_cas_blob_size_bytes).with_context(|| {
-                format!(
-                    "Upload request contains oversized directory `{}`",
-                    directory.path
-                )
-            })?;
-        }
-    }
-    Ok(())
-}
-
-fn upload_request_digests(request: &UploadRequest) -> Vec<TDigest> {
-    let mut digests = Vec::new();
-    digests.extend(upload_payload_digests(request));
-    if let Some(directories) = &request.directories {
-        digests.extend(
-            directories
-                .iter()
-                .filter_map(|directory| directory.digest.clone()),
-        );
-    }
-    digests
-}
-
-fn upload_payload_digests(request: &UploadRequest) -> Vec<TDigest> {
-    let mut digests = Vec::new();
-    if let Some(blobs) = &request.inlined_blobs_with_digest {
-        digests.extend(blobs.iter().map(|blob| blob.digest.clone()));
-    }
-    if let Some(files) = &request.files_with_digest {
-        digests.extend(files.iter().map(|file| file.digest.clone()));
-    }
-    digests
-}
-
-fn filter_upload_request_by_missing_digests(
-    mut request: UploadRequest,
-    missing_digests: &HashSet<TDigest>,
-) -> UploadRequest {
-    request.upload_only_missing = false;
-    if let Some(blobs) = request.inlined_blobs_with_digest.take() {
-        request.inlined_blobs_with_digest = Some(
-            blobs
-                .into_iter()
-                .filter(|blob| missing_digests.contains(&blob.digest))
-                .collect(),
-        );
-    }
-    if let Some(files) = request.files_with_digest.take() {
-        request.files_with_digest = Some(
-            files
-                .into_iter()
-                .filter(|file| missing_digests.contains(&file.digest))
-                .collect(),
-        );
-    }
-    if let Some(directories) = request.directories.take() {
-        request.directories = Some(
-            directories
-                .into_iter()
-                .filter(|directory| {
-                    directory
-                        .digest
-                        .as_ref()
-                        .is_some_and(|digest| missing_digests.contains(digest))
-                })
-                .collect(),
-        );
-    }
-    request
-}
-
-fn digests_with_ttl_for_requested_digests(
-    requested_digests: &[TDigest],
-    remote_results: &HashMap<TDigest, DigestRemoteState>,
-    cas_ttl_secs: i64,
-) -> anyhow::Result<Vec<DigestWithTtl>> {
-    requested_digests
-        .iter()
-        .map(|digest| {
-            let state = remote_results.get(digest).with_context(|| {
-                format!("No FindMissingBlobs result recorded for requested digest `{digest}`")
-            })?;
-            let ttl = match state {
-                DigestRemoteState::Missing => 0,
-                DigestRemoteState::ExistsOnRemote => cas_ttl_secs,
-            };
-            Ok(DigestWithTtl {
-                digest: digest.clone(),
-                ttl,
-            })
-        })
-        .collect()
-}
-
-fn digest_name(digest: &Digest) -> String {
-    format!("{}/{}", digest.hash, digest.size_bytes)
-}
-
-fn validate_find_missing_blobs_response_digests(
-    requested_digests: &[Digest],
-    response: &FindMissingBlobsResponse,
-) -> anyhow::Result<()> {
-    let mut unmatched_digests = requested_digests.to_vec();
-    let mut failures = Vec::new();
-
-    for digest in &response.missing_blob_digests {
-        let Some(index) = unmatched_digests
-            .iter()
-            .position(|requested| requested == digest)
-        else {
-            failures.push(format!(
-                "FindMissingBlobs response included unexpected digest `{}`",
-                digest_name(digest)
-            ));
-            continue;
-        };
-        unmatched_digests.swap_remove(index);
-    }
-
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("FindMissingBlobs failed: {:?}", failures))
-    }
-}
-
-fn validate_batch_read_blobs_response_digests(
-    requested_digests: &[Digest],
-    response: &BatchReadBlobsResponse,
-) -> anyhow::Result<()> {
-    let mut missing_digests = requested_digests.to_vec();
-    let mut failures = Vec::new();
-
-    for response in &response.responses {
-        let Some(digest) = &response.digest else {
-            failures.push("BatchReadBlobs response omitted a digest".to_owned());
-            continue;
-        };
-        let Some(index) = missing_digests
-            .iter()
-            .position(|requested| requested == digest)
-        else {
-            failures.push(format!(
-                "BatchReadBlobs response included unexpected digest `{}`",
-                digest_name(digest)
-            ));
-            continue;
-        };
-        missing_digests.swap_remove(index);
-    }
-
-    for digest in &missing_digests {
-        failures.push(format!(
-            "BatchReadBlobs response missing digest `{}`",
-            digest_name(digest)
-        ));
-    }
-
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("Batch download failed: {:?}", failures))
-    }
-}
-
-fn validate_batch_update_blobs_response(
-    requested_digests: &[Digest],
-    response: &BatchUpdateBlobsResponse,
-) -> anyhow::Result<()> {
-    let mut missing_digests = requested_digests.to_vec();
-    let mut failures = Vec::new();
-
-    for response in &response.responses {
-        let Some(digest) = &response.digest else {
-            failures.push("BatchUpdateBlobs response omitted a digest".to_owned());
-            continue;
-        };
-        let Some(index) = missing_digests
-            .iter()
-            .position(|requested| requested == digest)
-        else {
-            failures.push(format!(
-                "BatchUpdateBlobs response included unexpected digest `{}`",
-                digest_name(digest)
-            ));
-            continue;
-        };
-        missing_digests.swap_remove(index);
-
-        let status = response.status.as_ref().cloned().unwrap_or_default();
-        if status.code != Code::Ok as i32 {
-            failures.push(format!(
-                "Unable to upload blob '{}', rpc status code: {}, message: \"{}\"",
-                digest_name(digest),
-                status.code,
-                status.message
-            ));
-        }
-    }
-
-    for digest in &missing_digests {
-        failures.push(format!(
-            "BatchUpdateBlobs response missing digest `{}`",
-            digest_name(digest)
-        ));
-    }
-
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("Batch upload failed: {:?}", failures))
-    }
-}
-
-fn validate_splice_blob_response_digest(
-    requested_digest: &Digest,
-    response: GSpliceBlobResponse,
-) -> anyhow::Result<TDigest> {
-    let Some(response_digest) = response.blob_digest else {
-        return Err(anyhow::anyhow!("SpliceBlob response omitted blob digest"));
-    };
-    if &response_digest != requested_digest {
-        return Err(anyhow::anyhow!(
-            "SpliceBlob response included unexpected digest `{}`; requested `{}`",
-            digest_name(&response_digest),
-            digest_name(requested_digest),
-        ));
-    }
-    Ok(tdigest_from(response_digest))
-}
-
-fn validate_split_blob_response(
-    requested_digest: &Digest,
-    response: GSplitBlobResponse,
-) -> anyhow::Result<Vec<TDigest>> {
-    validate_chunk_digests_reconstruct_blob(
-        "SplitBlob response",
-        requested_digest,
-        &response.chunk_digests,
-    )?;
-    Ok(response.chunk_digests.into_map(tdigest_from))
-}
-
-fn validate_chunk_digests_reconstruct_blob(
-    context: &str,
-    requested_digest: &Digest,
-    chunk_digests: &[Digest],
-) -> anyhow::Result<()> {
-    if requested_digest.size_bytes > 0 && chunk_digests.is_empty() {
-        return Err(anyhow::anyhow!(
-            "{context} included no chunks for non-empty digest `{}`",
-            digest_name(requested_digest),
-        ));
-    }
-
-    let mut total_size = 0i64;
-    for chunk_digest in chunk_digests {
-        if chunk_digest.hash.len() != requested_digest.hash.len() {
-            return Err(anyhow::anyhow!(
-                "{context} included chunk digest `{}` with hash length {}, expected {}",
-                digest_name(chunk_digest),
-                chunk_digest.hash.len(),
-                requested_digest.hash.len(),
-            ));
-        }
-        if chunk_digest.size_bytes < 0 {
-            return Err(anyhow::anyhow!(
-                "{context} included negative-size chunk digest `{}`",
-                digest_name(chunk_digest),
-            ));
-        }
-        total_size = total_size
-            .checked_add(chunk_digest.size_bytes)
-            .with_context(|| {
-                format!(
-                    "{context} chunks are too large to sum for requested digest `{}`",
-                    digest_name(requested_digest),
-                )
-            })?;
-    }
-    if total_size != requested_digest.size_bytes {
-        return Err(anyhow::anyhow!(
-            "{context} chunks sum to {total_size} bytes; requested digest `{}` has {} bytes",
-            digest_name(requested_digest),
-            requested_digest.size_bytes,
-        ));
-    }
-    Ok(())
 }
 
 async fn upload_impl<Byt, Cas>(
@@ -5080,6 +5223,37 @@ mod tests {
                 .to_string();
         assert!(rep_max_err.contains("RepMaxCDC"));
         Ok(())
+    }
+
+    #[test]
+    fn test_validate_extend_digests_ttl_response_rejects_missing() {
+        let digest = test_digest("aa", 1);
+
+        let error = validate_extend_digests_ttl_response(
+            &[digest.clone()],
+            GetDigestsTtlResponse {
+                digests_with_ttl: vec![DigestWithTtl { digest, ttl: 0 }],
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot refresh CAS TTL for missing digests")
+        );
+    }
+
+    #[test]
+    fn test_validate_extend_digests_ttl_response_accepts_present() -> anyhow::Result<()> {
+        let digest = test_digest("aa", 1);
+
+        validate_extend_digests_ttl_response(
+            &[digest.clone()],
+            GetDigestsTtlResponse {
+                digests_with_ttl: vec![DigestWithTtl { digest, ttl: 17 }],
+            },
+        )
     }
 
     #[test]
