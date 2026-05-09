@@ -51,6 +51,8 @@ impl BuildGraphStats {
                 bes_backend: None,
                 #[cfg(not(fbcode_build))]
                 bes_headers: Vec::new(),
+                #[cfg(not(fbcode_build))]
+                event_format: Default::default(),
             },
         );
 
