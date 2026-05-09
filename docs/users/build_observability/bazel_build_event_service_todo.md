@@ -7,50 +7,54 @@ make goals clearer, obsolete, or more urgent.
 ## P0/P1: BuildBuddy reuse blockers
 
 - [ ] Emit target artifacts through `TargetComplete.output_group`.
-  - [ ] Add named sets for target outputs.
-  - [ ] Reference the named sets from the target completion event.
-  - [ ] Prefer URI-backed files when artifact upload is configured.
-- [ ] Make action and test logs render in BuildBuddy.
-  - [ ] Keep inline file contents as a fallback for debugging.
-  - [ ] Add an optional bytestream upload path for BEP `File.uri`.
-  - [ ] Use URI-backed `stdout`, `stderr`, `test.log`, and `test.xml` when
+  - [x] Add named sets for target outputs.
+  - [x] Reference the named sets from the target completion event.
+  - [x] Prefer URI-backed files when artifact upload is configured.
+  - [ ] Verify local-only target artifacts are present in the configured
+        bytestream or add a dedicated upload path for them.
+- [x] Make action and test logs render in BuildBuddy.
+  - [x] Keep inline file contents as a fallback for debugging.
+  - [x] Add an optional bytestream upload path for BEP `File.uri`.
+  - [x] Use URI-backed `stdout`, `stderr`, `test.log`, and `test.xml` when
         upload is enabled.
-- [ ] Emit BuildBuddy-usable command metadata.
-  - [ ] Emit canonical `StructuredCommandLine` with option-list sections.
-  - [ ] Emit `OptionsParsed`.
-  - [ ] Populate workspace status and build metadata with repo, user, host,
+- [x] Emit BuildBuddy-usable command metadata.
+  - [x] Emit canonical `StructuredCommandLine` with option-list sections.
+  - [x] Emit `OptionsParsed`.
+  - [x] Populate workspace status and build metadata with repo, user, host,
         command, target pattern, remote cache, remote executor, and CI values
         when Buck2 knows them.
-- [ ] Model tests as Bazel test events.
-  - [ ] Aggregate Buck2 testcase events into one `TestResult` per target run.
-  - [ ] Emit a matching `TestSummary` with run/shard/attempt counts.
-  - [ ] Synthesize a minimal `test.xml` from Buck2 testcase details.
-- [ ] Emit invocation-level metrics, configuration, and tool-log events.
-  - [ ] Emit `BuildMetrics` from `InvocationRecord` and aggregated Buck2
+- [x] Model tests as Bazel test events.
+  - [x] Aggregate Buck2 testcase events into one `TestResult` per target run.
+  - [x] Emit a matching `TestSummary` with run/shard/attempt counts.
+  - [x] Synthesize a minimal `test.xml` from Buck2 testcase details.
+- [x] Emit invocation-level metrics, configuration, and tool-log events.
+  - [x] Emit `BuildMetrics` from `InvocationRecord` and aggregated Buck2
         metrics.
-  - [ ] Emit `Configuration` and `WorkspaceInfo` events when known.
-  - [ ] Emit `BuildToolLogs` with a compact Buck2 invocation summary when file
+  - [x] Emit `Configuration` and `WorkspaceInfo` events when known.
+  - [x] Emit `BuildToolLogs` with a compact Buck2 invocation summary when file
         upload is enabled.
 
 ## P2: Semantic parity
 
-- [ ] Populate `PatternExpanded.children` with configured targets when the
+- [x] Populate `PatternExpanded.children` with configured targets when the
       resolved target list is available.
-- [ ] Clean up target lifecycle semantics.
-  - [ ] Avoid final target completion on analysis-only events when later build
+- [x] Clean up target lifecycle semantics.
+  - [x] Avoid final target completion on analysis-only events when later build
         or test completion exists.
-  - [ ] Deduplicate configured and completed events for each target/configuration.
+  - [x] Deduplicate configured and completed events for each target/configuration.
 - [ ] Add structured failures.
-  - [ ] Populate `failure_detail` on failed actions, targets, tests, and
+  - [x] Populate `failure_detail` on failed actions, targets, and
         invocations.
+  - [ ] Add test-specific failure details if Bazel BEP grows a direct field
+        for test result or summary payloads.
   - [ ] Emit `Aborted` for skipped, cancelled, or failed announced children that
         do not receive a normal terminal event.
-- [ ] Improve remote execution diagnostics.
-  - [ ] Populate `ActionExecuted.strategy_details` with Buck2 execution
+- [x] Improve remote execution diagnostics.
+  - [x] Populate `ActionExecuted.strategy_details` with Buck2 execution
         strategy, action digest, cache-hit type, queue time, remote session,
         and use-case details when they are available.
-- [ ] Improve action-cache statistics.
-  - [ ] Populate `BuildMetrics.ActionSummary.action_cache_statistics` with
+- [x] Improve action-cache statistics.
+  - [x] Populate `BuildMetrics.ActionSummary.action_cache_statistics` with
         conservative hit and miss counters derived from Buck2 invocation
         action counters.
 
