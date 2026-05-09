@@ -20,6 +20,11 @@ struct BuckconfigBesSettings {
     bes_backend: Option<String>,
     bes_headers: Vec<(String, String)>,
     bes_event_format: Option<BesEventFormat>,
+    bazel_artifact_upload: Option<bool>,
+    bazel_artifact_upload_backend: Option<String>,
+    bazel_artifact_upload_instance_name: Option<String>,
+    bazel_artifact_uri_authority: Option<String>,
+    bazel_artifact_upload_max_bytes: Option<usize>,
     bes_results_url: Option<String>,
 }
 
@@ -36,6 +41,21 @@ pub fn with_buckconfig_overrides(
             config.bes_headers = settings.bes_headers;
             if let Some(bes_event_format) = settings.bes_event_format {
                 config.event_format = bes_event_format;
+            }
+            if let Some(bazel_artifact_upload) = settings.bazel_artifact_upload {
+                config.bazel_artifact_upload = bazel_artifact_upload;
+            }
+            if let Some(backend) = settings.bazel_artifact_upload_backend {
+                config.bazel_artifact_upload_backend = Some(backend);
+            }
+            if let Some(instance_name) = settings.bazel_artifact_upload_instance_name {
+                config.bazel_artifact_upload_instance_name = Some(instance_name);
+            }
+            if let Some(authority) = settings.bazel_artifact_uri_authority {
+                config.bazel_artifact_uri_authority = Some(authority);
+            }
+            if let Some(max_bytes) = settings.bazel_artifact_upload_max_bytes {
+                config.bazel_artifact_upload_max_bytes = max_bytes;
             }
             config
         }
@@ -88,6 +108,11 @@ fn read_buckconfig_bes_settings(
             bes_backend: None,
             bes_headers: Vec::new(),
             bes_event_format: None,
+            bazel_artifact_upload: None,
+            bazel_artifact_upload_backend: None,
+            bazel_artifact_upload_instance_name: None,
+            bazel_artifact_uri_authority: None,
+            bazel_artifact_upload_max_bytes: None,
             bes_results_url: None,
         });
     };
@@ -128,6 +153,38 @@ fn read_buckconfig_bes_settings(
         bes_event_format: root_config.parse::<BesEventFormat>(BuckconfigKeyRef {
             section: "bes",
             property: "event_format",
+        })?,
+        bazel_artifact_upload: root_config.parse::<bool>(BuckconfigKeyRef {
+            section: "bes",
+            property: "bazel_artifact_upload",
+        })?,
+        bazel_artifact_upload_backend: root_config
+            .get(BuckconfigKeyRef {
+                section: "bes",
+                property: "bazel_artifact_upload_backend",
+            })
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        bazel_artifact_upload_instance_name: root_config
+            .get(BuckconfigKeyRef {
+                section: "bes",
+                property: "bazel_artifact_upload_instance_name",
+            })
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        bazel_artifact_uri_authority: root_config
+            .get(BuckconfigKeyRef {
+                section: "bes",
+                property: "bazel_artifact_uri_authority",
+            })
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        bazel_artifact_upload_max_bytes: root_config.parse::<usize>(BuckconfigKeyRef {
+            section: "bes",
+            property: "bazel_artifact_upload_max_bytes",
         })?,
         bes_results_url,
     })

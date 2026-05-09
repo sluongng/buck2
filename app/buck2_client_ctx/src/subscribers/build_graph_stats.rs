@@ -53,6 +53,16 @@ impl BuildGraphStats {
                 bes_headers: Vec::new(),
                 #[cfg(not(fbcode_build))]
                 event_format: Default::default(),
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload: false,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload_backend: None,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload_instance_name: None,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_uri_authority: None,
+                #[cfg(not(fbcode_build))]
+                bazel_artifact_upload_max_bytes: 1024 * 1024,
             },
         );
 
