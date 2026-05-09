@@ -2156,6 +2156,7 @@ version = "0.1.0"
 dependencies = [
  "allocative",
  "async-trait",
+ "bazel_bep_proto",
  "bes_grpc_proto",
  "buck2_build_info",
  "buck2_cli_proto",
@@ -2172,6 +2173,7 @@ dependencies = [
  "fbinit",
  "futures 0.3.34",
  "gazebo",
+ "google_grpc_proto",
  "hostname",
  "is_proc_translated",
  "pin-project",
@@ -2179,6 +2181,7 @@ dependencies = [
  "prost-types",
  "serde",
  "serde_json",
+ "sha2",
  "smallvec",
  "sys-info",
  "tokio",

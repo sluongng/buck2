@@ -433,7 +433,7 @@ impl IoHandler for DefaultIoHandler {
         let connection = self.re_client_manager.get_re_connection();
         let re_client = connection.get_client().with_use_case(info.re_use_case);
         re_client
-            .upload_files_and_directories(files, vec![], vec![])
+            .upload_files_and_directories(files, vec![], vec![], None)
             .await?;
 
         Ok(())
