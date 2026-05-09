@@ -63,6 +63,7 @@ use remote_execution::ExtendDigestsTtlRequest;
 use remote_execution::GetDigestsTtlRequest;
 use remote_execution::GetDigestsTtlResponse;
 use remote_execution::InlinedBlobWithDigest;
+use remote_execution::InlinedDigestWithStatus;
 use remote_execution::NamedDigest;
 use remote_execution::NamedDigestWithPermissions;
 use remote_execution::OperationMetadata;
@@ -1777,7 +1778,7 @@ impl RemoteExecutionClientImpl {
                 .download(
                     metadata,
                     DownloadRequest {
-                        inlined_digests: Some(digests),
+                        inlined_digests: Some(digests.clone()),
                         ..Default::default()
                     },
                 )
@@ -1787,7 +1788,8 @@ impl RemoteExecutionClientImpl {
 
         let mut blobs: Vec<T> = Vec::with_capacity(expected_blobs);
         if let Some(ds) = response.inlined_blobs {
-            for d in ds {
+            for (expected_digest, d) in digests.iter().zip(ds) {
+                validate_inlined_blob(expected_digest, &d)?;
                 blobs.push(
                     Message::decode(d.blob.as_slice()).with_buck_error_context(|| {
                         format!("Failed to Protobuf decode tree at `{}`", d.digest)
@@ -1833,13 +1835,18 @@ impl RemoteExecutionClientImpl {
         )
         .await?;
 
-        response
-            .inlined_blobs
-            .into_iter()
-            .flat_map(|blobs| blobs.into_iter())
+        let mut blobs = response.inlined_blobs.unwrap_or_default().into_iter();
+        let blob = blobs
             .next()
-            .map(|blob| (blob.blob, response.local_cache_stats))
-            .ok_or_else(|| internal_error!("No digest was returned in request for {digest}"))
+            .ok_or_else(|| internal_error!("No digest was returned in request for {digest}"))?;
+        if blobs.next().is_some() {
+            return Err(buck2_error!(
+                buck2_error::ErrorTag::ReInvalidGetCasResponse,
+                "CAS client returned more than one blob for `{digest}`"
+            ));
+        }
+        validate_inlined_blob(digest, &blob)?;
+        Ok((blob.blob, response.local_cache_stats))
     }
 
     pub async fn upload_blob(
@@ -2078,9 +2085,74 @@ fn chunks<T>(v: Vec<T>, chunk_size: usize) -> impl Iterator<Item = Vec<T>> {
     Either::Right(chunks.into_iter())
 }
 
+fn validate_inlined_blob(
+    expected_digest: &TDigest,
+    blob: &InlinedDigestWithStatus,
+) -> buck2_error::Result<()> {
+    if blob.status.code != TCode::OK {
+        return Err(buck2_error!(
+            buck2_error::ErrorTag::ReInvalidGetCasResponse,
+            "CAS client returned status `{}` for `{}`: {}",
+            blob.status.code,
+            expected_digest,
+            blob.status.message
+        ));
+    }
+
+    if blob.digest.hash != expected_digest.hash
+        || blob.digest.size_in_bytes != expected_digest.size_in_bytes
+    {
+        return Err(buck2_error!(
+            buck2_error::ErrorTag::ReInvalidGetCasResponse,
+            "CAS client returned digest `{}` when `{}` was requested",
+            blob.digest,
+            expected_digest
+        ));
+    }
+
+    let expected_size: usize = expected_digest.size_in_bytes.try_into().map_err(|_| {
+        buck2_error!(
+            buck2_error::ErrorTag::ReInvalidGetCasResponse,
+            "CAS client was asked to download invalid negative-size digest `{}`",
+            expected_digest
+        )
+    })?;
+    if blob.blob.len() != expected_size {
+        return Err(buck2_error!(
+            buck2_error::ErrorTag::ReInvalidGetCasResponse,
+            "CAS client returned {} bytes for `{}`, expected {} bytes",
+            blob.blob.len(),
+            expected_digest,
+            expected_size
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_digest(size: i64) -> TDigest {
+        TDigest {
+            hash: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            size_in_bytes: size,
+            ..Default::default()
+        }
+    }
+
+    fn test_blob(digest: TDigest, blob: Vec<u8>) -> InlinedDigestWithStatus {
+        InlinedDigestWithStatus {
+            digest,
+            status: remote_execution::TStatus {
+                code: TCode::OK,
+                message: String::new(),
+                ..Default::default()
+            },
+            blob,
+        }
+    }
 
     #[test]
     fn test_chunks_skips() {
@@ -2104,5 +2176,41 @@ mod tests {
         assert_eq!(it.next(), Some(vec![1, 2]));
         assert_eq!(it.next(), Some(vec![3]));
         assert_eq!(it.next(), None);
+    }
+
+    #[test]
+    fn validate_inlined_blob_accepts_matching_blob() {
+        let digest = test_digest(4);
+        let blob = test_blob(digest.clone(), b"test".to_vec());
+
+        validate_inlined_blob(&digest, &blob).unwrap();
+    }
+
+    #[test]
+    fn validate_inlined_blob_rejects_wrong_digest() {
+        let digest = test_digest(4);
+        let mut returned_digest = digest.clone();
+        returned_digest.hash = "fedcba9876543210fedcba9876543210fedcba98".to_owned();
+        let blob = test_blob(returned_digest, b"test".to_vec());
+
+        assert!(validate_inlined_blob(&digest, &blob).is_err());
+    }
+
+    #[test]
+    fn validate_inlined_blob_rejects_wrong_size() {
+        let digest = test_digest(4);
+        let blob = test_blob(digest.clone(), b"too long".to_vec());
+
+        assert!(validate_inlined_blob(&digest, &blob).is_err());
+    }
+
+    #[test]
+    fn validate_inlined_blob_rejects_remote_error() {
+        let digest = test_digest(4);
+        let mut blob = test_blob(digest.clone(), b"test".to_vec());
+        blob.status.code = TCode::DATA_LOSS;
+        blob.status.message = "corrupt blob".to_owned();
+
+        assert!(validate_inlined_blob(&digest, &blob).is_err());
     }
 }
