@@ -149,6 +149,7 @@ impl BuckSubcommand for ReplayCommand {
                 "(replay)", // Could be better
                 console_opts.superconsole_config(),
                 None,
+                None,
             );
 
             let mut events_ctx = EventsCtx::new(None, vec![console]);
