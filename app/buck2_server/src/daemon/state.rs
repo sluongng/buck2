@@ -83,7 +83,7 @@ use fbinit::FacebookInit;
 use gazebo::prelude::*;
 use gazebo::variants::VariantName;
 use host_sharing::NamedSemaphores;
-use remote::ScribeConfig;
+use remote::RemoteEventConfig;
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tracing::Instrument;
@@ -311,12 +311,31 @@ impl DaemonState {
                 .parse_single_cell(cells.root_cell(), &fs)
                 .await?;
 
+            #[cfg(not(fbcode_build))]
+            let buffer_size = root_config
+                .parse(BuckconfigKeyRef {
+                    section: "bes",
+                    property: "buffer_size",
+                })?
+                .unwrap_or(10000);
+            #[cfg(fbcode_build)]
             let buffer_size = root_config
                 .parse(BuckconfigKeyRef {
                     section: "buck2",
                     property: "event_log_buffer_size",
                 })?
                 .unwrap_or(10000);
+
+            #[cfg(not(fbcode_build))]
+            let retry_backoff = Duration::from_millis(
+                root_config
+                    .parse(BuckconfigKeyRef {
+                        section: "bes",
+                        property: "retry_backoff_duration_ms",
+                    })?
+                    .unwrap_or(500),
+            );
+            #[cfg(fbcode_build)]
             let retry_backoff = Duration::from_millis(
                 root_config
                     .parse(BuckconfigKeyRef {
@@ -325,25 +344,61 @@ impl DaemonState {
                     })?
                     .unwrap_or(500),
             );
+
+            #[cfg(not(fbcode_build))]
+            let retry_attempts = root_config
+                .parse(BuckconfigKeyRef {
+                    section: "bes",
+                    property: "retry_attempts",
+                })?
+                .unwrap_or(5);
+            #[cfg(fbcode_build)]
             let retry_attempts = root_config
                 .parse(BuckconfigKeyRef {
                     section: "buck2",
                     property: "event_log_retry_attempts",
                 })?
                 .unwrap_or(5);
+
+            #[cfg(not(fbcode_build))]
+            let message_batch_size = root_config.parse(BuckconfigKeyRef {
+                section: "bes",
+                property: "message_batch_size",
+            })?;
+            #[cfg(fbcode_build)]
             let message_batch_size = root_config.parse(BuckconfigKeyRef {
                 section: "buck2",
                 property: "event_log_message_batch_size",
             })?;
+            #[cfg(not(fbcode_build))]
+            let bes_backend = root_config
+                .get(BuckconfigKeyRef {
+                    section: "bes",
+                    property: "backend",
+                })
+                .map(str::to_owned);
+            #[cfg(not(fbcode_build))]
+            let bes_headers =
+                Self::parse_bes_headers(root_config.parse_list::<String>(BuckconfigKeyRef {
+                    section: "bes",
+                    property: "header",
+                })?)?;
             tracing::info!("Initializing scribe sink...");
             let scribe_sink = Self::init_scribe_sink(
                 fb,
-                ScribeConfig {
+                RemoteEventConfig {
                     buffer_size,
                     retry_backoff,
                     retry_attempts,
                     message_batch_size,
+                    #[cfg(fbcode_build)]
                     thrift_timeout: Duration::from_secs(1),
+                    #[cfg(not(fbcode_build))]
+                    grpc_timeout: Duration::from_secs(1),
+                    #[cfg(not(fbcode_build))]
+                    bes_backend,
+                    #[cfg(not(fbcode_build))]
+                    bes_headers,
                 },
             )
             .buck_error_context("failed to init scribe sink")?;
@@ -783,11 +838,37 @@ impl DaemonState {
 
     fn init_scribe_sink(
         fb: FacebookInit,
-        config: ScribeConfig,
+        config: RemoteEventConfig,
     ) -> buck2_error::Result<Option<Arc<dyn EventSinkWithStats>>> {
         facebook_only();
         remote::new_remote_event_sink_if_enabled(fb, config)
             .map(|maybe_scribe| maybe_scribe.map(|scribe| Arc::new(scribe) as _))
+    }
+
+    #[cfg(not(fbcode_build))]
+    fn parse_bes_headers(
+        raw_headers: Option<Vec<String>>,
+    ) -> buck2_error::Result<Vec<(String, String)>> {
+        let mut headers = Vec::new();
+        for raw_header in raw_headers.unwrap_or_default() {
+            let (key, value) = raw_header.split_once('=').ok_or_else(|| {
+                buck2_error!(
+                    ErrorTag::Input,
+                    "Invalid `bes.header` entry `{}` (expected `NAME=VALUE`)",
+                    raw_header
+                )
+            })?;
+            let key = key.trim();
+            if key.is_empty() {
+                return Err(buck2_error!(
+                    ErrorTag::Input,
+                    "Invalid `bes.header` entry `{}` (header name is empty)",
+                    raw_header
+                ));
+            }
+            headers.push((key.to_owned(), value.to_owned()));
+        }
+        Ok(headers)
     }
 
     /// Prepares an event stream for a request by bootstrapping an event source and EventDispatcher pair. The given
