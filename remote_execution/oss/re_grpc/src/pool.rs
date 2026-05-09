@@ -53,10 +53,11 @@ pub struct PoolConfig {
 /// Simplified configuration needed to start new connections
 #[derive(Clone)]
 pub struct ChannelConfig {
-    tls_config: Option<ClientTlsConfig>,
+    tls_config: ClientTlsConfig,
     grpc_keepalive_time_secs: Option<u64>,
     grpc_keepalive_timeout_secs: Option<u64>,
     grpc_keepalive_while_idle: Option<bool>,
+    tcp_keepalive_secs: Option<u64>,
 }
 
 fn substitute_env_vars(s: &str) -> anyhow::Result<String> {
@@ -89,23 +90,16 @@ fn substitute_env_vars_impl(
 
 impl ChannelConfig {
     pub async fn new(opts: &Buck2OssReConfiguration) -> anyhow::Result<Self> {
-        let tls_config = if opts.tls {
-            Some(Self::create_tls_config(opts).await?)
-        } else {
-            None
-        };
-
         Ok(Self {
-            tls_config,
+            tls_config: Self::create_tls_config(opts).await?,
             grpc_keepalive_time_secs: opts.grpc_keepalive_time_secs,
             grpc_keepalive_timeout_secs: opts.grpc_keepalive_timeout_secs,
             grpc_keepalive_while_idle: opts.grpc_keepalive_while_idle,
+            tcp_keepalive_secs: opts.tcp_keepalive_secs,
         })
     }
 
     async fn create_tls_config(opts: &Buck2OssReConfiguration) -> anyhow::Result<ClientTlsConfig> {
-        let config = ClientTlsConfig::new().with_enabled_roots();
-
         let config = match opts.tls_ca_certs.as_ref() {
             Some(tls_ca_certs) => {
                 let tls_ca_certs =
@@ -113,9 +107,9 @@ impl ChannelConfig {
                 let data = tokio::fs::read(&tls_ca_certs)
                     .await
                     .with_context(|| format!("Error reading `{tls_ca_certs}`"))?;
-                config.ca_certificate(Certificate::from_pem(data))
+                ClientTlsConfig::new().ca_certificate(Certificate::from_pem(data))
             }
-            None => config,
+            None => ClientTlsConfig::new().with_enabled_roots(),
         };
 
         let config = match opts.tls_client_cert.as_ref() {
@@ -134,21 +128,25 @@ impl ChannelConfig {
     }
 }
 
-fn prepare_uri(uri: Uri, tls: bool) -> anyhow::Result<Uri> {
+fn prepare_uri(uri: Uri) -> anyhow::Result<(Uri, bool)> {
     // Now do some awkward things with the protocol. Why do we do all this? The reason is
     // because we'd like our configuration to not be super confusing. We don't want to e.g.
-    // allow setting the address to `https://foobar` without enabling TLS (or enabling tls
-    // and using `http://foobar`), so we restrict ourselves to schemes that are actually
-    // remotely valid in GRPC (which is more restrictive than what Tonic allows).
+    // allow setting the address to `https://foobar`; instead we infer TLS from the source
+    // scheme and only accept schemes that are valid in GRPC naming.
 
     // This is the GRPC spec for naming: https://github.com/grpc/grpc/blob/master/doc/naming.md
-    // Many people (including Bazel), use grpc://, so we tolerate it.
+    // Many people (including Bazel), use grpc:// and grpcs://, so we tolerate both.
+    // We also accept http:// and https:// for convenience.
 
-    match uri.scheme_str() {
-        Some("grpc") | Some("dns") | Some("ipv4") | Some("ipv6") | None => {}
+    let tls = match uri.scheme_str() {
+        Some("grpc") => false,
+        Some("grpcs") => true,
+        Some("http") => false,
+        Some("https") => true,
+        Some("dns") | Some("ipv4") | Some("ipv6") | None => true,
         Some(scheme) => {
             return Err(anyhow::anyhow!(
-                "Invalid URI scheme: `{}` for `{}` (you should omit it)",
+                "Invalid URI scheme: `{}` for `{}` (expected one of grpc, grpcs, http, https, dns, ipv4, ipv6, or no scheme)",
                 scheme,
                 uri,
             ));
@@ -170,7 +168,7 @@ fn prepare_uri(uri: Uri, tls: bool) -> anyhow::Result<Uri> {
         parts.path_and_query = Some(http::uri::PathAndQuery::from_static(""));
     }
 
-    Ok(Uri::from_parts(parts)?)
+    Ok((Uri::from_parts(parts)?, tls))
 }
 
 /// Create a configured endpoint for the given address. The endpoint can be
@@ -181,11 +179,11 @@ fn create_endpoint(
 ) -> Result<tonic::transport::Endpoint, anyhow::Error> {
     let address = substitute_env_vars(address).context("Invalid address")?;
     let uri = address.parse().context("Invalid address")?;
-    let uri = prepare_uri(uri, config.tls_config.is_some()).context("Invalid URI")?;
+    let (uri, tls) = prepare_uri(uri).context("Invalid URI")?;
 
     let mut endpoint = Channel::builder(uri);
-    if let Some(tls_config) = &config.tls_config {
-        endpoint = endpoint.tls_config(tls_config.clone())?;
+    if tls {
+        endpoint = endpoint.tls_config(config.tls_config.clone())?;
     }
 
     // Configure gRPC keepalive settings (always enabled with sensible defaults)
@@ -202,12 +200,18 @@ fn create_endpoint(
 }
 
 /// Create a lazy channel from an endpoint.
-fn channel_from_endpoint(endpoint: &tonic::transport::Endpoint) -> Channel {
+fn channel_from_endpoint(
+    endpoint: &tonic::transport::Endpoint,
+    tcp_keepalive_secs: Option<u64>,
+) -> Channel {
     // Since we are creating the HttpConnector ourselves, any TCP
     // settings (tcp_nodelay, tcp_keepalive, connect_timeout), need to
     // be set here instead of on the endpoint
     let mut http = HttpConnector::new();
     http.enforce_http(false);
+    if let Some(tcp_keepalive_secs) = tcp_keepalive_secs {
+        http.set_keepalive(Some(Duration::from_secs(tcp_keepalive_secs)));
+    }
     let connector = CountingConnector::new(http);
 
     // We need to use a lazy channel so the pool isn't blocked waiting for new
@@ -217,7 +221,7 @@ fn channel_from_endpoint(endpoint: &tonic::transport::Endpoint) -> Channel {
 
 pub fn create_channel(config: &ChannelConfig, address: &str) -> Result<Channel, anyhow::Error> {
     let endpoint = create_endpoint(config, address)?;
-    Ok(channel_from_endpoint(&endpoint))
+    Ok(channel_from_endpoint(&endpoint, config.tcp_keepalive_secs))
 }
 
 /// A response body wrapper that holds a semaphore permit until the body is fully consumed or dropped.
@@ -360,6 +364,7 @@ impl HostPoolInner {
 struct HostPool {
     inner: Mutex<HostPoolInner>,
     endpoint: tonic::transport::Endpoint,
+    tcp_keepalive_secs: Option<u64>,
     max_connections: usize,
     max_concurrency_per_connection: usize,
 }
@@ -367,13 +372,14 @@ struct HostPool {
 impl HostPool {
     fn new(
         endpoint: tonic::transport::Endpoint,
+        tcp_keepalive_secs: Option<u64>,
         min_connections: usize,
         max_connections: usize,
         max_concurrency_per_connection: usize,
     ) -> Self {
         let channel_states: Vec<_> = (0..min_connections)
             .map(|_| {
-                let channel = channel_from_endpoint(&endpoint);
+                let channel = channel_from_endpoint(&endpoint, tcp_keepalive_secs);
                 PooledChannelState::new(channel, max_concurrency_per_connection)
             })
             .collect();
@@ -384,6 +390,7 @@ impl HostPool {
                 next_index: 0,
             }),
             endpoint,
+            tcp_keepalive_secs,
             max_connections,
             max_concurrency_per_connection,
         }
@@ -409,7 +416,7 @@ impl HostPool {
 
         // All channels at capacity - create new if allowed
         if num_channels < self.max_connections {
-            let channel = channel_from_endpoint(&self.endpoint);
+            let channel = channel_from_endpoint(&self.endpoint, self.tcp_keepalive_secs);
             let state = PooledChannelState::new(channel, self.max_concurrency_per_connection);
             let pooled = PooledChannel::new(state.channel.clone(), state.semaphore.clone());
             inner.channels.push(state);
@@ -457,6 +464,7 @@ impl ChannelPool {
                         .with_context(|| format!("Failed to create endpoint for {}", address))?;
                     let host_pool = HostPool::new(
                         endpoint,
+                        self.channel_config.tcp_keepalive_secs,
                         self.config.min_connections,
                         self.config.max_connections,
                         self.config.max_concurrency_per_connection,
