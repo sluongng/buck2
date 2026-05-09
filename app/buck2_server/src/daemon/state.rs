@@ -392,6 +392,79 @@ impl DaemonState {
                     section: "bes",
                     property: "header",
                 })?)?;
+            #[cfg(not(fbcode_build))]
+            let bes_event_format = root_config
+                .parse::<remote::BesEventFormat>(BuckconfigKeyRef {
+                    section: "bes",
+                    property: "event_format",
+                })?
+                .unwrap_or_default();
+            #[cfg(not(fbcode_build))]
+            let re_client_default_address: Option<String> =
+                root_config.parse(BuckconfigKeyRef {
+                    section: "buck2_re_client",
+                    property: "address",
+                })?;
+            #[cfg(not(fbcode_build))]
+            let re_client_cas_address = root_config
+                .parse::<String>(BuckconfigKeyRef {
+                    section: "buck2_re_client",
+                    property: "cas_address",
+                })?
+                .or(re_client_default_address);
+            #[cfg(not(fbcode_build))]
+            let re_client_instance_name = root_config.parse(BuckconfigKeyRef {
+                section: "buck2_re_client",
+                property: "instance_name",
+            })?;
+            #[cfg(not(fbcode_build))]
+            let bazel_artifact_upload = root_config
+                .parse::<bool>(BuckconfigKeyRef {
+                    section: "bes",
+                    property: "bazel_artifact_upload",
+                })?
+                .unwrap_or(true);
+            #[cfg(not(fbcode_build))]
+            let upload_successful_action_events = root_config
+                .parse::<bool>(BuckconfigKeyRef {
+                    section: "bes",
+                    property: "upload_successful_action_events",
+                })?
+                .unwrap_or(true);
+            #[cfg(not(fbcode_build))]
+            let bazel_artifact_upload_backend = root_config
+                .get(BuckconfigKeyRef {
+                    section: "bes",
+                    property: "bazel_artifact_upload_backend",
+                })
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            #[cfg(not(fbcode_build))]
+            let bazel_artifact_upload_instance_name = root_config
+                .get(BuckconfigKeyRef {
+                    section: "bes",
+                    property: "bazel_artifact_upload_instance_name",
+                })
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            #[cfg(not(fbcode_build))]
+            let bazel_artifact_uri_authority = root_config
+                .get(BuckconfigKeyRef {
+                    section: "bes",
+                    property: "bazel_artifact_uri_authority",
+                })
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            #[cfg(not(fbcode_build))]
+            let bazel_artifact_upload_max_bytes = root_config
+                .parse::<usize>(BuckconfigKeyRef {
+                    section: "bes",
+                    property: "bazel_artifact_upload_max_bytes",
+                })?
+                .unwrap_or(10 * 1024 * 1024);
             tracing::info!("Initializing scribe sink...");
             let scribe_sink = Self::init_scribe_sink(
                 fb,
@@ -403,11 +476,29 @@ impl DaemonState {
                     #[cfg(fbcode_build)]
                     thrift_timeout: Duration::from_secs(1),
                     #[cfg(not(fbcode_build))]
-                    grpc_timeout: Duration::from_secs(1),
+                    grpc_timeout: Duration::from_secs(10),
                     #[cfg(not(fbcode_build))]
                     bes_backend,
                     #[cfg(not(fbcode_build))]
                     bes_headers,
+                    #[cfg(not(fbcode_build))]
+                    event_format: bes_event_format,
+                    #[cfg(not(fbcode_build))]
+                    bazel_artifact_upload,
+                    #[cfg(not(fbcode_build))]
+                    upload_successful_action_events,
+                    #[cfg(not(fbcode_build))]
+                    bazel_artifact_upload_backend,
+                    #[cfg(not(fbcode_build))]
+                    re_client_cas_address,
+                    #[cfg(not(fbcode_build))]
+                    bazel_artifact_upload_instance_name,
+                    #[cfg(not(fbcode_build))]
+                    re_client_instance_name,
+                    #[cfg(not(fbcode_build))]
+                    bazel_artifact_uri_authority,
+                    #[cfg(not(fbcode_build))]
+                    bazel_artifact_upload_max_bytes,
                 },
             )
             .buck_error_context("failed to init scribe sink")?;
