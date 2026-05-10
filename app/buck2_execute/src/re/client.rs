@@ -665,6 +665,8 @@ static INDUCED_CACHE_MISSES: LazyLock<Option<StdBuckHashMap<String, AtomicBool>>
         }
     });
 
+static TEST_FAIL_RE_EXECUTE_MISSING_INPUTS_ONCE: AtomicBool = AtomicBool::new(false);
+
 impl RemoteExecutionClientImpl {
     async fn new(re_config: &RemoteExecutionConfig) -> buck2_error::Result<Self> {
         let op_name = "REClientBuilder";
@@ -1740,6 +1742,29 @@ impl RemoteExecutionClientImpl {
             ..Default::default()
         };
         let re_action = format!("Execute with digest {}", &action_digest);
+        if buck2_env!(
+            "BUCK2_TEST_FAIL_RE_EXECUTE_MISSING_INPUTS_ONCE",
+            bool,
+            applicability = testing
+        )? && !TEST_FAIL_RE_EXECUTE_MISSING_INPUTS_ONCE
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(ExecuteResponseOrCancelled::Response(
+                ExecuteResponseWithQueueStats {
+                    execute_response: remote_execution::ExecuteResponse {
+                        status: remote_execution::TStatus {
+                            code: TCode::FAILED_PRECONDITION,
+                            message: "Missing CAS input digest injected by test".to_owned(),
+                            ..Default::default()
+                        },
+                        action_digest: action_digest.to_re(),
+                        ..Default::default()
+                    },
+                    queue_stats: QueueStats::default(),
+                },
+            ));
+        }
+
         let res = with_error_handler(
             re_action.as_str(),
             self.get_session_id(),
