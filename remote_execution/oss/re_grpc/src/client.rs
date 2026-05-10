@@ -2272,7 +2272,6 @@ where
 #[derive(Debug, Copy, Clone)]
 enum GrpcClientKind {
     Cas,
-    Execution,
     ActionCache,
     ByteStream,
 }
@@ -2492,7 +2491,6 @@ impl REClient {
     async fn reconnect_after_broken_connection(&self, kind: GrpcClientKind) {
         let address = match kind {
             GrpcClientKind::Cas | GrpcClientKind::ByteStream => &self.cas_address,
-            GrpcClientKind::Execution => &self.engine_address,
             GrpcClientKind::ActionCache => &self.action_cache_address,
         };
         self.pool.reset(address).await;
