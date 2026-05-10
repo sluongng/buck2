@@ -127,6 +127,8 @@ const DEFAULT_RETRIES: usize = 5;
 const GRPC_RETRY_INITIAL_DELAY_MILLIS: u64 = 100;
 const DEFAULT_RETRY_MAX_DELAY_MILLIS: u64 = 5000;
 const GRPC_RETRY_JITTER: f64 = 0.1;
+const DEFAULT_GRPC_REQUEST_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_FAST_CDC_2020_AVG_CHUNK_SIZE: u64 = 512 * 1024;
 
 fn tdigest_to(tdigest: TDigest) -> Digest {
@@ -320,16 +322,139 @@ fn validate_upload_blob(
     Ok(())
 }
 
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct RetryInfoDetail {
+    #[prost(message, optional, tag = "1")]
+    retry_delay: Option<::prost_types::Duration>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct PreconditionFailureDetail {
+    #[prost(message, repeated, tag = "1")]
+    violations: Vec<PreconditionFailureViolation>,
+}
+
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct PreconditionFailureViolation {
+    #[prost(string, tag = "1")]
+    r#type: String,
+    #[prost(string, tag = "2")]
+    subject: String,
+    #[prost(string, tag = "3")]
+    description: String,
+}
+
+const RETRY_INFO_TYPE_URL: &str = "type.googleapis.com/google.rpc.RetryInfo";
+const PRECONDITION_FAILURE_TYPE_URL: &str = "type.googleapis.com/google.rpc.PreconditionFailure";
+
 fn check_status(status: Status) -> Result<(), REClientError> {
     if status.code == 0 {
         return Ok(());
     }
 
-    Err(REClientError {
-        code: TCode(status.code),
-        message: status.message,
-        group: TCodeReasonGroup::UNKNOWN,
+    Err(re_client_error_from_rpc_status(&status))
+}
+
+fn grpc_duration_to_duration(duration: &::prost_types::Duration) -> Option<Duration> {
+    if duration.seconds < 0 || duration.nanos < 0 {
+        return None;
+    }
+
+    Some(Duration::new(
+        u64::try_from(duration.seconds).ok()?,
+        u32::try_from(duration.nanos).ok()?,
+    ))
+}
+
+fn retry_delay_from_rpc_status(status: &Status) -> Option<Duration> {
+    status.details.iter().find_map(|detail| {
+        if detail.type_url != RETRY_INFO_TYPE_URL {
+            return None;
+        }
+
+        let retry_info = RetryInfoDetail::decode(detail.value.as_slice()).ok()?;
+        retry_info
+            .retry_delay
+            .as_ref()
+            .and_then(grpc_duration_to_duration)
     })
+}
+
+fn precondition_failures(status: &Status) -> impl Iterator<Item = PreconditionFailureDetail> + '_ {
+    status.details.iter().filter_map(|detail| {
+        if detail.type_url != PRECONDITION_FAILURE_TYPE_URL {
+            return None;
+        }
+
+        PreconditionFailureDetail::decode(detail.value.as_slice()).ok()
+    })
+}
+
+fn rpc_status_has_missing_precondition(status: &Status) -> bool {
+    status.code == Code::FailedPrecondition as i32
+        && precondition_failures(status).any(|failure| {
+            !failure.violations.is_empty()
+                && failure
+                    .violations
+                    .iter()
+                    .all(|violation| violation.r#type.eq_ignore_ascii_case("MISSING"))
+        })
+}
+
+fn message_indicates_quota(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("quota") || message.contains("rate limit")
+}
+
+fn group_for_rpc_status(status: &Status) -> TCodeReasonGroup {
+    if status.code == Code::ResourceExhausted as i32 && message_indicates_quota(&status.message) {
+        TCodeReasonGroup::USER_QUOTA
+    } else {
+        TCodeReasonGroup::UNKNOWN
+    }
+}
+
+fn format_rpc_status_message(status: &Status) -> String {
+    let mut details = Vec::new();
+    if let Some(retry_delay) = retry_delay_from_rpc_status(status) {
+        details.push(format!(
+            "RetryInfo(retry_delay_ms={})",
+            retry_delay.as_millis()
+        ));
+    }
+
+    for failure in precondition_failures(status) {
+        for violation in failure.violations {
+            details.push(format!(
+                "PreconditionFailure(type={}, subject={}, description={})",
+                violation.r#type, violation.subject, violation.description
+            ));
+        }
+    }
+
+    for detail in &status.details {
+        if detail.type_url != RETRY_INFO_TYPE_URL
+            && detail.type_url != PRECONDITION_FAILURE_TYPE_URL
+        {
+            details.push(format!("detail_type={}", detail.type_url));
+        }
+    }
+
+    if details.is_empty() {
+        status.message.clone()
+    } else if status.message.is_empty() {
+        details.join("; ")
+    } else {
+        format!("{} ({})", status.message, details.join("; "))
+    }
+}
+
+fn re_client_error_from_rpc_status(status: &Status) -> REClientError {
+    REClientError {
+        code: TCode(status.code),
+        message: format_rpc_status_message(status),
+        group: group_for_rpc_status(status),
+    }
 }
 
 fn ttimestamp_to(ts: TTimestamp) -> ::prost_types::Timestamp {
@@ -393,6 +518,10 @@ pub struct RERuntimeOpts {
     retries: usize,
     /// Maximum backoff delay in milliseconds between retry attempts.
     retry_max_delay_ms: u64,
+    /// Per-request timeout for unary gRPC RPCs.
+    grpc_request_timeout: Duration,
+    /// Maximum time a ByteStream download may make no read progress.
+    bytestream_progress_timeout: Duration,
     /// Digest function selected from user config and capabilities for download hash validation.
     download_hash_digest_function: Option<digest_function::Value>,
     /// Digest functions selected from daemon config for RE request fields.
@@ -1319,6 +1448,14 @@ impl REClientBuilder {
         let retry_max_delay_ms = opts
             .retry_max_delay_ms
             .unwrap_or(DEFAULT_RETRY_MAX_DELAY_MILLIS);
+        let grpc_request_timeout = Duration::from_secs(
+            opts.grpc_request_timeout_secs
+                .unwrap_or(DEFAULT_GRPC_REQUEST_TIMEOUT_SECS),
+        );
+        let bytestream_progress_timeout = Duration::from_secs(
+            opts.bytestream_progress_timeout_secs
+                .unwrap_or(DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS),
+        );
 
         let capabilities = if opts.capabilities.unwrap_or(true) {
             Self::fetch_rbe_capabilities(
@@ -1327,6 +1464,7 @@ impl REClientBuilder {
                 opts.max_total_batch_size,
                 retries,
                 retry_max_delay_ms,
+                grpc_request_timeout,
             )
             .await?
         } else {
@@ -1454,6 +1592,8 @@ impl REClientBuilder {
                 cas_ttl_secs: opts.cas_ttl_secs.unwrap_or(3 * 60 * 60),
                 retries,
                 retry_max_delay_ms,
+                grpc_request_timeout,
+                bytestream_progress_timeout,
                 download_hash_digest_function,
                 request_digest_function_config,
                 remote_cache_chunking: opts.remote_cache_chunking,
@@ -1477,6 +1617,7 @@ impl REClientBuilder {
         max_total_batch_size: Option<usize>,
         retries: usize,
         retry_max_delay_ms: u64,
+        grpc_request_timeout: Duration,
     ) -> anyhow::Result<RECapabilities> {
         // TODO use more of the capabilities of the remote build executor
 
@@ -1485,7 +1626,11 @@ impl REClientBuilder {
             let request = GetCapabilitiesRequest {
                 instance_name: instance_name.as_str().to_owned(),
             };
-            async move { Ok(client.get_capabilities(request).await?.into_inner()) }
+            async move {
+                let mut request = tonic::Request::new(request);
+                request.set_timeout(grpc_request_timeout);
+                Ok(client.get_capabilities(request).await?.into_inner())
+            }
         })
         .await
         .context("Failed to query capabilities of remote")?;
@@ -1835,8 +1980,7 @@ where
 fn tcode_is_retryable(code: TCode) -> bool {
     matches!(
         code,
-        TCode::CANCELLED
-            | TCode::UNKNOWN
+        TCode::UNKNOWN
             | TCode::DEADLINE_EXCEEDED
             | TCode::ABORTED
             | TCode::INTERNAL
@@ -1867,12 +2011,80 @@ fn tcode_from_grpc_code(code: tonic::Code) -> TCode {
     }
 }
 
+fn tonic_status_rpc_status(status: &tonic::Status) -> Option<Status> {
+    if status.details().is_empty() {
+        return None;
+    }
+
+    Status::decode(status.details()).ok()
+}
+
+fn tonic_status_indicates_broken_connection(status: &tonic::Status) -> bool {
+    if !matches!(
+        status.code(),
+        tonic::Code::Unavailable
+            | tonic::Code::Unknown
+            | tonic::Code::Internal
+            | tonic::Code::DeadlineExceeded
+    ) {
+        return false;
+    }
+
+    let message = status.message().to_ascii_lowercase();
+    message.contains("transport error")
+        || message.contains("connection reset")
+        || message.contains("connection refused")
+        || message.contains("connection closed")
+        || message.contains("connection error")
+        || message.contains("broken pipe")
+        || message.contains("goaway")
+        || message.contains("http2")
+        || message.contains("io error")
+}
+
 fn re_client_error_from_tonic_status(status: &tonic::Status) -> REClientError {
+    let rpc_status = tonic_status_rpc_status(status);
+    let mut message = status.message().to_owned();
+    let mut group = if tonic_status_indicates_broken_connection(status) {
+        TCodeReasonGroup::RE_CONNECTION
+    } else {
+        TCodeReasonGroup::UNKNOWN
+    };
+
+    if let Some(rpc_status) = &rpc_status {
+        let rpc_group = group_for_rpc_status(rpc_status);
+        if group == TCodeReasonGroup::UNKNOWN {
+            group = rpc_group;
+        }
+        let rpc_message = format_rpc_status_message(rpc_status);
+        if !rpc_message.is_empty() {
+            message = rpc_message;
+        }
+    } else if status.code() == tonic::Code::ResourceExhausted && message_indicates_quota(&message) {
+        group = TCodeReasonGroup::USER_QUOTA;
+    }
+
     REClientError {
         code: tcode_from_grpc_code(status.code()),
-        message: status.message().to_owned(),
-        group: TCodeReasonGroup::UNKNOWN,
+        message,
+        group,
     }
+}
+
+fn tonic_status_from_io_error(error: &io::Error) -> Option<&tonic::Status> {
+    let source = error.get_ref()?;
+    if let Some(status) = source.downcast_ref::<tonic::Status>() {
+        return Some(status);
+    }
+
+    let mut current = source.source();
+    while let Some(source) = current {
+        if let Some(status) = source.downcast_ref::<tonic::Status>() {
+            return Some(status);
+        }
+        current = source.source();
+    }
+    None
 }
 
 fn normalize_grpc_error(err: anyhow::Error) -> anyhow::Error {
@@ -1880,10 +2092,15 @@ fn normalize_grpc_error(err: anyhow::Error) -> anyhow::Error {
         return err;
     }
 
-    match err
+    let re_client_error = err
         .downcast_ref::<tonic::Status>()
         .map(re_client_error_from_tonic_status)
-    {
+        .or_else(|| {
+            err.downcast_ref::<io::Error>()
+                .and_then(tonic_status_from_io_error)
+                .map(re_client_error_from_tonic_status)
+        });
+    match re_client_error {
         Some(re_client_error) => anyhow::Error::from(re_client_error),
         None => err,
     }
@@ -1896,10 +2113,69 @@ fn error_tcode(err: &anyhow::Error) -> Option<TCode> {
             err.downcast_ref::<tonic::Status>()
                 .map(|status| tcode_from_grpc_code(status.code()))
         })
+        .or_else(|| {
+            err.downcast_ref::<io::Error>()
+                .and_then(tonic_status_from_io_error)
+                .map(|status| tcode_from_grpc_code(status.code()))
+        })
+}
+
+fn grpc_error_retry_delay(err: &anyhow::Error) -> Option<Duration> {
+    err.downcast_ref::<tonic::Status>()
+        .and_then(tonic_status_rpc_status)
+        .and_then(|status| retry_delay_from_rpc_status(&status))
+        .or_else(|| {
+            err.downcast_ref::<io::Error>()
+                .and_then(tonic_status_from_io_error)
+                .and_then(tonic_status_rpc_status)
+                .and_then(|status| retry_delay_from_rpc_status(&status))
+        })
+}
+
+fn is_broken_connection_error(err: &anyhow::Error) -> bool {
+    if err
+        .downcast_ref::<REClientError>()
+        .is_some_and(|error| error.group == TCodeReasonGroup::RE_CONNECTION)
+    {
+        return true;
+    }
+
+    if err
+        .downcast_ref::<tonic::Status>()
+        .is_some_and(tonic_status_indicates_broken_connection)
+    {
+        return true;
+    }
+
+    if let Some(io_error) = err.downcast_ref::<io::Error>() {
+        if matches!(
+            io_error.kind(),
+            io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::TimedOut
+        ) {
+            return true;
+        }
+
+        if tonic_status_from_io_error(io_error)
+            .is_some_and(tonic_status_indicates_broken_connection)
+        {
+            return true;
+        }
+    }
+
+    let message = format!("{err:#}").to_ascii_lowercase();
+    message.contains("connection reset")
+        || message.contains("connection refused")
+        || message.contains("connection closed")
+        || message.contains("broken pipe")
+        || message.contains("transport error")
 }
 
 fn is_retryable_grpc_error(err: &anyhow::Error) -> bool {
-    error_tcode(err).is_some_and(tcode_is_retryable)
+    grpc_error_retry_delay(err).is_some() || error_tcode(err).is_some_and(tcode_is_retryable)
 }
 
 fn is_operation_not_found(err: &anyhow::Error) -> bool {
@@ -1910,12 +2186,20 @@ fn should_retry_execute_after_wait_execution_error(err: &anyhow::Error) -> bool 
     is_operation_not_found(err)
 }
 
-fn should_retry_execute_after_operation_error(code: TCode) -> bool {
-    tcode_is_retryable(code)
+fn should_retry_execute_after_operation_error(status: &Status) -> bool {
+    if rpc_status_has_missing_precondition(status) {
+        return false;
+    }
+    retry_delay_from_rpc_status(status).is_some() || tcode_is_retryable(TCode(status.code))
 }
 
-fn should_retry_execute_after_execute_response_status(code: TCode) -> bool {
-    code != TCode::DEADLINE_EXCEEDED && tcode_is_retryable(code)
+fn should_retry_execute_after_execute_response_status(status: &Status) -> bool {
+    if rpc_status_has_missing_precondition(status) {
+        return false;
+    }
+    retry_delay_from_rpc_status(status).is_some()
+        || (TCode(status.code) != TCode::DEADLINE_EXCEEDED
+            && tcode_is_retryable(TCode(status.code)))
 }
 
 fn can_retry_execute(retry_attempts: usize, retries: usize) -> bool {
@@ -1932,11 +2216,26 @@ fn jittered_retry_delay(base_delay: Duration) -> Duration {
 async fn retry_grpc_request<T, Fut, F>(
     retries: usize,
     retry_max_delay: Duration,
-    mut request: F,
+    request: F,
 ) -> anyhow::Result<T>
 where
     Fut: Future<Output = anyhow::Result<T>>,
     F: FnMut() -> Fut,
+{
+    retry_grpc_request_with_reconnect(retries, retry_max_delay, request, || async {}).await
+}
+
+async fn retry_grpc_request_with_reconnect<T, Fut, F, RFut, R>(
+    retries: usize,
+    retry_max_delay: Duration,
+    mut request: F,
+    mut reconnect: R,
+) -> anyhow::Result<T>
+where
+    Fut: Future<Output = anyhow::Result<T>>,
+    F: FnMut() -> Fut,
+    RFut: Future<Output = ()>,
+    R: FnMut() -> RFut,
 {
     let mut retry_attempt = 0usize;
     let mut next_delay = Duration::from_millis(GRPC_RETRY_INITIAL_DELAY_MILLIS);
@@ -1949,7 +2248,13 @@ where
                     return Err(normalize_grpc_error(err));
                 }
 
-                let delay = jittered_retry_delay(next_delay);
+                if is_broken_connection_error(&err) {
+                    reconnect().await;
+                }
+
+                let delay = grpc_error_retry_delay(&err)
+                    .map(|delay| std::cmp::min(delay, retry_max_delay))
+                    .unwrap_or_else(|| jittered_retry_delay(next_delay));
                 tracing::debug!(
                     retry_attempt = retry_attempt + 1,
                     retries,
@@ -1964,6 +2269,31 @@ where
     }
 }
 
+#[derive(Debug, Copy, Clone)]
+enum GrpcClientKind {
+    Cas,
+    Execution,
+    ActionCache,
+    ByteStream,
+}
+
+async fn retry_grpc_request_with_client_reconnect<T, Fut, F>(
+    client: &REClient,
+    kind: GrpcClientKind,
+    retries: usize,
+    retry_max_delay: Duration,
+    request: F,
+) -> anyhow::Result<T>
+where
+    Fut: Future<Output = anyhow::Result<T>>,
+    F: FnMut() -> Fut,
+{
+    retry_grpc_request_with_reconnect(retries, retry_max_delay, request, || async {
+        client.reconnect_after_broken_connection(kind).await;
+    })
+    .await
+}
+
 async fn execute_stream(
     client: ExecutionClient<GrpcService>,
     metadata: RemoteExecutionMetadata,
@@ -1971,6 +2301,7 @@ async fn execute_stream(
     request: GExecuteRequest,
     retries: usize,
     retry_max_delay: Duration,
+    grpc_request_timeout: Duration,
 ) -> anyhow::Result<tonic::Streaming<Operation>> {
     retry_grpc_request(retries, retry_max_delay, || {
         let mut client = client.clone();
@@ -1978,7 +2309,12 @@ async fn execute_stream(
         let request = request.clone();
         async move {
             Ok(client
-                .execute(with_re_metadata(request, metadata, use_fbcode_metadata))
+                .execute(with_re_metadata_timeout(
+                    request,
+                    metadata,
+                    use_fbcode_metadata,
+                    grpc_request_timeout,
+                ))
                 .await?
                 .into_inner())
         }
@@ -1993,6 +2329,7 @@ async fn wait_execution_stream(
     operation_name: String,
     retries: usize,
     retry_max_delay: Duration,
+    grpc_request_timeout: Duration,
 ) -> anyhow::Result<tonic::Streaming<Operation>> {
     retry_grpc_request(retries, retry_max_delay, || {
         let mut client = client.clone();
@@ -2000,12 +2337,13 @@ async fn wait_execution_stream(
         let operation_name = operation_name.clone();
         async move {
             Ok(client
-                .wait_execution(with_re_metadata(
+                .wait_execution(with_re_metadata_timeout(
                     WaitExecutionRequest {
                         name: operation_name,
                     },
                     metadata,
                     use_fbcode_metadata,
+                    grpc_request_timeout,
                 ))
                 .await?
                 .into_inner())
@@ -2023,6 +2361,7 @@ async fn wait_execution_or_retry_execute(
     execute_retry_attempts: usize,
     retries: usize,
     retry_max_delay: Duration,
+    grpc_request_timeout: Duration,
     wait_failure_context: &'static str,
 ) -> anyhow::Result<(tonic::Streaming<Operation>, Option<String>, usize)> {
     match wait_execution_stream(
@@ -2032,6 +2371,7 @@ async fn wait_execution_or_retry_execute(
         operation_name.clone(),
         retries,
         retry_max_delay,
+        grpc_request_timeout,
     )
     .await
     {
@@ -2039,7 +2379,7 @@ async fn wait_execution_or_retry_execute(
         Err(wait_err) if should_retry_execute_after_wait_execution_error(&wait_err) => {
             if !can_retry_execute(execute_retry_attempts, retries) {
                 return Err(wait_err.context(format!(
-                    "RE operation '{operation_name}' was lost after retry limit"
+                    "RE operation {operation_name} was lost after retry limit"
                 )));
             }
 
@@ -2057,10 +2397,11 @@ async fn wait_execution_or_retry_execute(
                 execute_request,
                 retries,
                 retry_max_delay,
+                grpc_request_timeout,
             )
             .await
             .context(format!(
-                "RE operation '{operation_name}' was lost and Execute retry failed"
+                "RE operation {operation_name} was lost and Execute retry failed"
             ))?;
             Ok((stream, None, execute_retry_attempts))
         }
@@ -2148,6 +2489,15 @@ impl REClient {
         self.capabilities.action_cache_update_enabled
     }
 
+    async fn reconnect_after_broken_connection(&self, kind: GrpcClientKind) {
+        let address = match kind {
+            GrpcClientKind::Cas | GrpcClientKind::ByteStream => &self.cas_address,
+            GrpcClientKind::Execution => &self.engine_address,
+            GrpcClientKind::ActionCache => &self.action_cache_address,
+        };
+        self.pool.reset(address).await;
+    }
+
     async fn bystream_write_plan(
         &self,
         bytestream_client: &mut ByteStreamClient<GrpcService>,
@@ -2162,12 +2512,13 @@ impl REClient {
         let total_size = total_bystream_write_size(&segments);
 
         match bytestream_client
-            .query_write_status(with_re_metadata(
+            .query_write_status(with_re_metadata_timeout(
                 QueryWriteStatusRequest {
                     resource_name: resource_name.clone(),
                 },
                 metadata,
                 self.runtime_opts.use_fbcode_metadata,
+                self.runtime_opts.grpc_request_timeout,
             ))
             .await
         {
@@ -2213,7 +2564,9 @@ impl REClient {
             .request_digest_function_config
             .for_digest(&action_digest);
         let digest_function = digest_function_to_grpc(digest_function);
-        let res = retry_grpc_request(
+        let res = retry_grpc_request_with_client_reconnect(
+            self,
+            GrpcClientKind::ActionCache,
             self.runtime_opts.retries,
             Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
             || {
@@ -2223,7 +2576,7 @@ impl REClient {
                     let res = self
                         .action_cache_client()
                         .await?
-                        .get_action_result(with_re_metadata(
+                        .get_action_result(with_re_metadata_timeout(
                             GetActionResultRequest {
                                 instance_name: self.instance_name.as_str().to_owned(),
                                 action_digest: Some(action_digest),
@@ -2232,6 +2585,7 @@ impl REClient {
                             },
                             metadata,
                             self.runtime_opts.use_fbcode_metadata,
+                            self.runtime_opts.grpc_request_timeout,
                         ))
                         .await?;
                     anyhow::Ok(res)
@@ -2259,7 +2613,9 @@ impl REClient {
         let digest_function = digest_function_to_grpc(digest_function);
         let action_result = convert_t_action_result2(request.action_result)?;
 
-        let res = retry_grpc_request(
+        let res = retry_grpc_request_with_client_reconnect(
+            self,
+            GrpcClientKind::ActionCache,
             self.runtime_opts.retries,
             Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
             || {
@@ -2270,7 +2626,7 @@ impl REClient {
                     let res = self
                         .action_cache_client()
                         .await?
-                        .update_action_result(with_re_metadata(
+                        .update_action_result(with_re_metadata_timeout(
                             UpdateActionResultRequest {
                                 instance_name: self.instance_name.as_str().to_owned(),
                                 action_digest: Some(action_digest),
@@ -2281,6 +2637,7 @@ impl REClient {
                             },
                             metadata,
                             self.runtime_opts.use_fbcode_metadata,
+                            self.runtime_opts.grpc_request_timeout,
                         ))
                         .await?;
                     anyhow::Ok(res)
@@ -2333,6 +2690,7 @@ impl REClient {
         };
 
         let execution_client = self.execution_client().await?;
+        let grpc_request_timeout = self.runtime_opts.grpc_request_timeout;
         let stream = execute_stream(
             execution_client.clone(),
             metadata.clone(),
@@ -2340,6 +2698,7 @@ impl REClient {
             grpc_request.clone(),
             self.runtime_opts.retries,
             Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
+            grpc_request_timeout,
         )
         .await?;
 
@@ -2384,6 +2743,7 @@ impl REClient {
                                         execute_retry_attempts,
                                         retries,
                                         retry_max_delay,
+                                        grpc_request_timeout,
                                         "RE WaitExecution failed after Execute stream ended before completion",
                                     )
                                     .await?;
@@ -2417,6 +2777,7 @@ impl REClient {
                                             grpc_request.clone(),
                                             retries,
                                             retry_max_delay,
+                                            grpc_request_timeout,
                                         )
                                         .await
                                         .context(
@@ -2442,6 +2803,7 @@ impl REClient {
                                         execute_retry_attempts,
                                         retries,
                                         retry_max_delay,
+                                        grpc_request_timeout,
                                         "RE WaitExecution failed after Execute stream interruption",
                                     )
                                     .await?;
@@ -2462,8 +2824,7 @@ impl REClient {
                                 .context("Missing `result` when message was `done`")?
                             {
                                 OpResult::Error(rpc_status) => {
-                                    let code = TCode(rpc_status.code);
-                                    if should_retry_execute_after_operation_error(code)
+                                    if should_retry_execute_after_operation_error(&rpc_status)
                                         && can_retry_execute(execute_retry_attempts, retries)
                                     {
                                         execute_retry_attempts += 1;
@@ -2482,6 +2843,7 @@ impl REClient {
                                             grpc_request.clone(),
                                             retries,
                                             retry_max_delay,
+                                            grpc_request_timeout,
                                         )
                                         .await
                                         .context(
@@ -2491,12 +2853,7 @@ impl REClient {
                                         continue;
                                     }
 
-                                    return Err(REClientError {
-                                        code,
-                                        message: rpc_status.message,
-                                        group: TCodeReasonGroup::UNKNOWN,
-                                    }
-                                    .into());
+                                    return Err(re_client_error_from_rpc_status(&rpc_status).into());
                                 }
                                 OpResult::Response(any) => {
                                     let execute_response_grpc: GExecuteResponse =
@@ -2504,9 +2861,8 @@ impl REClient {
 
                                     let execute_response_status =
                                         execute_response_grpc.status.unwrap_or_default();
-                                    let execute_response_code = TCode(execute_response_status.code);
                                     if should_retry_execute_after_execute_response_status(
-                                        execute_response_code,
+                                        &execute_response_status,
                                     ) && can_retry_execute(execute_retry_attempts, retries)
                                     {
                                         execute_retry_attempts += 1;
@@ -2525,6 +2881,7 @@ impl REClient {
                                             grpc_request.clone(),
                                             retries,
                                             retry_max_delay,
+                                            grpc_request_timeout,
                                         )
                                         .await
                                         .context(
@@ -2650,7 +3007,9 @@ impl REClient {
             |re_request| {
                 let metadata = metadata.clone();
                 async move {
-                    retry_grpc_request(
+                    retry_grpc_request_with_client_reconnect(
+                        self,
+                        GrpcClientKind::Cas,
                         self.runtime_opts.retries,
                         Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
                         || {
@@ -2660,10 +3019,11 @@ impl REClient {
                                 let resp = self
                                     .cas_client()
                                     .await?
-                                    .batch_update_blobs(with_re_metadata(
+                                    .batch_update_blobs(with_re_metadata_timeout(
                                         re_request,
                                         metadata,
                                         self.runtime_opts.use_fbcode_metadata,
+                                        self.runtime_opts.grpc_request_timeout,
                                     ))
                                     .await?;
                                 Ok(resp.into_inner())
@@ -2676,7 +3036,9 @@ impl REClient {
             |segments| {
                 let metadata = metadata.clone();
                 async move {
-                    retry_grpc_request(
+                    retry_grpc_request_with_client_reconnect(
+                        self,
+                        GrpcClientKind::ByteStream,
                         self.runtime_opts.retries,
                         Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
                         || {
@@ -2698,10 +3060,11 @@ impl REClient {
                                     }
                                 };
                                 let resp = bytestream_client
-                                    .write(with_re_metadata(
+                                    .write(with_re_metadata_timeout(
                                         futures::stream::iter(segments),
                                         metadata,
                                         self.runtime_opts.use_fbcode_metadata,
+                                        self.runtime_opts.grpc_request_timeout,
                                     ))
                                     .await?;
                                 Ok(resp.into_inner())
@@ -3034,7 +3397,9 @@ impl REClient {
                 .for_digest(&blob_digest),
         );
 
-        let res: GSplitBlobResponse = retry_grpc_request(
+        let res: GSplitBlobResponse = retry_grpc_request_with_client_reconnect(
+            self,
+            GrpcClientKind::Cas,
             self.runtime_opts.retries,
             Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
             || {
@@ -3043,7 +3408,7 @@ impl REClient {
                 async move {
                     self.cas_client()
                         .await?
-                        .split_blob(with_re_metadata(
+                        .split_blob(with_re_metadata_timeout(
                             GSplitBlobRequest {
                                 instance_name: self.instance_name.as_str().to_owned(),
                                 blob_digest: Some(blob_digest),
@@ -3052,6 +3417,7 @@ impl REClient {
                             },
                             metadata,
                             self.runtime_opts.use_fbcode_metadata,
+                            self.runtime_opts.grpc_request_timeout,
                         ))
                         .await
                         .map(|response| response.into_inner())
@@ -3099,7 +3465,9 @@ impl REClient {
                 .for_common_digest_function(&request_digests),
         );
 
-        let res: GSpliceBlobResponse = retry_grpc_request(
+        let res: GSpliceBlobResponse = retry_grpc_request_with_client_reconnect(
+            self,
+            GrpcClientKind::Cas,
             self.runtime_opts.retries,
             Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
             || {
@@ -3109,7 +3477,7 @@ impl REClient {
                 async move {
                     self.cas_client()
                         .await?
-                        .splice_blob(with_re_metadata(
+                        .splice_blob(with_re_metadata_timeout(
                             GSpliceBlobRequest {
                                 instance_name: self.instance_name.as_str().to_owned(),
                                 blob_digest: Some(blob_digest),
@@ -3119,6 +3487,7 @@ impl REClient {
                             },
                             metadata,
                             self.runtime_opts.use_fbcode_metadata,
+                            self.runtime_opts.grpc_request_timeout,
                         ))
                         .await
                         .map(|response| response.into_inner())
@@ -3173,7 +3542,9 @@ impl REClient {
             |re_request| {
                 let metadata = metadata.clone();
                 async move {
-                    retry_grpc_request(
+                    retry_grpc_request_with_client_reconnect(
+                        self,
+                        GrpcClientKind::Cas,
                         self.runtime_opts.retries,
                         Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
                         || {
@@ -3183,10 +3554,11 @@ impl REClient {
                                 let resp = self
                                     .cas_client()
                                     .await?
-                                    .batch_read_blobs(with_re_metadata(
+                                    .batch_read_blobs(with_re_metadata_timeout(
                                         re_request,
                                         metadata,
                                         self.runtime_opts.use_fbcode_metadata,
+                                        self.runtime_opts.grpc_request_timeout,
                                     ))
                                     .await?;
                                 Ok(resp.into_inner())
@@ -3199,7 +3571,9 @@ impl REClient {
             |read_request| {
                 let metadata = metadata.clone();
                 async move {
-                    let response = retry_grpc_request(
+                    let response = retry_grpc_request_with_client_reconnect(
+                        self,
+                        GrpcClientKind::ByteStream,
                         self.runtime_opts.retries,
                         Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
                         || {
@@ -3548,7 +3922,9 @@ impl REClient {
                     .request_digest_function_config
                     .for_common_digest_function(&requested_digests);
                 let request_digest_function = digest_function_to_grpc(request_digest_function);
-                let missing_blobs = retry_grpc_request(
+                let missing_blobs = retry_grpc_request_with_client_reconnect(
+                    self,
+                    GrpcClientKind::Cas,
                     self.runtime_opts.retries,
                     Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
                     || {
@@ -3558,7 +3934,7 @@ impl REClient {
                             let resp = self
                                 .cas_client()
                                 .await?
-                                .find_missing_blobs(with_re_metadata(
+                                .find_missing_blobs(with_re_metadata_timeout(
                                     FindMissingBlobsRequest {
                                         instance_name: self.instance_name.as_str().to_owned(),
                                         blob_digests: requested_digests,
@@ -3567,6 +3943,7 @@ impl REClient {
                                     },
                                     metadata,
                                     self.runtime_opts.use_fbcode_metadata,
+                                    self.runtime_opts.grpc_request_timeout,
                                 ))
                                 .await?;
                             anyhow::Ok(resp)
@@ -4929,6 +5306,17 @@ fn with_re_metadata<T>(
     msg
 }
 
+fn with_re_metadata_timeout<T>(
+    t: T,
+    metadata: RemoteExecutionMetadata,
+    use_fbcode_metadata: bool,
+    timeout: Duration,
+) -> tonic::Request<T> {
+    let mut request = with_re_metadata(t, metadata, use_fbcode_metadata);
+    request.set_timeout(timeout);
+    request
+}
+
 /// Replace occurrences of $FOO in a string with the value of the env var $FOO.
 fn substitute_env_vars(s: &str) -> anyhow::Result<String> {
     substitute_env_vars_impl(s, |v| std::env::var(v))
@@ -4986,27 +5374,35 @@ mod tests {
 
     #[test]
     fn operation_error_retry_policy_matches_grpc_retry_codes() {
-        assert!(should_retry_execute_after_operation_error(
+        let status = |code: TCode| Status {
+            code: code.0,
+            ..Default::default()
+        };
+        assert!(should_retry_execute_after_operation_error(&status(
             TCode::UNAVAILABLE
-        ));
-        assert!(should_retry_execute_after_operation_error(
+        )));
+        assert!(should_retry_execute_after_operation_error(&status(
             TCode::DEADLINE_EXCEEDED
-        ));
-        assert!(!should_retry_execute_after_operation_error(
+        )));
+        assert!(!should_retry_execute_after_operation_error(&status(
             TCode::PERMISSION_DENIED
-        ));
+        )));
     }
 
     #[test]
     fn execute_response_status_retry_policy_matches_bazel() {
-        assert!(should_retry_execute_after_execute_response_status(
+        let status = |code: TCode| Status {
+            code: code.0,
+            ..Default::default()
+        };
+        assert!(should_retry_execute_after_execute_response_status(&status(
             TCode::UNAVAILABLE
+        )));
+        assert!(!should_retry_execute_after_execute_response_status(
+            &status(TCode::DEADLINE_EXCEEDED)
         ));
         assert!(!should_retry_execute_after_execute_response_status(
-            TCode::DEADLINE_EXCEEDED
-        ));
-        assert!(!should_retry_execute_after_execute_response_status(
-            TCode::PERMISSION_DENIED
+            &status(TCode::PERMISSION_DENIED)
         ));
     }
 
