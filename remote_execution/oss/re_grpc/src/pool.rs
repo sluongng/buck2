@@ -476,4 +476,9 @@ impl ChannelPool {
 
         Ok(host_pool.get().await)
     }
+
+    /// Drop cached channels for an address so the next request creates fresh lazy channels.
+    pub async fn reset(&self, address: &str) {
+        self.pools.lock().await.remove(address);
+    }
 }
