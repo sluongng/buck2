@@ -193,6 +193,16 @@ impl RemoteEventSink {
     fn prepare_event(event: &mut buck2_data::BuckEvent) {
         use buck2_data::buck_event::Data;
 
+        #[cfg(not(fbcode_build))]
+        {
+            if let Some(Data::Instant(i)) = &mut event.data
+                && let Some(buck2_data::instant_event::Data::BuckconfigInputValues(values)) =
+                    &mut i.data
+            {
+                redact_sensitive_buckconfig_values(values);
+            }
+        }
+
         if let Some(Data::SpanEnd(s)) = &mut event.data
             && let Some(buck2_data::span_end_event::Data::ActionExecution(action)) = &mut s.data
         {
@@ -371,6 +381,50 @@ impl EventSink for RemoteEventSink {
             Event::PartialResult(..) => {}
         }
     }
+}
+
+#[cfg(not(fbcode_build))]
+fn redact_sensitive_buckconfig_values(values: &mut buck2_data::BuckconfigInputValues) {
+    use buck2_data::buckconfig_component::Data;
+
+    for component in &mut values.components {
+        let Some(data) = component.data.as_mut() else {
+            continue;
+        };
+        let config_values = match data {
+            Data::ConfigValue(value) => std::slice::from_mut(value),
+            Data::ConfigFile(config_file) => match config_file.data.as_mut() {
+                Some(buck2_data::config_file::Data::GlobalExternalConfig(config)) => {
+                    config.values.as_mut_slice()
+                }
+                _ => continue,
+            },
+            Data::GlobalExternalConfigFile(config) => config.values.as_mut_slice(),
+        };
+
+        for value in config_values {
+            if is_sensitive_buckconfig_value(value) {
+                value.value = "<redacted>".to_owned();
+            }
+        }
+    }
+}
+
+#[cfg(not(fbcode_build))]
+fn is_sensitive_buckconfig_value(value: &buck2_data::ConfigValue) -> bool {
+    let section = value.section.to_ascii_lowercase();
+    let key = value.key.to_ascii_lowercase();
+    section.contains("credential")
+        || section.contains("secret")
+        || section.contains("token")
+        || key.contains("credential")
+        || key.contains("password")
+        || key.contains("secret")
+        || key.contains("token")
+        || key.contains("api_key")
+        || key.contains("api-key")
+        || key == "header"
+        || key == "http_headers"
 }
 
 fn action_has_cache_hit(action: &ActionExecutionEnd) -> bool {
