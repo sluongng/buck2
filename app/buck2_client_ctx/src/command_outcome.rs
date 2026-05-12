@@ -60,6 +60,10 @@ impl FromResidual<CommandFailure> for ExitResult {
     }
 }
 
+impl<R> std::ops::Residual<R> for CommandFailure {
+    type TryType = CommandOutcome<R>;
+}
+
 impl<T> FromResidual<CommandFailure> for Result<T, ExitResult> {
     fn from_residual(residual: CommandFailure) -> Self {
         Err(residual.0)
