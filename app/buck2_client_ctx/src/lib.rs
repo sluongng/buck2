@@ -12,6 +12,7 @@
 #![feature(error_generic_member_access)]
 #![feature(try_blocks)]
 #![feature(try_trait_v2)]
+#![feature(try_trait_v2_residual)]
 #![feature(used_with_arg)]
 
 pub mod agent_context;
