@@ -47,6 +47,8 @@ use tonic::Status;
 use tonic::metadata::MetadataKey;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
+use tonic::transport::ClientTlsConfig;
+use tonic::transport::Endpoint;
 
 use crate::sink::bazel_converter::BazelEventConverter;
 use crate::sink::bazel_converter::encode_bep_event;
@@ -57,7 +59,7 @@ const CLOSE_ACK_TIMEOUT_MULTIPLIER: u32 = 30;
 const MIN_CLOSE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_END_CLOSE_GRACE: Duration = Duration::from_millis(500);
 const COMMAND_END_CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const DEFAULT_BAZEL_ARTIFACT_UPLOAD_MAX_BYTES: usize = 1024 * 1024;
+const DEFAULT_BAZEL_ARTIFACT_UPLOAD_MAX_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct BesConfig {
@@ -72,7 +74,9 @@ pub struct BesConfig {
     pub bazel_artifact_upload: bool,
     pub upload_successful_action_events: bool,
     pub bazel_artifact_upload_backend: Option<String>,
+    pub re_client_cas_address: Option<String>,
     pub bazel_artifact_upload_instance_name: Option<String>,
+    pub re_client_instance_name: Option<String>,
     pub bazel_artifact_uri_authority: Option<String>,
     pub bazel_artifact_upload_max_bytes: usize,
 }
@@ -91,14 +95,16 @@ impl Default for BesConfig {
             retry_backoff: Duration::from_millis(500),
             retry_attempts: 5,
             message_batch_size: None,
-            grpc_timeout: Duration::from_secs(2),
+            grpc_timeout: Duration::from_secs(10),
             bes_backend: None,
             bes_headers: Vec::new(),
             event_format: BesEventFormat::Buck,
-            bazel_artifact_upload: false,
+            bazel_artifact_upload: true,
             upload_successful_action_events: true,
             bazel_artifact_upload_backend: None,
+            re_client_cas_address: None,
             bazel_artifact_upload_instance_name: None,
+            re_client_instance_name: None,
             bazel_artifact_uri_authority: None,
             bazel_artifact_upload_max_bytes: DEFAULT_BAZEL_ARTIFACT_UPLOAD_MAX_BYTES,
         }
@@ -265,10 +271,18 @@ impl BazelArtifactUploadConfig {
         if config.event_format != BesEventFormat::Bazel || !config.bazel_artifact_upload {
             return Ok(None);
         }
-        let endpoint = match config.bazel_artifact_upload_backend.as_deref() {
-            Some(backend) => bes_backend(Some(backend))?,
-            None => connection.endpoint.clone(),
-        };
+        let endpoint = config
+            .bazel_artifact_upload_backend
+            .as_deref()
+            .map(|backend| bes_backend(Some(backend)))
+            .transpose()?
+            .or_else(|| {
+                config
+                    .re_client_cas_address
+                    .as_deref()
+                    .and_then(re_client_cas_endpoint)
+            })
+            .unwrap_or_else(|| connection.endpoint.clone());
         let uri_authority = config
             .bazel_artifact_uri_authority
             .as_deref()
@@ -286,6 +300,7 @@ impl BazelArtifactUploadConfig {
             instance_name: config
                 .bazel_artifact_upload_instance_name
                 .clone()
+                .or_else(|| config.re_client_instance_name.clone())
                 .unwrap_or_default(),
             uri_authority,
             max_bytes: config.bazel_artifact_upload_max_bytes,
@@ -421,9 +436,7 @@ impl BazelArtifactUploader {
         request: WriteRequest,
     ) -> Result<google_grpc_proto::google::bytestream::WriteResponse, Status> {
         if self.client.is_none() {
-            let endpoint = tonic::transport::Endpoint::from_shared(self.config.endpoint.clone())
-                .map_err(|e| Status::internal(e.to_string()))?
-                .connect_timeout(self.config.grpc_timeout);
+            let endpoint = endpoint_for(&self.config.endpoint, self.config.grpc_timeout)?;
             let channel = endpoint.connect().await.map_err(map_transport_error)?;
             self.client = Some(ByteStreamClient::new(channel));
         }
@@ -461,6 +474,27 @@ fn endpoint_authority(endpoint: &str) -> Option<String> {
         .map(str::trim)
         .filter(|authority| !authority.is_empty())
         .map(str::to_owned)
+}
+
+fn re_client_cas_endpoint(address: &str) -> Option<String> {
+    let address = address.trim();
+    if address.is_empty() {
+        return None;
+    }
+
+    if let Some((scheme, target)) = address.split_once("://") {
+        let target = target.trim();
+        if target.is_empty() {
+            return None;
+        }
+        match scheme.to_ascii_lowercase().as_str() {
+            "grpc" | "http" => Some(format!("http://{target}")),
+            "grpcs" | "https" => Some(format!("https://{target}")),
+            _ => None,
+        }
+    } else {
+        Some(format!("https://{address}"))
+    }
 }
 
 fn upload_resource_name(instance_name: &str, hash: &str, size: i64) -> String {
@@ -947,11 +981,9 @@ impl WorkerState {
         ),
         Status,
     > {
-        let endpoint = tonic::transport::Endpoint::from_shared(self.connection.endpoint.clone())
-            .map_err(|e| Status::internal(e.to_string()))?
-            // Keep stream RPCs open for the duration of the build; use this value
-            // only to bound connection establishment.
-            .connect_timeout(self.config.grpc_timeout);
+        // Keep stream RPCs open for the duration of the build; use this value
+        // only to bound connection establishment.
+        let endpoint = endpoint_for(&self.connection.endpoint, self.config.grpc_timeout)?;
         let channel = endpoint.connect().await.map_err(map_transport_error)?;
         let mut client = PublishBuildEventClient::new(channel);
         let (tx, rx) = mpsc::channel(self.config.buffer_size.max(1));
@@ -1286,10 +1318,15 @@ impl StreamState {
 
     async fn flush_pending(&mut self) -> Result<(), Status> {
         self.prune_acked_requests();
-        let sender = self
-            .sender
-            .clone()
-            .ok_or_else(|| Status::unavailable("BES stream was not open"))?;
+        let sender = match self.sender.clone() {
+            Some(sender) => sender,
+            None => {
+                if let Some(status) = self.finished_ack_task_status().await {
+                    return Err(status);
+                }
+                return Err(Status::unavailable("BES stream was not open"));
+            }
+        };
 
         let pending = self
             .pending_unacked
@@ -1299,10 +1336,12 @@ impl StreamState {
             .collect::<Vec<_>>();
         for request in pending {
             let sequence_number = request_sequence_number(&request);
-            sender
-                .send(request)
-                .await
-                .map_err(|_| Status::unavailable("BES stream was closed"))?;
+            if sender.send(request).await.is_err() {
+                if let Some(status) = self.finished_ack_task_status().await {
+                    return Err(status);
+                }
+                return Err(Status::unavailable("BES stream was closed"));
+            }
             self.last_sent_sequence_number = sequence_number;
         }
         Ok(())
@@ -1330,6 +1369,20 @@ impl StreamState {
 
     fn last_acked_sequence_number(&self) -> i64 {
         self.last_acked_sequence_number.load(Ordering::Relaxed)
+    }
+
+    async fn finished_ack_task_status(&mut self) -> Option<Status> {
+        let task = self.ack_task.as_ref()?;
+        if !task.is_finished() {
+            return None;
+        }
+        drop(self.sender.take());
+        let task = self.ack_task.take()?;
+        match task.await {
+            Ok(Ok(())) => Some(Status::unavailable("BES stream closed")),
+            Ok(Err(status)) => Some(status),
+            Err(e) => Some(Status::internal(e.to_string())),
+        }
     }
 }
 
@@ -1465,6 +1518,21 @@ fn is_invocation_record(event: &buck2_data::BuckEvent) -> bool {
 
 fn map_transport_error(err: tonic::transport::Error) -> Status {
     Status::unavailable(err.to_string())
+}
+
+fn endpoint_for(uri: &str, connect_timeout: Duration) -> Result<Endpoint, Status> {
+    let mut endpoint = Endpoint::from_shared(uri.to_owned())
+        .map_err(|e| Status::internal(e.to_string()))?
+        .connect_timeout(connect_timeout);
+    if uri
+        .split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
+    {
+        endpoint = endpoint
+            .tls_config(ClientTlsConfig::new().with_enabled_roots())
+            .map_err(|e| Status::internal(e.to_string()))?;
+    }
+    Ok(endpoint)
 }
 
 fn bes_backend(configured_endpoint: Option<&str>) -> buck2_error::Result<String> {
@@ -1639,6 +1707,43 @@ mod tests {
             endpoint_authority("https://bes.example.com").as_deref(),
             Some("bes.example.com")
         );
+    }
+
+    #[test]
+    fn re_client_cas_endpoint_defaults_to_tls() {
+        assert_eq!(
+            re_client_cas_endpoint("remote.buildbuddy.io").as_deref(),
+            Some("https://remote.buildbuddy.io")
+        );
+        assert_eq!(
+            re_client_cas_endpoint("grpc://localhost:1985").as_deref(),
+            Some("http://localhost:1985")
+        );
+        assert_eq!(
+            re_client_cas_endpoint("grpcs://remote.buildbuddy.io").as_deref(),
+            Some("https://remote.buildbuddy.io")
+        );
+    }
+
+    #[test]
+    fn bazel_artifact_upload_defaults_to_re_client_cas() {
+        let config = BesConfig {
+            event_format: BesEventFormat::Bazel,
+            re_client_cas_address: Some("remote.buildbuddy.io".to_owned()),
+            re_client_instance_name: Some("instance".to_owned()),
+            ..Default::default()
+        };
+        let connection = ConnectionConfig {
+            endpoint: "https://bes.example.com".to_owned(),
+            headers: Vec::new(),
+        };
+        let upload = BazelArtifactUploadConfig::from_bes(&config, &connection)
+            .unwrap()
+            .unwrap();
+        assert_eq!(upload.endpoint, "https://remote.buildbuddy.io");
+        assert_eq!(upload.uri_authority, "remote.buildbuddy.io");
+        assert_eq!(upload.instance_name, "instance");
+        assert_eq!(upload.max_bytes, 10 * 1024 * 1024);
     }
 
     #[test]
