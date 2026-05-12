@@ -46,7 +46,7 @@ impl BuildGraphStats {
                 #[cfg(fbcode_build)]
                 thrift_timeout: Duration::from_secs(1),
                 #[cfg(not(fbcode_build))]
-                grpc_timeout: Duration::from_secs(1),
+                grpc_timeout: Duration::from_secs(10),
                 #[cfg(not(fbcode_build))]
                 bes_backend: None,
                 #[cfg(not(fbcode_build))]
@@ -54,17 +54,21 @@ impl BuildGraphStats {
                 #[cfg(not(fbcode_build))]
                 event_format: Default::default(),
                 #[cfg(not(fbcode_build))]
-                bazel_artifact_upload: false,
+                bazel_artifact_upload: true,
                 #[cfg(not(fbcode_build))]
                 upload_successful_action_events: true,
                 #[cfg(not(fbcode_build))]
                 bazel_artifact_upload_backend: None,
                 #[cfg(not(fbcode_build))]
+                re_client_cas_address: None,
+                #[cfg(not(fbcode_build))]
                 bazel_artifact_upload_instance_name: None,
+                #[cfg(not(fbcode_build))]
+                re_client_instance_name: None,
                 #[cfg(not(fbcode_build))]
                 bazel_artifact_uri_authority: None,
                 #[cfg(not(fbcode_build))]
-                bazel_artifact_upload_max_bytes: 1024 * 1024,
+                bazel_artifact_upload_max_bytes: 10 * 1024 * 1024,
             },
         );
 

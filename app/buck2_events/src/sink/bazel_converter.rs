@@ -63,6 +63,7 @@ struct TestCaseState {
 #[derive(Debug, Default)]
 pub(crate) struct BazelEventConverter {
     saw_started: bool,
+    saw_finished: bool,
     progress_count: i32,
     completed_targets: BTreeMap<TargetKey, CompletedTargetState>,
     action_children: BTreeMap<TargetKey, BTreeMap<String, bep::BuildEventId>>,
@@ -157,8 +158,9 @@ impl BazelEventConverter {
         events: &mut Vec<bep::BuildEvent>,
     ) {
         match span_end.data.as_ref() {
-            Some(buck2_data::span_end_event::Data::Command(_)) => {
+            Some(buck2_data::span_end_event::Data::Command(command)) => {
                 self.emit_completed_updates_for_actions(events);
+                self.push_finished(finished_event_from_command_end(event, command), events);
             }
             Some(buck2_data::span_end_event::Data::Analysis(analysis)) => {
                 if let Some(completed) = completed_event_from_analysis_end(analysis) {
@@ -229,6 +231,16 @@ impl BazelEventConverter {
             }
             Some(buck2_data::instant_event::Data::StructuredError(error)) => {
                 events.push(self.progress_event(sequence_hint, None, Some(error.payload.clone())));
+            }
+            Some(buck2_data::instant_event::Data::ReSession(session)) => {
+                let mut metadata = BTreeMap::from([(
+                    "REMOTE_EXECUTION_ENABLED".to_owned(),
+                    "1".to_owned(),
+                )]);
+                if !session.session_id.is_empty() {
+                    metadata.insert("BUCK2_RE_SESSION_ID".to_owned(), session.session_id.clone());
+                }
+                events.push(build_metadata_event(&metadata));
             }
             Some(buck2_data::instant_event::Data::TargetPatterns(patterns)) => {
                 self.remember_target_patterns(patterns);
@@ -337,7 +349,7 @@ impl BazelEventConverter {
                 self.emit_completed_updates_for_actions(events);
                 events.push(build_metrics_event(record));
                 events.push(build_metadata_event_from_invocation(record));
-                events.push(finished_event_from_invocation_record(event, record));
+                self.push_finished(finished_event_from_invocation_record(event, record), events);
                 events.push(build_tool_logs_event_from_invocation(record));
             }
             Some(buck2_data::record_event::Data::BuildGraphStats(stats)) => {
@@ -351,6 +363,14 @@ impl BazelEventConverter {
             }
             _ => {}
         }
+    }
+
+    fn push_finished(&mut self, event: bep::BuildEvent, events: &mut Vec<bep::BuildEvent>) {
+        if self.saw_finished {
+            return;
+        }
+        self.saw_finished = true;
+        events.push(event);
     }
 
     fn remember_target_patterns(&mut self, patterns: &buck2_data::ParsedTargetPatterns) {
@@ -1378,9 +1398,6 @@ fn build_metadata_event_from_command(command: &buck2_data::CommandStart) -> bep:
     if env::var("CI").is_ok_and(|ci| !ci.is_empty()) {
         metadata.entry("ROLE".to_owned()).or_insert("CI".to_owned());
     }
-    if !command.tags.is_empty() {
-        metadata.insert("TAGS".to_owned(), command.tags.join(","));
-    }
     build_metadata_event(&metadata)
 }
 
@@ -1390,9 +1407,6 @@ fn build_metadata_event_from_invocation(record: &buck2_data::InvocationRecord) -
         && !command_name.is_empty()
     {
         metadata.insert("BUCK2_COMMAND".to_owned(), command_name.clone());
-    }
-    if !record.tags.is_empty() {
-        metadata.insert("TAGS".to_owned(), record.tags.join(","));
     }
     if !record.re_session_id.is_empty() {
         metadata.insert(
@@ -1971,6 +1985,19 @@ fn finished_event_from_invocation_record(
     {
         exit_name = record_exit_name.clone();
     }
+
+    finished_event(event.timestamp.clone(), exit_code, exit_name)
+}
+
+fn finished_event_from_command_end(
+    event: &buck2_data::BuckEvent,
+    command: &buck2_data::CommandEnd,
+) -> bep::BuildEvent {
+    let (exit_code, exit_name) = if command.is_success {
+        (0, "SUCCESS")
+    } else {
+        (1, "FAILED")
+    };
 
     finished_event(event.timestamp.clone(), exit_code, exit_name)
 }
@@ -2992,7 +3019,7 @@ mod tests {
     }
 
     #[test]
-    fn command_end_does_not_emit_build_finished() {
+    fn command_end_emits_build_finished() {
         let mut converter = BazelEventConverter::default();
         let events = converter.convert(
             1,
@@ -3014,45 +3041,25 @@ mod tests {
             )),
         );
 
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event.payload, Some(build_event::Payload::Finished(_))))
-        );
+        let finished = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::Finished(finished)) => Some(finished),
+                _ => None,
+            })
+            .expect("build finished");
+        assert!(!finished.overall_success);
+        let exit_code = finished.exit_code.as_ref().expect("exit code");
+        assert_eq!(exit_code.code, 1);
+        assert_eq!(exit_code.name, "FAILED");
     }
 
     #[test]
-    fn invocation_record_controls_build_finished_status() {
+    fn invocation_record_emits_build_finished_when_command_end_did_not() {
         let mut converter = BazelEventConverter::default();
-        let command_end = converter.convert(
-            1,
-            &trace_event(buck2_data::buck_event::Data::SpanEnd(
-                buck2_data::SpanEndEvent {
-                    data: Some(buck2_data::span_end_event::Data::Command(
-                        buck2_data::CommandEnd {
-                            data: Some(buck2_data::command_end::Data::Test(
-                                buck2_data::TestCommandEnd {
-                                    unresolved_target_patterns: Vec::new(),
-                                },
-                            )),
-                            is_success: true,
-                            build_result: Some(buck2_data::BuildResult {
-                                build_completed: true,
-                            }),
-                        },
-                    )),
-                    ..Default::default()
-                },
-            )),
-        );
-        assert!(
-            !command_end
-                .iter()
-                .any(|event| matches!(event.payload, Some(build_event::Payload::Finished(_))))
-        );
 
         let final_events = converter.convert(
-            2,
+            1,
             &trace_event(buck2_data::buck_event::Data::Record(
                 buck2_data::RecordEvent {
                     data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
@@ -3078,6 +3085,41 @@ mod tests {
         let exit_code = finished.exit_code.as_ref().expect("exit code");
         assert_eq!(exit_code.code, 32);
         assert_eq!(exit_code.name, "TESTS_FAILED");
+    }
+
+    #[test]
+    fn re_session_emits_remote_execution_metadata() {
+        let mut converter = BazelEventConverter::default();
+        let events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::Instant(
+                buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::ReSession(
+                        buck2_data::RemoteExecutionSessionCreated {
+                            session_id: "re-session".to_owned(),
+                            experiment_name: String::new(),
+                            persistent_cache_mode: None,
+                        },
+                    )),
+                },
+            )),
+        );
+
+        let metadata = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::BuildMetadata(metadata)) => Some(metadata),
+                _ => None,
+            })
+            .expect("build metadata");
+        assert_eq!(
+            metadata.metadata.get("REMOTE_EXECUTION_ENABLED").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            metadata.metadata.get("BUCK2_RE_SESSION_ID").map(String::as_str),
+            Some("re-session")
+        );
     }
 
     #[test]
