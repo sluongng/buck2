@@ -391,12 +391,30 @@ impl DaemonState {
                 })?
                 .unwrap_or_default();
             #[cfg(not(fbcode_build))]
+            let re_client_default_address: Option<String> =
+                root_config.parse(BuckconfigKeyRef {
+                    section: "buck2_re_client",
+                    property: "address",
+                })?;
+            #[cfg(not(fbcode_build))]
+            let re_client_cas_address = root_config
+                .parse::<String>(BuckconfigKeyRef {
+                    section: "buck2_re_client",
+                    property: "cas_address",
+                })?
+                .or(re_client_default_address);
+            #[cfg(not(fbcode_build))]
+            let re_client_instance_name = root_config.parse(BuckconfigKeyRef {
+                section: "buck2_re_client",
+                property: "instance_name",
+            })?;
+            #[cfg(not(fbcode_build))]
             let bazel_artifact_upload = root_config
                 .parse::<bool>(BuckconfigKeyRef {
                     section: "bes",
                     property: "bazel_artifact_upload",
                 })?
-                .unwrap_or_default();
+                .unwrap_or(true);
             #[cfg(not(fbcode_build))]
             let upload_successful_action_events = root_config
                 .parse::<bool>(BuckconfigKeyRef {
@@ -437,7 +455,7 @@ impl DaemonState {
                     section: "bes",
                     property: "bazel_artifact_upload_max_bytes",
                 })?
-                .unwrap_or(1024 * 1024);
+                .unwrap_or(10 * 1024 * 1024);
             tracing::info!("Initializing scribe sink...");
             let scribe_sink = Self::init_scribe_sink(
                 fb,
@@ -449,7 +467,7 @@ impl DaemonState {
                     #[cfg(fbcode_build)]
                     thrift_timeout: Duration::from_secs(1),
                     #[cfg(not(fbcode_build))]
-                    grpc_timeout: Duration::from_secs(1),
+                    grpc_timeout: Duration::from_secs(10),
                     #[cfg(not(fbcode_build))]
                     bes_backend,
                     #[cfg(not(fbcode_build))]
@@ -463,7 +481,11 @@ impl DaemonState {
                     #[cfg(not(fbcode_build))]
                     bazel_artifact_upload_backend,
                     #[cfg(not(fbcode_build))]
+                    re_client_cas_address,
+                    #[cfg(not(fbcode_build))]
                     bazel_artifact_upload_instance_name,
+                    #[cfg(not(fbcode_build))]
+                    re_client_instance_name,
                     #[cfg(not(fbcode_build))]
                     bazel_artifact_uri_authority,
                     #[cfg(not(fbcode_build))]
