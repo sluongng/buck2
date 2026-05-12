@@ -359,6 +359,10 @@ impl<T> std::ops::FromResidual<ResultMaybeCompatible<std::convert::Infallible>>
     }
 }
 
+impl<T> std::ops::Residual<T> for ResultMaybeCompatible<std::convert::Infallible> {
+    type TryType = ResultMaybeCompatible<T>;
+}
+
 impl<T, E: Into<buck2_error::Error>> std::ops::FromResidual<Result<std::convert::Infallible, E>>
     for ResultMaybeCompatible<T>
 {
