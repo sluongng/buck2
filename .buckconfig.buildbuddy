@@ -1,0 +1,46 @@
+[buck2]
+digest_algorithms = BLAKE3
+# Keep remote outputs deferred, but persist materializer state so Buck can
+# reuse files that are already present on disk after daemon restarts.
+materializations = deferred
+sqlite_materializer_state = true
+# Defer writes on the build critical path; combined with on-disk state, this
+# lets Buck skip writes when the expected content is already present.
+defer_write_actions = true
+# Continuously trim stale buck-out artifacts using Buck's default clean-stale
+# schedule.
+clean_stale_enabled = true
+# Restart the daemon when Buck detects deferred materializer state that can be
+# recovered by restarting.
+restarter = true
+
+[buck2_re_client]
+engine_address = remote.buildbuddy.io
+action_cache_address = remote.buildbuddy.io
+cas_address = remote.buildbuddy.io
+# Keep capabilities enabled so Buck uses BuildBuddy's advertised remote cache
+# protocol features, including ByteStream and BatchUpdate compression.
+capabilities = true
+request_metadata_tool_name = bazel
+execution_concurrency_limit = 2000
+# Match BuildBuddy's client-side batch RPC limit: blobs or batches above 2 MiB
+# use ByteStream, which is faster for larger transfers.
+max_total_batch_size = 2097152
+# Match Bazel/BuildBuddy's compression break-even point.
+remote_cache_compression_threshold = 100
+remote_cache_chunking = true
+remote_cache_chunk_cache_dir = buck-out/buildbuddy-re-chunks
+
+[build]
+execution_platforms = root//buildbuddy:buildbuddy-rbe
+
+[http_archive]
+remote_download = true
+
+[bes]
+backend = grpcs://remote.buildbuddy.io
+event_format = bazel
+# Keep failed-action diagnostics while avoiding a long tail of successful
+# action events before the terminal BES events on fully remote no-cache builds.
+upload_successful_action_events = false
+results_url = https://app.buildbuddy.io/invocation/
