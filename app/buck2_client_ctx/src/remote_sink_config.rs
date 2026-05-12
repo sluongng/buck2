@@ -23,7 +23,9 @@ struct BuckconfigBesSettings {
     bazel_artifact_upload: Option<bool>,
     upload_successful_action_events: Option<bool>,
     bazel_artifact_upload_backend: Option<String>,
+    re_client_cas_address: Option<String>,
     bazel_artifact_upload_instance_name: Option<String>,
+    re_client_instance_name: Option<String>,
     bazel_artifact_uri_authority: Option<String>,
     bazel_artifact_upload_max_bytes: Option<usize>,
     bes_results_url: Option<String>,
@@ -53,8 +55,14 @@ pub fn with_buckconfig_overrides(
             if let Some(backend) = settings.bazel_artifact_upload_backend {
                 config.bazel_artifact_upload_backend = Some(backend);
             }
+            if let Some(re_client_cas_address) = settings.re_client_cas_address {
+                config.re_client_cas_address = Some(re_client_cas_address);
+            }
             if let Some(instance_name) = settings.bazel_artifact_upload_instance_name {
                 config.bazel_artifact_upload_instance_name = Some(instance_name);
+            }
+            if let Some(re_client_instance_name) = settings.re_client_instance_name {
+                config.re_client_instance_name = Some(re_client_instance_name);
             }
             if let Some(authority) = settings.bazel_artifact_uri_authority {
                 config.bazel_artifact_uri_authority = Some(authority);
@@ -116,7 +124,9 @@ fn read_buckconfig_bes_settings(
             bazel_artifact_upload: None,
             upload_successful_action_events: None,
             bazel_artifact_upload_backend: None,
+            re_client_cas_address: None,
             bazel_artifact_upload_instance_name: None,
+            re_client_instance_name: None,
             bazel_artifact_uri_authority: None,
             bazel_artifact_upload_max_bytes: None,
             bes_results_url: None,
@@ -144,6 +154,16 @@ fn read_buckconfig_bes_settings(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
+    let re_client_default_address: Option<String> = root_config.parse(BuckconfigKeyRef {
+        section: "buck2_re_client",
+        property: "address",
+    })?;
+    let re_client_cas_address = root_config
+        .parse::<String>(BuckconfigKeyRef {
+            section: "buck2_re_client",
+            property: "cas_address",
+        })?
+        .or(re_client_default_address);
 
     Ok(BuckconfigBesSettings {
         bes_backend: root_config
@@ -176,6 +196,7 @@ fn read_buckconfig_bes_settings(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_owned),
+        re_client_cas_address,
         bazel_artifact_upload_instance_name: root_config
             .get(BuckconfigKeyRef {
                 section: "bes",
@@ -184,6 +205,10 @@ fn read_buckconfig_bes_settings(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_owned),
+        re_client_instance_name: root_config.parse(BuckconfigKeyRef {
+            section: "buck2_re_client",
+            property: "instance_name",
+        })?,
         bazel_artifact_uri_authority: root_config
             .get(BuckconfigKeyRef {
                 section: "bes",
