@@ -143,6 +143,8 @@ const DEFAULT_FAST_CDC_2020_AVG_CHUNK_SIZE: u64 = 512 * 1024;
 const DEFAULT_EXECUTION_CONCURRENCY_LIMIT: usize = 400;
 const DEFAULT_ENGINE_REQUESTS_PER_CONNECTION: usize = 100;
 const DEFAULT_MAX_ENGINE_CONNECTION_COUNT: usize = 100;
+const DEFAULT_REQUEST_METADATA_TOOL_NAME: &str = "buck2";
+const REQUEST_METADATA_HEADER: &str = "build.bazel.remote.execution.v2.requestmetadata-bin";
 
 fn tdigest_to(tdigest: TDigest) -> Digest {
     Digest {
@@ -791,6 +793,7 @@ async fn execute_stream(
     grpc_clients: Arc<GRPCClients>,
     metadata: RemoteExecutionMetadata,
     use_fbcode_metadata: bool,
+    request_metadata_tool_name: &str,
     request: GExecuteRequest,
     retries: usize,
     retry_max_delay: Duration,
@@ -807,7 +810,12 @@ async fn execute_stream(
             async move {
                 let mut client = grpc_clients.execution_client().await;
                 Ok(client
-                    .execute(with_re_metadata(request, metadata, use_fbcode_metadata))
+                    .execute(with_re_metadata(
+                        request,
+                        metadata,
+                        use_fbcode_metadata,
+                        request_metadata_tool_name,
+                    ))
                     .await?
                     .into_inner())
             }
@@ -820,6 +828,7 @@ async fn wait_execution_stream(
     grpc_clients: Arc<GRPCClients>,
     metadata: RemoteExecutionMetadata,
     use_fbcode_metadata: bool,
+    request_metadata_tool_name: &str,
     operation_name: String,
     retries: usize,
     retry_max_delay: Duration,
@@ -842,6 +851,7 @@ async fn wait_execution_stream(
                         },
                         metadata,
                         use_fbcode_metadata,
+                        request_metadata_tool_name,
                     ))
                     .await?
                     .into_inner())
@@ -855,6 +865,7 @@ async fn wait_execution_or_retry_execute(
     grpc_clients: Arc<GRPCClients>,
     metadata: RemoteExecutionMetadata,
     use_fbcode_metadata: bool,
+    request_metadata_tool_name: &str,
     operation_name: String,
     execute_request: GExecuteRequest,
     execute_retry_attempts: usize,
@@ -866,6 +877,7 @@ async fn wait_execution_or_retry_execute(
         grpc_clients.clone(),
         metadata.clone(),
         use_fbcode_metadata,
+        request_metadata_tool_name,
         operation_name.clone(),
         retries,
         retry_max_delay,
@@ -891,6 +903,7 @@ async fn wait_execution_or_retry_execute(
                 grpc_clients,
                 metadata,
                 use_fbcode_metadata,
+                request_metadata_tool_name,
                 execute_request,
                 retries,
                 retry_max_delay,
@@ -1075,6 +1088,8 @@ pub struct RECapabilities {
 pub struct RERuntimeOpts {
     /// Use the Meta version of the request metadata
     use_fbcode_metadata: bool,
+    /// Tool name to report in RequestMetadata.tool_details.
+    request_metadata_tool_name: String,
     /// Maximum number of concurrent upload requests.
     max_concurrent_uploads_per_action: Option<usize>,
     /// Time that digests are assumed to live in CAS after being touched.
@@ -2070,10 +2085,25 @@ fn validate_re_api_versions(
     ))
 }
 
+fn request_metadata_tool_name_from_options(
+    opts: &Buck2OssReConfiguration,
+) -> anyhow::Result<String> {
+    let request_metadata_tool_name = opts
+        .request_metadata_tool_name
+        .clone()
+        .unwrap_or_else(|| DEFAULT_REQUEST_METADATA_TOOL_NAME.to_owned());
+    anyhow::ensure!(
+        !request_metadata_tool_name.is_empty(),
+        "`request_metadata_tool_name` must not be empty"
+    );
+    Ok(request_metadata_tool_name)
+}
+
 pub struct REClientBuilder;
 
 impl REClientBuilder {
     pub async fn build_and_connect(opts: &Buck2OssReConfiguration) -> anyhow::Result<REClient> {
+        let request_metadata_tool_name = request_metadata_tool_name_from_options(opts)?;
         let tls_config = Arc::new(tokio::sync::OnceCell::new());
         let channel_settings = GrpcChannelSettings::from_options(opts);
         let cas_connector = GrpcChannelConnector::new(
@@ -2286,6 +2316,7 @@ impl REClientBuilder {
         Ok(REClient::new(
             RERuntimeOpts {
                 use_fbcode_metadata: opts.use_fbcode_metadata,
+                request_metadata_tool_name,
                 max_concurrent_uploads_per_action: opts.max_concurrent_uploads_per_action,
                 // NOTE: This is an arbitrary number because RBE does not return information
                 // on the TTL of the remote blob.
@@ -3163,6 +3194,7 @@ impl REClient {
                 },
                 metadata,
                 self.runtime_opts.use_fbcode_metadata,
+                self.runtime_opts.request_metadata_tool_name.as_str(),
                 self.runtime_opts.grpc_request_timeout,
             ))
             .await
@@ -3230,6 +3262,7 @@ impl REClient {
                             },
                             metadata,
                             self.runtime_opts.use_fbcode_metadata,
+                            self.runtime_opts.request_metadata_tool_name.as_str(),
                             self.runtime_opts.grpc_request_timeout,
                         ))
                         .await
@@ -3281,6 +3314,7 @@ impl REClient {
                             },
                             metadata,
                             self.runtime_opts.use_fbcode_metadata,
+                            self.runtime_opts.request_metadata_tool_name.as_str(),
                             self.runtime_opts.grpc_request_timeout,
                         ))
                         .await
@@ -3337,11 +3371,13 @@ impl REClient {
             digest_function,
             ..Default::default()
         };
+        let request_metadata_tool_name = self.runtime_opts.request_metadata_tool_name.clone();
 
         let stream = execute_stream(
             self.grpc_clients.clone(),
             metadata.clone(),
             self.runtime_opts.use_fbcode_metadata,
+            request_metadata_tool_name.as_str(),
             grpc_request.clone(),
             self.runtime_opts.retries,
             Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
@@ -3362,6 +3398,7 @@ impl REClient {
                 let grpc_clients = grpc_clients.clone();
                 let metadata = metadata_for_wait_execution.clone();
                 let grpc_request = grpc_request_for_retry.clone();
+                let request_metadata_tool_name = request_metadata_tool_name.clone();
                 async move {
                     loop {
                         let msg = loop {
@@ -3386,6 +3423,7 @@ impl REClient {
                                         grpc_clients.clone(),
                                         metadata.clone(),
                                         use_fbcode_metadata,
+                                        request_metadata_tool_name.as_str(),
                                         name,
                                         grpc_request.clone(),
                                         execute_retry_attempts,
@@ -3428,6 +3466,7 @@ impl REClient {
                                             grpc_clients.clone(),
                                             metadata.clone(),
                                             use_fbcode_metadata,
+                                            request_metadata_tool_name.as_str(),
                                             grpc_request.clone(),
                                             retries,
                                             retry_max_delay,
@@ -3451,6 +3490,7 @@ impl REClient {
                                         grpc_clients.clone(),
                                         metadata.clone(),
                                         use_fbcode_metadata,
+                                        request_metadata_tool_name.as_str(),
                                         name,
                                         grpc_request.clone(),
                                         execute_retry_attempts,
@@ -3492,6 +3532,7 @@ impl REClient {
                                             grpc_clients.clone(),
                                             metadata.clone(),
                                             use_fbcode_metadata,
+                                            request_metadata_tool_name.as_str(),
                                             grpc_request.clone(),
                                             retries,
                                             retry_max_delay,
@@ -3529,6 +3570,7 @@ impl REClient {
                                             grpc_clients.clone(),
                                             metadata.clone(),
                                             use_fbcode_metadata,
+                                            request_metadata_tool_name.as_str(),
                                             grpc_request.clone(),
                                             retries,
                                             retry_max_delay,
@@ -3677,6 +3719,7 @@ impl REClient {
                                         re_request,
                                         metadata,
                                         self.runtime_opts.use_fbcode_metadata,
+                                        self.runtime_opts.request_metadata_tool_name.as_str(),
                                         self.runtime_opts.grpc_request_timeout,
                                     ))
                                     .await?
@@ -3720,6 +3763,7 @@ impl REClient {
                                         requests,
                                         metadata,
                                         self.runtime_opts.use_fbcode_metadata,
+                                        self.runtime_opts.request_metadata_tool_name.as_str(),
                                     ))
                                     .await?
                                     .into_inner())
@@ -4094,6 +4138,7 @@ impl REClient {
                             },
                             metadata,
                             self.runtime_opts.use_fbcode_metadata,
+                            self.runtime_opts.request_metadata_tool_name.as_str(),
                             self.runtime_opts.grpc_request_timeout,
                         ))
                         .await
@@ -4167,6 +4212,7 @@ impl REClient {
                             },
                             metadata,
                             self.runtime_opts.use_fbcode_metadata,
+                            self.runtime_opts.request_metadata_tool_name.as_str(),
                             self.runtime_opts.grpc_request_timeout,
                         ))
                         .await
@@ -4246,6 +4292,7 @@ impl REClient {
                                         re_request,
                                         metadata,
                                         self.runtime_opts.use_fbcode_metadata,
+                                        self.runtime_opts.request_metadata_tool_name.as_str(),
                                         self.runtime_opts.grpc_request_timeout,
                                     ))
                                     .await?
@@ -4275,6 +4322,7 @@ impl REClient {
                                         read_request,
                                         metadata,
                                         self.runtime_opts.use_fbcode_metadata,
+                                        self.runtime_opts.request_metadata_tool_name.as_str(),
                                     ))
                                     .await?
                                     .into_inner())
@@ -4655,6 +4703,7 @@ impl REClient {
                                     },
                                     metadata,
                                     self.runtime_opts.use_fbcode_metadata,
+                                    self.runtime_opts.request_metadata_tool_name.as_str(),
                                     self.runtime_opts.grpc_request_timeout,
                                 ))
                                 .await
@@ -6218,6 +6267,7 @@ fn with_re_metadata<T>(
     t: T,
     metadata: RemoteExecutionMetadata,
     use_fbcode_metadata: bool,
+    request_metadata_tool_name: &str,
 ) -> tonic::Request<T> {
     // This creates a new Tonic request with attached metadata for the RE
     // backend. There are two cases here we need to support:
@@ -6302,7 +6352,7 @@ fn with_re_metadata<T>(
 
         RequestMetadata {
             tool_details: Some(ToolDetails {
-                tool_name: "buck2".to_owned(),
+                tool_name: request_metadata_tool_name.to_owned(),
                 tool_version,
             }),
             action_id: action_id.unwrap_or_default(),
@@ -6315,10 +6365,8 @@ fn with_re_metadata<T>(
         .encode(&mut encoded)
         .expect("Encoding into a Vec cannot not fail");
 
-        msg.metadata_mut().insert_bin(
-            "build.bazel.remote.execution.v2.requestmetadata-bin",
-            MetadataValue::from_bytes(&encoded),
-        );
+        msg.metadata_mut()
+            .insert_bin(REQUEST_METADATA_HEADER, MetadataValue::from_bytes(&encoded));
     };
     msg
 }
@@ -6327,9 +6375,11 @@ fn with_re_metadata_timeout<T>(
     t: T,
     metadata: RemoteExecutionMetadata,
     use_fbcode_metadata: bool,
+    request_metadata_tool_name: &str,
     timeout: Duration,
 ) -> tonic::Request<T> {
-    let mut request = with_re_metadata(t, metadata, use_fbcode_metadata);
+    let mut request =
+        with_re_metadata(t, metadata, use_fbcode_metadata, request_metadata_tool_name);
     request.set_timeout(timeout);
     request
 }
@@ -6468,6 +6518,74 @@ mod tests {
         assert_eq!(configured_connection_count(Some(0), Some(2000)), 1);
         assert_eq!(configured_connection_count(Some(16), Some(2000)), 16);
     }
+
+    fn decode_request_metadata<T>(request: &tonic::Request<T>) -> RequestMetadata {
+        let metadata = request
+            .metadata()
+            .get_bin(REQUEST_METADATA_HEADER)
+            .expect("request metadata header should be present");
+        RequestMetadata::decode(metadata.to_bytes().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn request_metadata_tool_name_from_options_defaults_to_buck2() -> anyhow::Result<()> {
+        let opts = Buck2OssReConfiguration::default();
+
+        assert_eq!(
+            request_metadata_tool_name_from_options(&opts)?,
+            DEFAULT_REQUEST_METADATA_TOOL_NAME
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_metadata_tool_name_from_options_uses_configured_value() -> anyhow::Result<()> {
+        let opts = Buck2OssReConfiguration {
+            request_metadata_tool_name: Some("bazel".to_owned()),
+            ..Default::default()
+        };
+
+        assert_eq!(request_metadata_tool_name_from_options(&opts)?, "bazel");
+        Ok(())
+    }
+
+    #[test]
+    fn request_metadata_tool_name_from_options_rejects_empty_value() {
+        let opts = Buck2OssReConfiguration {
+            request_metadata_tool_name: Some(String::new()),
+            ..Default::default()
+        };
+
+        let err = request_metadata_tool_name_from_options(&opts)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("request_metadata_tool_name"));
+    }
+
+    #[test]
+    fn with_re_metadata_sets_request_metadata_tool_name() {
+        let request = with_re_metadata(
+            (),
+            RemoteExecutionMetadata {
+                buck_info: Some(BuckInfo {
+                    build_id: "build-id".to_owned(),
+                    version: "version".to_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            false,
+            "bazel",
+        );
+
+        let request_metadata = decode_request_metadata(&request);
+        let tool_details = request_metadata
+            .tool_details
+            .expect("tool details should be set");
+        assert_eq!(tool_details.tool_name, "bazel");
+        assert_eq!(tool_details.tool_version, "version");
+    }
+
     fn status_for_code(code: TCode) -> Status {
         Status {
             code: code.0,
@@ -6795,6 +6913,7 @@ mod tests {
             DigestFunctionConfig::from_configured_algorithms(&["SHA256".into(), "SHA1".into()]);
         let runtime_opts = RERuntimeOpts {
             use_fbcode_metadata: false,
+            request_metadata_tool_name: DEFAULT_REQUEST_METADATA_TOOL_NAME.to_owned(),
             max_concurrent_uploads_per_action: None,
             cas_ttl_secs: 0,
             remote_cache_chunking: false,
