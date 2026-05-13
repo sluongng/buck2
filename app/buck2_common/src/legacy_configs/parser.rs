@@ -204,7 +204,11 @@ impl LegacyConfigParser {
                 v.values.iter().map(|(key, value)| buck2_data::ConfigValue {
                     section: k.to_owned(),
                     key: key.to_owned(),
-                    value: value.raw_value().to_owned(),
+                    value: if is_sensitive_config_value(k, key) {
+                        "<redacted>".to_owned()
+                    } else {
+                        value.raw_value().to_owned()
+                    },
                     cell: None,
                     is_cli,
                 })
@@ -218,6 +222,22 @@ impl LegacyConfigParser {
             .for_each(|o| parser.join(&o.parse_state));
         parser
     }
+}
+
+fn is_sensitive_config_value(section: &str, key: &str) -> bool {
+    let section = section.to_ascii_lowercase();
+    let key = key.to_ascii_lowercase();
+    section.contains("credential")
+        || section.contains("secret")
+        || section.contains("token")
+        || key.contains("credential")
+        || key.contains("password")
+        || key.contains("secret")
+        || key.contains("token")
+        || key.contains("api_key")
+        || key.contains("api-key")
+        || key == "header"
+        || key == "http_headers"
 }
 
 impl<'p> LegacyConfigFileParser<'p> {

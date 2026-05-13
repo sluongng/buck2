@@ -1,0 +1,67 @@
+load(
+    ":defs.bzl",
+    "BUILDBUDDY_DEFAULT_CONTAINER_IMAGE",
+    "buildbuddy_remote_execution_platform",
+    "buildbuddy_remote_execution_platforms",
+)
+
+oncall("build_infra")
+
+buildbuddy_remote_execution_platforms(
+    name = "buildbuddy-rbe",
+    platforms = [
+        ":buildbuddy-rbe-linux-x86_64",
+        ":buildbuddy-rbe-linux-arm64",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+buildbuddy_remote_execution_platform(
+    name = "buildbuddy-rbe-linux-x86_64",
+    arch = "amd64",
+    container_image = BUILDBUDDY_DEFAULT_CONTAINER_IMAGE,
+    cpu_configuration = "prelude//cpu:x86_64",
+    network = "external",
+    os_configuration = "prelude//os:linux",
+    os_family = "Linux",
+    visibility = ["PUBLIC"],
+)
+
+buildbuddy_remote_execution_platform(
+    name = "buildbuddy-rbe-linux-arm64",
+    arch = "arm64",
+    container_image = BUILDBUDDY_DEFAULT_CONTAINER_IMAGE,
+    cpu_configuration = "prelude//cpu:arm64",
+    network = "external",
+    os_configuration = "prelude//os:linux",
+    os_family = "Linux",
+    visibility = ["PUBLIC"],
+)
+
+buildbuddy_remote_execution_platform(
+    name = "buildbuddy-rbe-macos-x86_64",
+    container_image = "none",
+    cpu_configuration = "prelude//cpu:x86_64",
+    os_configuration = "prelude//os:macos",
+    os_family = "Darwin",
+    visibility = ["PUBLIC"],
+)
+
+buildbuddy_remote_execution_platform(
+    name = "buildbuddy-rbe-macos-arm64",
+    arch = "arm64",
+    container_image = "none",
+    cpu_configuration = "prelude//cpu:arm64",
+    os_configuration = "prelude//os:macos",
+    os_family = "Darwin",
+    visibility = ["PUBLIC"],
+)
+
+buildbuddy_remote_execution_platform(
+    name = "buildbuddy-rbe-windows-x86_64",
+    cpu_configuration = "prelude//cpu:x86_64",
+    os_configuration = "prelude//os:windows",
+    os_family = "Windows",
+    use_windows_path_separators = True,
+    visibility = ["PUBLIC"],
+)

@@ -42,6 +42,9 @@ Keys supported include:
   interpolation syntax ($VAR). They will be substituted before reading the file.
 - `instance_name` - an instance name to pass on execution, action cache, and CAS
   requests.
+- `request_metadata_tool_name` - optional override for
+  `RequestMetadata.tool_details.tool_name` in the Bazel remote execution request
+  metadata. This defaults to `buck2`.
 - `capabilities` - whether Buck2 should query the RE capabilities service. This
   defaults to enabled.
 - `max_total_batch_size` - optional client-side cap for cumulative blob size in

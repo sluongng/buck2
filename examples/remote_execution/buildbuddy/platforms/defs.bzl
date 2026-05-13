@@ -12,9 +12,9 @@ def _platforms(ctx):
         values = {},
     )
 
-    # This is the default image used in BuildBuddy SaaS executor.
-    # This one is Ubuntu 22.04 (i.e. its current LTS release): https://hub.docker.com/_/ubuntu
-    image = "docker://gcr.io/flame-public/rbe-ubuntu20-04:latest"
+    # This can be any Docker image. Use a pinned digest for reproducibility.
+    # This one is Ubuntu 24.04: https://hub.docker.com/_/ubuntu
+    image = "docker://ubuntu@sha256:cd1dba651b3080c3686ecf4e3c4220f026b521fb76978881737d24f200828b2b"
     platform = ExecutionPlatformInfo(
         label = ctx.label.raw_target(),
         configuration = configuration,
