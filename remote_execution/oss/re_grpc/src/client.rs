@@ -127,6 +127,7 @@ const DEFAULT_RETRIES: usize = 5;
 const GRPC_RETRY_INITIAL_DELAY_MILLIS: u64 = 100;
 const DEFAULT_RETRY_MAX_DELAY_MILLIS: u64 = 5000;
 const GRPC_RETRY_JITTER: f64 = 0.1;
+const DEFAULT_REQUEST_METADATA_TOOL_NAME: &str = "buck2";
 const DEFAULT_GRPC_REQUEST_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_FAST_CDC_2020_AVG_CHUNK_SIZE: u64 = 512 * 1024;
@@ -522,6 +523,8 @@ pub struct RERuntimeOpts {
     grpc_request_timeout: Duration,
     /// Maximum time a ByteStream download may make no read progress.
     bytestream_progress_timeout: Duration,
+    /// RequestMetadata.tool_details.tool_name value for OSS RE API requests.
+    request_metadata_tool_name: String,
     /// Digest function selected from user config and capabilities for download hash validation.
     download_hash_digest_function: Option<digest_function::Value>,
     /// Digest functions selected from daemon config for RE request fields.
@@ -880,6 +883,20 @@ fn validate_remote_cache_chunking_enabled(
         "remote_cache_chunking requires FastCDC 2020 parameters from the remote server"
     );
     Ok(())
+}
+
+fn request_metadata_tool_name_from_options(
+    opts: &Buck2OssReConfiguration,
+) -> anyhow::Result<String> {
+    let request_metadata_tool_name = opts
+        .request_metadata_tool_name
+        .clone()
+        .unwrap_or_else(|| DEFAULT_REQUEST_METADATA_TOOL_NAME.to_owned());
+    anyhow::ensure!(
+        !request_metadata_tool_name.is_empty(),
+        "request_metadata_tool_name must not be empty"
+    );
+    Ok(request_metadata_tool_name)
 }
 
 fn digest_blob(data: &[u8], digest_function: digest_function::Value) -> anyhow::Result<TDigest> {
@@ -1456,6 +1473,7 @@ impl REClientBuilder {
             opts.bytestream_progress_timeout_secs
                 .unwrap_or(DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS),
         );
+        let request_metadata_tool_name = request_metadata_tool_name_from_options(opts)?;
 
         let capabilities = if opts.capabilities.unwrap_or(true) {
             Self::fetch_rbe_capabilities(
@@ -1594,6 +1612,7 @@ impl REClientBuilder {
                 retry_max_delay_ms,
                 grpc_request_timeout,
                 bytestream_progress_timeout,
+                request_metadata_tool_name,
                 download_hash_digest_function,
                 request_digest_function_config,
                 remote_cache_chunking: opts.remote_cache_chunking,
@@ -2297,6 +2316,7 @@ async fn execute_stream(
     client: ExecutionClient<GrpcService>,
     metadata: RemoteExecutionMetadata,
     use_fbcode_metadata: bool,
+    request_metadata_tool_name: String,
     request: GExecuteRequest,
     retries: usize,
     retry_max_delay: Duration,
@@ -2305,6 +2325,7 @@ async fn execute_stream(
     retry_grpc_request(retries, retry_max_delay, || {
         let mut client = client.clone();
         let metadata = metadata.clone();
+        let request_metadata_tool_name = request_metadata_tool_name.clone();
         let request = request.clone();
         async move {
             Ok(client
@@ -2312,6 +2333,7 @@ async fn execute_stream(
                     request,
                     metadata,
                     use_fbcode_metadata,
+                    request_metadata_tool_name.as_str(),
                     grpc_request_timeout,
                 ))
                 .await?
@@ -2325,6 +2347,7 @@ async fn wait_execution_stream(
     client: ExecutionClient<GrpcService>,
     metadata: RemoteExecutionMetadata,
     use_fbcode_metadata: bool,
+    request_metadata_tool_name: String,
     operation_name: String,
     retries: usize,
     retry_max_delay: Duration,
@@ -2333,6 +2356,7 @@ async fn wait_execution_stream(
     retry_grpc_request(retries, retry_max_delay, || {
         let mut client = client.clone();
         let metadata = metadata.clone();
+        let request_metadata_tool_name = request_metadata_tool_name.clone();
         let operation_name = operation_name.clone();
         async move {
             Ok(client
@@ -2342,6 +2366,7 @@ async fn wait_execution_stream(
                     },
                     metadata,
                     use_fbcode_metadata,
+                    request_metadata_tool_name.as_str(),
                     grpc_request_timeout,
                 ))
                 .await?
@@ -2355,6 +2380,7 @@ async fn wait_execution_or_retry_execute(
     client: ExecutionClient<GrpcService>,
     metadata: RemoteExecutionMetadata,
     use_fbcode_metadata: bool,
+    request_metadata_tool_name: String,
     operation_name: String,
     execute_request: GExecuteRequest,
     execute_retry_attempts: usize,
@@ -2367,6 +2393,7 @@ async fn wait_execution_or_retry_execute(
         client.clone(),
         metadata.clone(),
         use_fbcode_metadata,
+        request_metadata_tool_name.clone(),
         operation_name.clone(),
         retries,
         retry_max_delay,
@@ -2393,6 +2420,7 @@ async fn wait_execution_or_retry_execute(
                 client,
                 metadata,
                 use_fbcode_metadata,
+                request_metadata_tool_name,
                 execute_request,
                 retries,
                 retry_max_delay,
@@ -2516,6 +2544,7 @@ impl REClient {
                 },
                 metadata,
                 self.runtime_opts.use_fbcode_metadata,
+                self.runtime_opts.request_metadata_tool_name.as_str(),
                 self.runtime_opts.grpc_request_timeout,
             ))
             .await
@@ -2583,6 +2612,7 @@ impl REClient {
                             },
                             metadata,
                             self.runtime_opts.use_fbcode_metadata,
+                            self.runtime_opts.request_metadata_tool_name.as_str(),
                             self.runtime_opts.grpc_request_timeout,
                         ))
                         .await?;
@@ -2635,6 +2665,7 @@ impl REClient {
                             },
                             metadata,
                             self.runtime_opts.use_fbcode_metadata,
+                            self.runtime_opts.request_metadata_tool_name.as_str(),
                             self.runtime_opts.grpc_request_timeout,
                         ))
                         .await?;
@@ -2689,10 +2720,12 @@ impl REClient {
 
         let execution_client = self.execution_client().await?;
         let grpc_request_timeout = self.runtime_opts.grpc_request_timeout;
+        let request_metadata_tool_name = self.runtime_opts.request_metadata_tool_name.clone();
         let stream = execute_stream(
             execution_client.clone(),
             metadata.clone(),
             self.runtime_opts.use_fbcode_metadata,
+            request_metadata_tool_name.clone(),
             grpc_request.clone(),
             self.runtime_opts.retries,
             Duration::from_millis(self.runtime_opts.retry_max_delay_ms),
@@ -2712,6 +2745,7 @@ impl REClient {
                 let execution_client = execution_client.clone();
                 let metadata = metadata_for_wait_execution.clone();
                 let grpc_request = grpc_request_for_retry.clone();
+                let request_metadata_tool_name = request_metadata_tool_name.clone();
                 async move {
                     loop {
                         let msg = loop {
@@ -2736,6 +2770,7 @@ impl REClient {
                                         execution_client.clone(),
                                         metadata.clone(),
                                         use_fbcode_metadata,
+                                        request_metadata_tool_name.clone(),
                                         name,
                                         grpc_request.clone(),
                                         execute_retry_attempts,
@@ -2772,6 +2807,7 @@ impl REClient {
                                             execution_client.clone(),
                                             metadata.clone(),
                                             use_fbcode_metadata,
+                                            request_metadata_tool_name.clone(),
                                             grpc_request.clone(),
                                             retries,
                                             retry_max_delay,
@@ -2796,6 +2832,7 @@ impl REClient {
                                         execution_client.clone(),
                                         metadata.clone(),
                                         use_fbcode_metadata,
+                                        request_metadata_tool_name.clone(),
                                         name,
                                         grpc_request.clone(),
                                         execute_retry_attempts,
@@ -2838,6 +2875,7 @@ impl REClient {
                                             execution_client.clone(),
                                             metadata.clone(),
                                             use_fbcode_metadata,
+                                            request_metadata_tool_name.clone(),
                                             grpc_request.clone(),
                                             retries,
                                             retry_max_delay,
@@ -2876,6 +2914,7 @@ impl REClient {
                                             execution_client.clone(),
                                             metadata.clone(),
                                             use_fbcode_metadata,
+                                            request_metadata_tool_name.clone(),
                                             grpc_request.clone(),
                                             retries,
                                             retry_max_delay,
@@ -3021,6 +3060,7 @@ impl REClient {
                                         re_request,
                                         metadata,
                                         self.runtime_opts.use_fbcode_metadata,
+                                        self.runtime_opts.request_metadata_tool_name.as_str(),
                                         self.runtime_opts.grpc_request_timeout,
                                     ))
                                     .await?;
@@ -3062,6 +3102,7 @@ impl REClient {
                                         futures::stream::iter(segments),
                                         metadata,
                                         self.runtime_opts.use_fbcode_metadata,
+                                        self.runtime_opts.request_metadata_tool_name.as_str(),
                                         self.runtime_opts.grpc_request_timeout,
                                     ))
                                     .await?;
@@ -3415,6 +3456,7 @@ impl REClient {
                             },
                             metadata,
                             self.runtime_opts.use_fbcode_metadata,
+                            self.runtime_opts.request_metadata_tool_name.as_str(),
                             self.runtime_opts.grpc_request_timeout,
                         ))
                         .await
@@ -3485,6 +3527,7 @@ impl REClient {
                             },
                             metadata,
                             self.runtime_opts.use_fbcode_metadata,
+                            self.runtime_opts.request_metadata_tool_name.as_str(),
                             self.runtime_opts.grpc_request_timeout,
                         ))
                         .await
@@ -3556,6 +3599,7 @@ impl REClient {
                                         re_request,
                                         metadata,
                                         self.runtime_opts.use_fbcode_metadata,
+                                        self.runtime_opts.request_metadata_tool_name.as_str(),
                                         self.runtime_opts.grpc_request_timeout,
                                     ))
                                     .await?;
@@ -3585,6 +3629,7 @@ impl REClient {
                                         read_request,
                                         metadata,
                                         self.runtime_opts.use_fbcode_metadata,
+                                        self.runtime_opts.request_metadata_tool_name.as_str(),
                                     ))
                                     .await?
                                     .into_inner();
@@ -3941,6 +3986,7 @@ impl REClient {
                                     },
                                     metadata,
                                     self.runtime_opts.use_fbcode_metadata,
+                                    self.runtime_opts.request_metadata_tool_name.as_str(),
                                     self.runtime_opts.grpc_request_timeout,
                                 ))
                                 .await?;
@@ -5199,6 +5245,7 @@ fn with_re_metadata<T>(
     t: T,
     metadata: RemoteExecutionMetadata,
     use_fbcode_metadata: bool,
+    request_metadata_tool_name: &str,
 ) -> tonic::Request<T> {
     // This creates a new Tonic request with attached metadata for the RE
     // backend. There are two cases here we need to support:
@@ -5283,7 +5330,7 @@ fn with_re_metadata<T>(
 
         RequestMetadata {
             tool_details: Some(ToolDetails {
-                tool_name: "buck2".to_owned(),
+                tool_name: request_metadata_tool_name.to_owned(),
                 tool_version,
             }),
             action_id: action_id.unwrap_or_default(),
@@ -5308,9 +5355,11 @@ fn with_re_metadata_timeout<T>(
     t: T,
     metadata: RemoteExecutionMetadata,
     use_fbcode_metadata: bool,
+    request_metadata_tool_name: &str,
     timeout: Duration,
 ) -> tonic::Request<T> {
-    let mut request = with_re_metadata(t, metadata, use_fbcode_metadata);
+    let mut request =
+        with_re_metadata(t, metadata, use_fbcode_metadata, request_metadata_tool_name);
     request.set_timeout(timeout);
     request
 }
