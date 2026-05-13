@@ -466,6 +466,8 @@ pub struct Buck2OssReConfiguration {
     pub instance_name: Option<String>,
     /// Use the Meta version of the request metadata
     pub use_fbcode_metadata: bool,
+    /// Optional override for RequestMetadata.tool_details.tool_name.
+    pub request_metadata_tool_name: Option<String>,
     /// The max size for a GRPC message to be decoded.
     pub max_decoding_message_size: Option<usize>,
     /// The max cumulative blob size for batch CAS methods.
@@ -593,6 +595,10 @@ impl Buck2OssReConfiguration {
                     property: "use_fbcode_metadata",
                 })?
                 .unwrap_or(false),
+            request_metadata_tool_name: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "request_metadata_tool_name",
+            })?,
             max_decoding_message_size: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "max_decoding_message_size",
@@ -699,6 +705,30 @@ mod tests {
         let config = Buck2OssReConfiguration::from_legacy_config(&legacy_config, Vec::new())?;
 
         assert_eq!(config.remote_cache_compression_threshold, Some(100));
+        Ok(())
+    }
+
+    #[test]
+    fn oss_config_parses_request_metadata_tool_name() -> buck2_error::Result<()> {
+        let legacy_config = parse(
+            &[(
+                "config",
+                "[buck2_re_client]\nrequest_metadata_tool_name = bazel\n",
+            )],
+            "config",
+        )?;
+        let config = Buck2OssReConfiguration::from_legacy_config(&legacy_config, Vec::new())?;
+
+        assert_eq!(config.request_metadata_tool_name.as_deref(), Some("bazel"));
+        Ok(())
+    }
+
+    #[test]
+    fn oss_config_leaves_request_metadata_tool_name_unset_by_default() -> buck2_error::Result<()> {
+        let legacy_config = parse(&[("config", "")], "config")?;
+        let config = Buck2OssReConfiguration::from_legacy_config(&legacy_config, Vec::new())?;
+
+        assert_eq!(config.request_metadata_tool_name, None);
         Ok(())
     }
 }
