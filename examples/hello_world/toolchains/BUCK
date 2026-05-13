@@ -1,7 +1,20 @@
-load("@prelude//toolchains:demo.bzl", "system_demo_toolchains")
+load("@prelude//toolchains:cxx.bzl", "system_cxx_toolchain")
+load("@prelude//toolchains:python.bzl", "system_python_bootstrap_toolchain")
 
 oncall("build_infra")
 
-# All the default toolchains, suitable for a quick demo or early prototyping.
-# Most real projects should copy/paste the implementation to configure them.
-system_demo_toolchains()
+system_cxx_toolchain(
+    name = "cxx",
+    archiver = "/usr/bin/ar",
+    compiler = "/usr/bin/gcc",
+    compiler_type = "gcc",
+    cxx_compiler = "/usr/bin/g++",
+    linker = "g++",
+    visibility = ["PUBLIC"],
+)
+
+system_python_bootstrap_toolchain(
+    name = "python_bootstrap",
+    interpreter = "python3",
+    visibility = ["PUBLIC"],
+)
