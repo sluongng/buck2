@@ -48,7 +48,45 @@ def archive_type(url_or_path: str, typ: str | None) -> str:
 #
 # 1. The cmd_args with the unarchive command
 # 2. A bool indicating whether the prefix still needs to be stripped (in cases where the tool used to uncompress does not support this feature).
-def _unarchive_cmd(ext_type: str, archive: Artifact, strip_prefix: [str, None]) -> (cmd_args, bool):
+def _unarchive_cmd(
+        ext_type: str,
+        exec_is_windows: bool,
+        archive,
+        strip_prefix: [str, None]) -> (cmd_args, bool):
+    if exec_is_windows:
+        # So many hacks.
+        if ext_type == "tar.zst":
+            # tar that ships with windows is bsdtar
+            # bsdtar seems to not properly interop with zstd and hangs instead of
+            # exiting with an error. Manually decompressing with zstd and piping to
+            # tar seems to work fine though.
+            return cmd_args(
+                "zstd",
+                "-d",
+                archive,
+                "--stdout",
+                "|",
+                "%WINDIR%\\System32\\tar.exe",
+                "-x",
+                "-P",
+                "-f",
+                "-",
+                _tar_strip_prefix_flags(strip_prefix),
+            ), False
+        elif ext_type == "zip":
+            # unzip and zip are not cli commands available on windows. however, the
+            # bsdtar that ships with windows has builtin support for zip
+            return cmd_args(
+                "%WINDIR%\\System32\\tar.exe",
+                "-x",
+                "-P",
+                "-f",
+                archive,
+                _tar_strip_prefix_flags(strip_prefix),
+            ), False
+
+        # Else hope for the best
+
     if ext_type in _TAR_FLAGS:
         return cmd_args(
             "tar",
@@ -113,18 +151,26 @@ def _windows_unpack_ps1(out: OutputArtifact, archive: Artifact, ext_type: str, s
         fail("unsupported archive type on Windows: {}".format(ext_type))
 
 def unarchive(
-    ctx: AnalysisContext,
-    archive: Artifact,
-    output_name: str,
-    ext_type,
-    excludes,
-    strip_prefix,
-    exec_deps: HttpArchiveExecDeps,
-    prefer_local: bool,
-    sub_targets: list[str] | dict[str, list[str]],
-    has_content_based_path: bool = False,
-):
+        ctx: AnalysisContext,
+        archive: Artifact | None,
+        download_urls: list[str],
+        output_name: str,
+        ext_type,
+        excludes,
+        remote_download: bool,
+        sha1: str | None,
+        sha256: str | None,
+        size_bytes: int | None,
+        strip_prefix,
+        exec_deps: HttpArchiveExecDeps,
+        prefer_local: bool,
+        sub_targets: list[str] | dict[str, list[str]],
+        has_content_based_path: bool = False):
     exec_is_windows = exec_deps.exec_os_type[OsLookup].os == Os("windows")
+    if remote_download and exec_is_windows:
+        fail("remote_download is not supported for Windows http_archive actions")
+    if remote_download and excludes:
+        fail("remote_download does not support excludes")
 
     # The excludes listing runs `tar --list` and redirects it to a file; keep it
     # in the shell whose redirect writes raw bytes (cmd on Windows, sh else).
@@ -187,18 +233,39 @@ def unarchive(
         exclude_flags.append(cmd_args(exclusions, format = "--exclude-from={}"))
         exclude_hidden.append(exclusions)
 
-    unarchive_cmd = None  # unused on Windows (see _windows_unpack_ps1)
-    if exec_is_windows:
-        needs_strip_prefix = False
-        unpack_ext = "ps1"
-        unpack_interpreter = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]
-    else:
-        unarchive_cmd, needs_strip_prefix = _unarchive_cmd(ext_type, archive, strip_prefix)
-        unpack_ext = "sh"
-        unpack_interpreter = ["/bin/sh"]
+    archive_path = "__downloaded_archive." + ext_type if remote_download else archive
+    unarchive_cmd, needs_strip_prefix = _unarchive_cmd(ext_type, exec_is_windows, archive_path, strip_prefix)
 
     output = ctx.actions.declare_output(output_name, dir = True, has_content_based_path = has_content_based_path)
     script_output = ctx.actions.declare_output(output_name + "_tmp", dir = True, has_content_based_path = False) if needs_strip_prefix else output
+    download = []
+    if remote_download:
+        download = [
+            "archive=\"{}\"".format(archive_path),
+            "downloaded=\"\"",
+            "for url in \"$@\"; do",
+            "  if curl -fsSL \"$url\" -o \"$archive\"; then",
+            "    downloaded=1",
+            "    break",
+            "  fi",
+            "done",
+            "if [ -z \"$downloaded\" ]; then",
+            "  echo \"failed to download archive\" >&2",
+            "  exit 1",
+            "fi",
+        ]
+        if sha256 != None:
+            download.append("echo \"{}  $archive\" | sha256sum -c -".format(sha256))
+        if sha1 != None:
+            download.append("echo \"{}  $archive\" | sha1sum -c -".format(sha1))
+        if size_bytes != None:
+            download.extend([
+                "actual_size=$(wc -c < \"$archive\" | tr -d ' ')",
+                "if [ \"$actual_size\" != \"{}\" ]; then".format(size_bytes),
+                "  echo \"archive size mismatch: expected {}, got $actual_size\" >&2".format(size_bytes),
+                "  exit 1",
+                "fi",
+            ])
 
     if exec_is_windows:
         script_lines = _windows_unpack_ps1(script_output.as_output(), archive, ext_type, strip_prefix, exclude_flags)
@@ -206,12 +273,9 @@ def unarchive(
         script_lines = [
             cmd_args(script_output.as_output(), format = "mkdir -p {}"),
             cmd_args(script_output.as_output(), format = "cd {}"),
+        ] + download + [
             cmd_args([unarchive_cmd] + exclude_flags, delimiter = " ", relative_to = script_output.as_output()),
-        ]
-
-    script, _ = ctx.actions.write(
-        "{}_unpack.{}".format(output_name, unpack_ext),
-        script_lines,
+        ] + (["rm -f \"$archive\""] if remote_download else []),
         is_executable = True,
         allow_args = True,
         has_content_based_path = False,
@@ -219,12 +283,13 @@ def unarchive(
 
     ctx.actions.run(
         cmd_args(
-            unpack_interpreter + [script],
-            hidden = exclude_hidden + [archive, script_output.as_output()],
+            interpreter + [script] + download_urls,
+            hidden = exclude_hidden + ([archive] if archive != None else []) + [script_output.as_output()],
         ),
         category = "http_archive",
         identifier = output_name,
         prefer_local = prefer_local,
+        prefer_remote = remote_download,
     )
 
     if needs_strip_prefix:

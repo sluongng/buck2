@@ -1,11 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
-# This source code is dual-licensed under either the MIT license found in the
-# LICENSE-MIT file in the root directory of this source tree or the Apache
-# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
-# of this source tree. You may select, at your option, one of the
-# above-listed licenses.
-
 load("@prelude//rust:rust_toolchain.bzl", "PanicRuntime", "RustToolchainInfo")
 
 _RUST_STATIC_DIST = "https://static.rust-lang.org/dist"
@@ -22,9 +14,6 @@ _DEFAULT_TRIPLE = select({
     }),
     "prelude//os:windows": select({
         "prelude//cpu:arm64": select({
-            # Rustup's default ABI for the host on Windows is MSVC, not GNU.
-            # When you do `rustup install stable` that's the one you get. It
-            # makes you opt in to GNU by `rustup install stable-gnu`.
             "DEFAULT": "aarch64-pc-windows-msvc",
             "prelude//abi:gnu": "aarch64-pc-windows-gnu",
             "prelude//abi:msvc": "aarch64-pc-windows-msvc",
@@ -52,9 +41,6 @@ def _parse_rust_toolchain(contents):
         if not line:
             continue
 
-        # Support the non-TOML rust-toolchain format:
-        #
-        #   nightly-2026-02-28
         if "=" not in line and not line.startswith("["):
             channel = _strip_quotes(line)
             continue
@@ -76,8 +62,6 @@ def _parse_rust_toolchain(contents):
     return struct(channel = channel, components = components)
 
 def _channel_manifest_url(base_url, channel):
-    # Rustup channels like `nightly-2026-02-28` use the dated dist path but
-    # still fetch `channel-rust-nightly.toml`.
     if channel.startswith("nightly-"):
         date = channel[len("nightly-"):]
         if len(date) == 10:
@@ -139,91 +123,6 @@ def _manifest_package(manifest, package, triple):
             return struct(url = url, sha256 = sha256)
 
     fail("Rust package `{}` is not listed for `{}`".format(package, triple))
-
-def _sanitize_output_name(value):
-    return value.replace("*", "all").replace("-", "_").replace(".", "_")
-
-_COMMON_ATTRS = {
-    "allow_lints": attrs.list(attrs.string(), default = []),
-    "clippy_toml": attrs.option(attrs.dep(providers = [DefaultInfo]), default = None),
-    "default_edition": attrs.option(attrs.string(), default = None),
-    "deny_lints": attrs.list(attrs.string(), default = []),
-    "doctests": attrs.bool(default = False),
-    "nightly_features": attrs.bool(default = False),
-    "report_unused_deps": attrs.bool(default = False),
-    "rustc_binary_flags": attrs.list(attrs.arg(), default = []),
-    "rustc_flags": attrs.list(attrs.arg(), default = []),
-    "rustc_target_triple": attrs.string(default = _DEFAULT_TRIPLE),
-    "rustc_test_flags": attrs.list(attrs.arg(), default = []),
-    "rustdoc_flags": attrs.list(attrs.arg(), default = []),
-    "warn_lints": attrs.list(attrs.string(), default = []),
-}
-
-def _rust_toolchain_info(ctx, compiler: RunInfo, clippy_driver: RunInfo, rustdoc: RunInfo, sysroot_path: Artifact | None = None) -> RustToolchainInfo:
-    return RustToolchainInfo(
-        allow_lints = ctx.attrs.allow_lints,
-        clippy_driver = clippy_driver,
-        clippy_toml = ctx.attrs.clippy_toml[DefaultInfo].default_outputs[0] if ctx.attrs.clippy_toml else None,
-        compiler = compiler,
-        default_edition = ctx.attrs.default_edition,
-        panic_runtime = PanicRuntime("unwind"),
-        deny_lints = ctx.attrs.deny_lints,
-        doctests = ctx.attrs.doctests,
-        nightly_features = ctx.attrs.nightly_features,
-        report_unused_deps = ctx.attrs.report_unused_deps,
-        rustc_binary_flags = ctx.attrs.rustc_binary_flags,
-        rustc_flags = ctx.attrs.rustc_flags,
-        rustc_target_triple = ctx.attrs.rustc_target_triple,
-        rustc_test_flags = ctx.attrs.rustc_test_flags,
-        rustdoc = rustdoc,
-        rustdoc_flags = ctx.attrs.rustdoc_flags,
-        sysroot_path = sysroot_path,
-        warn_lints = ctx.attrs.warn_lints,
-    )
-
-def _system_rust_toolchain_impl(ctx):
-    return [
-        DefaultInfo(),
-        _rust_toolchain_info(
-            ctx,
-            compiler = RunInfo(args = ctx.attrs.compiler),
-            clippy_driver = RunInfo(args = ctx.attrs.clippy_driver),
-            rustdoc = RunInfo(args = ctx.attrs.rustdoc),
-        ),
-    ]
-
-system_rust_toolchain = rule(
-    impl = _system_rust_toolchain_impl,
-    attrs = _COMMON_ATTRS | {
-        "clippy_driver": attrs.list(attrs.string(), default = ["clippy-driver"]),
-        "compiler": attrs.list(attrs.string(), default = ["rustc"]),
-        "rustdoc": attrs.list(attrs.string(), default = ["rustdoc"]),
-    },
-    is_toolchain_rule = True,
-)
-
-def _rust_toolchain_impl(ctx):
-    return [
-        DefaultInfo(),
-        _rust_toolchain_info(
-            ctx,
-            compiler = ctx.attrs.compiler[RunInfo],
-            clippy_driver = ctx.attrs.clippy_driver[RunInfo],
-            rustdoc = ctx.attrs.rustdoc[RunInfo],
-            sysroot_path = ctx.attrs.sysroot,
-        ),
-    ]
-
-rust_toolchain = rule(
-    impl = _rust_toolchain_impl,
-    attrs = _COMMON_ATTRS | {
-        "clippy_driver": attrs.exec_dep(providers = [RunInfo]),
-        "compiler": attrs.exec_dep(providers = [RunInfo]),
-        "rustdoc": attrs.exec_dep(providers = [RunInfo]),
-        "sysroot": attrs.source(allow_directory = True),
-    },
-    is_toolchain_rule = True,
-)
 
 def _downloaded_rust_toolchain_impl(ctx):
     rust_toolchain_file = ctx.attrs.rust_toolchain
@@ -339,12 +238,12 @@ def _downloaded_rust_toolchain_impl(ctx):
                 "rustdoc": [DefaultInfo(default_output = rustdoc)],
             },
         ),
-        _rust_toolchain_info(
-            ctx,
-            # Rust tools load shared libraries from sibling directories at
-            # runtime, so remote actions need the whole toolchain tree.
+        RustToolchainInfo(
             compiler = RunInfo(args = cmd_args(rustc, hidden = toolchain)),
             clippy_driver = RunInfo(args = cmd_args(clippy_driver, hidden = toolchain)),
+            default_edition = ctx.attrs.default_edition,
+            panic_runtime = PanicRuntime("unwind"),
+            rustc_target_triple = ctx.attrs.rustc_target_triple,
             rustdoc = RunInfo(args = cmd_args(rustdoc, hidden = toolchain)),
             sysroot_path = toolchain,
         ),
@@ -352,16 +251,18 @@ def _downloaded_rust_toolchain_impl(ctx):
 
 downloaded_rust_toolchain = rule(
     impl = _downloaded_rust_toolchain_impl,
-    attrs = _COMMON_ATTRS | {
+    attrs = {
         "base_components": attrs.list(attrs.string(), default = ["rustc", "rust-std", "cargo"]),
         "base_url": attrs.string(default = _RUST_STATIC_DIST),
         "binary_suffix": attrs.string(default = select({
             "DEFAULT": "",
             "prelude//os:windows": ".exe",
         })),
+        "default_edition": attrs.option(attrs.string(), default = None),
         "extra_components": attrs.list(attrs.string(), default = ["clippy"]),
         "rust_toolchain": attrs.source(),
         "rustc_host_triple": attrs.string(default = _DEFAULT_TRIPLE),
+        "rustc_target_triple": attrs.string(default = _DEFAULT_TRIPLE),
     },
     is_toolchain_rule = True,
 )
