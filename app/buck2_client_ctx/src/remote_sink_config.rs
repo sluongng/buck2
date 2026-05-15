@@ -21,6 +21,7 @@ struct BuckconfigBesSettings {
     bes_headers: Vec<(String, String)>,
     bes_event_format: Option<BesEventFormat>,
     bazel_artifact_upload: Option<bool>,
+    upload_successful_action_events: Option<bool>,
     bazel_artifact_upload_backend: Option<String>,
     bazel_artifact_upload_instance_name: Option<String>,
     bazel_artifact_uri_authority: Option<String>,
@@ -44,6 +45,10 @@ pub fn with_buckconfig_overrides(
             }
             if let Some(bazel_artifact_upload) = settings.bazel_artifact_upload {
                 config.bazel_artifact_upload = bazel_artifact_upload;
+            }
+            if let Some(upload_successful_action_events) = settings.upload_successful_action_events
+            {
+                config.upload_successful_action_events = upload_successful_action_events;
             }
             if let Some(backend) = settings.bazel_artifact_upload_backend {
                 config.bazel_artifact_upload_backend = Some(backend);
@@ -109,6 +114,7 @@ fn read_buckconfig_bes_settings(
             bes_headers: Vec::new(),
             bes_event_format: None,
             bazel_artifact_upload: None,
+            upload_successful_action_events: None,
             bazel_artifact_upload_backend: None,
             bazel_artifact_upload_instance_name: None,
             bazel_artifact_uri_authority: None,
@@ -157,6 +163,10 @@ fn read_buckconfig_bes_settings(
         bazel_artifact_upload: root_config.parse::<bool>(BuckconfigKeyRef {
             section: "bes",
             property: "bazel_artifact_upload",
+        })?,
+        upload_successful_action_events: root_config.parse::<bool>(BuckconfigKeyRef {
+            section: "bes",
+            property: "upload_successful_action_events",
         })?,
         bazel_artifact_upload_backend: root_config
             .get(BuckconfigKeyRef {
