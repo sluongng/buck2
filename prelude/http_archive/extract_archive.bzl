@@ -20,12 +20,17 @@ def _impl(ctx: AnalysisContext) -> list[Provider]:
     output, sub_targets = unarchive(
         ctx,
         archive = ctx.attrs.src,
+        download_urls = [],
         output_name = value_or(
             value_or(ctx.attrs.out, ctx.attrs.directory_name),
             ctx.label.name,
         ),
         ext_type = archive_type(ctx.attrs.src.short_path, ctx.attrs.type),
         excludes = ctx.attrs.excludes,
+        remote_download = False,
+        sha1 = None,
+        sha256 = None,
+        size_bytes = None,
         strip_prefix = ctx.attrs.strip_prefix,
         sub_targets = ctx.attrs.sub_targets,
         exec_deps = ctx.attrs.exec_deps[HttpArchiveExecDeps],
