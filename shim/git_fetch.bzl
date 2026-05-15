@@ -1,14 +1,6 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
-# This source code is dual-licensed under either the MIT license found in the
-# LICENSE-MIT file in the root directory of this source tree or the Apache
-# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
-# of this source tree. You may select, at your option, one of the
-# above-listed licenses.
-
 _HEX_DIGITS = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"]
 
-def _is_hex(rev: str, *, length: int) -> bool:
+def _is_hex(rev, length):
     if len(rev) != length:
         return False
     for digit in rev.elems():
@@ -16,7 +8,7 @@ def _is_hex(rev: str, *, length: int) -> bool:
             return False
     return True
 
-def git_fetch_impl(ctx: AnalysisContext) -> list[Provider]:
+def _git_fetch_impl(ctx):
     object_format = ctx.attrs.object_format
     rev = ctx.attrs.rev
     if object_format == None:
@@ -53,8 +45,6 @@ def git_fetch_impl(ctx: AnalysisContext) -> list[Provider]:
     ctx.actions.run(
         cmd,
         category = "git_fetch",
-        # Preserve local-first behavior for hybrid executors, but do not require
-        # local execution so remote-only platforms can still run git fetches.
         prefer_local = True,
         allow_cache_upload = ctx.attrs.allow_cache_upload,
     )
@@ -63,5 +53,18 @@ def git_fetch_impl(ctx: AnalysisContext) -> list[Provider]:
         DefaultInfo(
             default_output = work_tree,
             sub_targets = {path: [DefaultInfo(default_output = work_tree.project(path))] for path in ctx.attrs.sub_targets},
-        )
+        ),
     ]
+
+git_fetch = rule(
+    impl = _git_fetch_impl,
+    attrs = {
+        "allow_cache_upload": attrs.bool(default = True),
+        "git": attrs.option(attrs.string(), default = None),
+        "object_format": attrs.option(attrs.enum(["sha1", "sha256"]), default = None),
+        "repo": attrs.string(),
+        "rev": attrs.string(),
+        "sub_targets": attrs.list(attrs.string(), default = []),
+        "_git_fetch_tool": attrs.default_only(attrs.exec_dep(providers = [RunInfo], default = "prelude//git/tools:git_fetch")),
+    },
+)
