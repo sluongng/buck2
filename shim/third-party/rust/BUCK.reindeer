@@ -2,6 +2,7 @@
 
 load("@prelude//rust:cargo_buildscript.bzl", "buildscript_run")
 load("@prelude//rust:cargo_package.bzl", "cargo")
+load("@shim//:git_fetch.bzl", "git_fetch")
 load("@shim//third-party/macros:rust_third_party.bzl", "third_party_rust_prebuilt_cxx_library")
 
 git_fetch(
