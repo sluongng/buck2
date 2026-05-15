@@ -1920,12 +1920,16 @@ impl RemoteExecutionClientImpl {
                                 ..Default::default()
                             },
                         )
+                        // boxed() to segment the future
+                        .boxed()
                         .await,
                 )
                 .await?;
 
                 buck2_error::Ok(ChunkDownloadResult::Downloaded(response.local_cache_stats))
             }
+            // boxed() to segment the future
+            .boxed()
         });
 
         let results: Vec<ChunkDownloadResult> = buck2_util::future::try_join_all(futs).await?;
