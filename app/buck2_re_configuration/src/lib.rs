@@ -470,8 +470,10 @@ pub struct Buck2OssReConfiguration {
     pub use_fbcode_metadata: bool,
     /// The max size for a GRPC message to be decoded.
     pub max_decoding_message_size: Option<usize>,
-    /// The max cumulative blob size for `Read` and `BatchReadBlobs` methods.
+    /// The max cumulative blob size for batch CAS methods.
     pub max_total_batch_size: Option<usize>,
+    /// Minimum blob size for remote cache compression.
+    pub remote_cache_compression_threshold: Option<usize>,
     /// Maximum number of concurrent upload requests for each action.
     pub max_concurrent_uploads_per_action: Option<usize>,
     /// Time that digests are assumed to live in CAS after being touched.
@@ -601,6 +603,10 @@ impl Buck2OssReConfiguration {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "max_total_batch_size",
             })?,
+            remote_cache_compression_threshold: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "remote_cache_compression_threshold",
+            })?,
             max_concurrent_uploads_per_action: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "max_concurrent_uploads_per_action",
@@ -680,6 +686,21 @@ mod tests {
         let config = Buck2OssReConfiguration::from_legacy_config(&legacy_config, Vec::new())?;
 
         assert_eq!(config.engine_connection_count, Some(8));
+        Ok(())
+    }
+
+    #[test]
+    fn oss_config_parses_remote_cache_compression_threshold() -> buck2_error::Result<()> {
+        let legacy_config = parse(
+            &[(
+                "config",
+                "[buck2_re_client]\nremote_cache_compression_threshold = 100\n",
+            )],
+            "config",
+        )?;
+        let config = Buck2OssReConfiguration::from_legacy_config(&legacy_config, Vec::new())?;
+
+        assert_eq!(config.remote_cache_compression_threshold, Some(100));
         Ok(())
     }
 }
