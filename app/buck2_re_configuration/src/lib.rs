@@ -434,6 +434,8 @@ pub struct Buck2OssReConfiguration {
     /// grpc, grpcs, http, https, dns, ipv4, ipv6. If no scheme is provided, TLS is enabled by
     /// default.
     pub engine_address: Option<String>,
+    /// Number of gRPC connections to use for RBE Engine execute requests.
+    pub engine_connection_count: Option<usize>,
     /// Address for RBE Action Cache service. Accepted schemes: grpc, grpcs, http, https, dns,
     /// ipv4, ipv6. If no scheme is provided, TLS is enabled by default.
     pub action_cache_address: Option<String>,
@@ -556,6 +558,10 @@ impl Buck2OssReConfiguration {
                     property: "engine_address",
                 })?
                 .or(default_address.clone()),
+            engine_connection_count: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "engine_connection_count",
+            })?,
             action_cache_address: legacy_config
                 .parse(BuckconfigKeyRef {
                     section: BUCK2_RE_CLIENT_CFG_SECTION,
@@ -665,3 +671,22 @@ impl Buck2OssReConfiguration {
 pub use fbcode::RemoteExecutionStaticMetadata;
 #[cfg(not(fbcode_build))]
 pub use not_fbcode::RemoteExecutionStaticMetadata;
+
+#[cfg(test)]
+mod tests {
+    use buck2_common::legacy_configs::configs::testing::parse;
+
+    use super::*;
+
+    #[test]
+    fn oss_config_parses_engine_connection_count() -> buck2_error::Result<()> {
+        let legacy_config = parse(
+            &[("config", "[buck2_re_client]\nengine_connection_count = 8\n")],
+            "config",
+        )?;
+        let config = Buck2OssReConfiguration::from_legacy_config(&legacy_config, Vec::new())?;
+
+        assert_eq!(config.engine_connection_count, Some(8));
+        Ok(())
+    }
+}
