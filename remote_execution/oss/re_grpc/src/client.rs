@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
@@ -136,6 +137,11 @@ const DEFAULT_GRPC_KEEPALIVE_WHILE_IDLE: bool = false;
 const DEFAULT_GRPC_REQUEST_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_BYTESTREAM_PROGRESS_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_FAST_CDC_2020_AVG_CHUNK_SIZE: u64 = 512 * 1024;
+// Match Bazel's default gRPC remote-execution fanout: roughly 100 requests per
+// connection, with at most 100 connections unless explicitly overridden.
+const DEFAULT_EXECUTION_CONCURRENCY_LIMIT: usize = 400;
+const DEFAULT_ENGINE_REQUESTS_PER_CONNECTION: usize = 100;
+const DEFAULT_MAX_ENGINE_CONNECTION_COUNT: usize = 100;
 
 fn tdigest_to(tdigest: TDigest) -> Digest {
     Digest {
@@ -2028,14 +2034,23 @@ impl REClientBuilder {
             tls_config.clone(),
         );
 
-        let (cas, execution, action_cache, bytestream, capabilities) = futures::future::join5(
+        let (cas, action_cache, bytestream, capabilities) = futures::future::join4(
             cas_connector.connect(),
-            execution_connector.connect(),
             action_cache_connector.connect(),
             bytestream_connector.connect(),
             capabilities_connector.connect(),
         )
         .await;
+
+        let execution_connection_count = configured_connection_count(
+            opts.engine_connection_count,
+            opts.execution_concurrency_limit,
+        );
+        let execution_channels = futures::future::try_join_all(
+            (0..execution_connection_count).map(|_| execution_connector.connect()),
+        )
+        .await
+        .context("Error creating Execution clients")?;
 
         let interceptor = InjectHeadersInterceptor::new(&opts.http_headers)?;
 
@@ -2169,6 +2184,7 @@ impl REClientBuilder {
             local_fast_cdc_chunk_cache_dir = ?local_chunk_cache
                 .as_ref()
                 .map(|cache| cache.root.display().to_string()),
+            execution_connection_count = execution_connection_count,
             "RE server capabilities"
         );
 
@@ -2180,8 +2196,8 @@ impl REClientBuilder {
                 max_decoding_msg_size,
                 build_cas_client,
             ),
-            execution_client: ResettableGrpcClient::new(
-                execution.context("Error creating Execution client")?,
+            execution_client: ResettableGrpcClientPool::new(
+                execution_channels,
                 execution_connector,
                 interceptor.dupe(),
                 max_decoding_msg_size,
@@ -2549,6 +2565,70 @@ impl<C: Clone> ResettableGrpcClient<C> {
     }
 }
 
+fn configured_connection_count(
+    count: Option<usize>,
+    execution_concurrency_limit: Option<usize>,
+) -> usize {
+    if let Some(count) = count {
+        return count.max(1);
+    }
+
+    let execution_concurrency_limit =
+        execution_concurrency_limit.unwrap_or(DEFAULT_EXECUTION_CONCURRENCY_LIMIT);
+    let connections = execution_concurrency_limit.div_ceil(DEFAULT_ENGINE_REQUESTS_PER_CONNECTION);
+    connections.clamp(1, DEFAULT_MAX_ENGINE_CONNECTION_COUNT)
+}
+
+struct ResettableGrpcClientPool<C> {
+    clients: Vec<ResettableGrpcClient<C>>,
+    next_client: AtomicUsize,
+}
+
+impl<C: Clone> ResettableGrpcClientPool<C> {
+    fn new(
+        channels: Vec<Channel>,
+        connector: GrpcChannelConnector,
+        interceptor: InjectHeadersInterceptor,
+        max_decoding_message_size: usize,
+        build_client: fn(Channel, InjectHeadersInterceptor, usize) -> C,
+    ) -> Self {
+        let clients = channels
+            .into_iter()
+            .map(|channel| {
+                ResettableGrpcClient::new(
+                    channel,
+                    connector.clone(),
+                    interceptor.dupe(),
+                    max_decoding_message_size,
+                    build_client,
+                )
+            })
+            .collect();
+        Self {
+            clients,
+            next_client: AtomicUsize::new(0),
+        }
+    }
+
+    async fn client(&self) -> C {
+        let index = self.next_client.fetch_add(1, Ordering::Relaxed) % self.clients.len();
+        self.clients[index].client().await
+    }
+
+    async fn reconnect(&self) -> anyhow::Result<()> {
+        let mut last_error = None;
+        for client in &self.clients {
+            if let Err(error) = client.reconnect().await {
+                last_error = Some(error);
+            }
+        }
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
 fn build_cas_client(
     channel: Channel,
     interceptor: InjectHeadersInterceptor,
@@ -2595,7 +2675,7 @@ enum GrpcClientKind {
 
 pub struct GRPCClients {
     cas_client: ResettableGrpcClient<ContentAddressableStorageClient<GrpcService>>,
-    execution_client: ResettableGrpcClient<ExecutionClient<GrpcService>>,
+    execution_client: ResettableGrpcClientPool<ExecutionClient<GrpcService>>,
     action_cache_client: ResettableGrpcClient<ActionCacheClient<GrpcService>>,
     bytestream_client: ResettableGrpcClient<ByteStreamClient<GrpcService>>,
 }
@@ -5855,6 +5935,19 @@ mod tests {
         assert!(!should_retry_execute_after_wait_execution_error(&err));
     }
 
+    #[test]
+    fn configured_connection_count_uses_bazel_ratio_by_default() {
+        assert_eq!(configured_connection_count(None, Some(2000)), 20);
+        assert_eq!(configured_connection_count(None, Some(1)), 1);
+        assert_eq!(configured_connection_count(None, Some(10_001)), 100);
+        assert_eq!(configured_connection_count(None, None), 4);
+    }
+
+    #[test]
+    fn configured_connection_count_honors_override() {
+        assert_eq!(configured_connection_count(Some(0), Some(2000)), 1);
+        assert_eq!(configured_connection_count(Some(16), Some(2000)), 16);
+    }
     fn status_for_code(code: TCode) -> Status {
         Status {
             code: code.0,
