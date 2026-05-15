@@ -54,6 +54,8 @@ pub struct RemoteEventSink {
     client: scribe_client::ScribeClient,
     #[cfg(not(fbcode_build))]
     client: crate::sink::bes_client::BesClient,
+    #[cfg(not(fbcode_build))]
+    upload_successful_action_events: bool,
     schedule_type: SandcastleScheduleType,
 }
 
@@ -68,12 +70,16 @@ impl RemoteEventSink {
         let client = scribe_client::ScribeClient::new(fb, config)
             .map_err(|e| from_any_with_tag(e, ErrorTag::Tier0))?;
         #[cfg(not(fbcode_build))]
+        let upload_successful_action_events = config.upload_successful_action_events;
+        #[cfg(not(fbcode_build))]
         let client = crate::sink::bes_client::BesClient::new(fb, config)?;
 
         let schedule_type = SandcastleScheduleType::new()?;
         Ok(RemoteEventSink {
             category,
             client,
+            #[cfg(not(fbcode_build))]
+            upload_successful_action_events,
             schedule_type,
         })
     }
@@ -232,24 +238,11 @@ impl RemoteEventSink {
                 }
             }
             Data::SpanEnd(s) => {
-                use buck2_data::ActionExecutionKind;
                 use buck2_data::span_end_event::Data;
 
                 match &s.data {
                     Some(Data::Command(..)) => true,
-                    Some(Data::ActionExecution(a)) => {
-                        a.failed
-                            || match ActionExecutionKind::try_from(a.execution_kind) {
-                                // Those kinds are not used in downstreams
-                                Ok(ActionExecutionKind::Simple) => false,
-                                Ok(ActionExecutionKind::Deferred) => false,
-                                Ok(ActionExecutionKind::NotSet) => false,
-                                _ => !matches!(
-                                    (action_has_cache_hit(a), self.schedule_type.is_diff()),
-                                    (true, true)
-                                ),
-                            }
-                    }
+                    Some(Data::ActionExecution(a)) => self.should_send_action_execution(a),
                     Some(Data::Analysis(..)) => !self.schedule_type.is_diff(),
                     Some(Data::Load(..)) => true,
                     Some(Data::CacheUpload(..)) => true,
@@ -314,6 +307,42 @@ impl RemoteEventSink {
                 }
             }
         }
+    }
+
+    fn should_send_action_execution(&self, action: &ActionExecutionEnd) -> bool {
+        #[cfg(not(fbcode_build))]
+        let upload_successful_action_events = self.upload_successful_action_events;
+        #[cfg(fbcode_build)]
+        let upload_successful_action_events = true;
+
+        should_send_action_execution(action, &self.schedule_type, upload_successful_action_events)
+    }
+}
+
+fn should_send_action_execution(
+    action: &ActionExecutionEnd,
+    schedule_type: &SandcastleScheduleType,
+    upload_successful_action_events: bool,
+) -> bool {
+    use buck2_data::ActionExecutionKind;
+
+    if action.failed {
+        return true;
+    }
+
+    if !upload_successful_action_events {
+        return false;
+    }
+
+    match ActionExecutionKind::try_from(action.execution_kind) {
+        // Those kinds are not used in downstreams.
+        Ok(ActionExecutionKind::Simple) => false,
+        Ok(ActionExecutionKind::Deferred) => false,
+        Ok(ActionExecutionKind::NotSet) => false,
+        _ => !matches!(
+            (action_has_cache_hit(action), schedule_type.is_diff()),
+            (true, true)
+        ),
     }
 }
 
@@ -405,6 +434,8 @@ pub(crate) fn scribe_category() -> buck2_error::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use buck2_data::ActionExecutionEnd;
+    use buck2_data::ActionExecutionKind;
     use buck2_data::CommandExecutionDetails;
     use buck2_data::CommandExecutionKind;
     use buck2_data::RemoteCommand;
@@ -461,5 +492,42 @@ mod tests {
             ..Default::default()
         };
         assert!(!get_is_cache_hit(&details_no_cache_hit));
+    }
+
+    #[test]
+    fn upload_successful_action_events_keeps_failures() {
+        let schedule_type = SandcastleScheduleType::testing_empty();
+        let failed_remote = ActionExecutionEnd {
+            failed: true,
+            execution_kind: ActionExecutionKind::Remote as i32,
+            ..Default::default()
+        };
+
+        assert!(should_send_action_execution(
+            &failed_remote,
+            &schedule_type,
+            false
+        ));
+    }
+
+    #[test]
+    fn upload_successful_action_events_filters_successes() {
+        let schedule_type = SandcastleScheduleType::testing_empty();
+        let successful_remote = ActionExecutionEnd {
+            failed: false,
+            execution_kind: ActionExecutionKind::Remote as i32,
+            ..Default::default()
+        };
+
+        assert!(should_send_action_execution(
+            &successful_remote,
+            &schedule_type,
+            true
+        ));
+        assert!(!should_send_action_execution(
+            &successful_remote,
+            &schedule_type,
+            false
+        ));
     }
 }
