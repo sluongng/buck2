@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::env;
+use std::io::Write;
 
 use bazel_bep_proto::blaze;
 use bazel_bep_proto::build_event_stream as bep;
@@ -21,6 +22,8 @@ use bazel_bep_proto::build_event_stream::build_event;
 use bazel_bep_proto::build_event_stream::build_event_id;
 use bazel_bep_proto::command_line as cl;
 use bazel_bep_proto::failure_details as failure;
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use prost::Message as _;
 use prost_types::Any;
 use prost_types::Struct;
@@ -41,6 +44,8 @@ const ORIGINAL_COMMAND_LINE_LABEL: &str = "original";
 const STRUCT_TYPE_URL: &str = "type.googleapis.com/google.protobuf.Struct";
 const BUILDBUDDY_VISIBILITY_KEY: &str = "VISIBILITY";
 const BUILDBUDDY_PUBLIC_VISIBILITY: &str = "PUBLIC";
+const COMMAND_PROFILE_NAME: &str = "command.profile.gz";
+const MAX_PROFILE_SPANS: usize = 50_000;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TargetKey {
@@ -62,6 +67,105 @@ struct TestCaseState {
     message: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum ProfileLane {
+    Command,
+    Loading,
+    Analysis,
+    Actions,
+    ActionStages,
+    Tests,
+    Materialization,
+    Cache,
+    Dice,
+    Other,
+}
+
+impl ProfileLane {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Command => "Buck2 command",
+            Self::Loading => "Buck2 loading",
+            Self::Analysis => "Buck2 analysis",
+            Self::Actions => "Buck2 actions",
+            Self::ActionStages => "Buck2 action stages",
+            Self::Tests => "Buck2 tests",
+            Self::Materialization => "Buck2 materialization",
+            Self::Cache => "Buck2 cache and remote",
+            Self::Dice => "Buck2 DICE",
+            Self::Other => "Buck2 other",
+        }
+    }
+
+    fn track_base(self) -> u64 {
+        match self {
+            Self::Command => 1,
+            Self::Loading => 1_000,
+            Self::Analysis => 2_000,
+            Self::Actions => 3_000,
+            Self::ActionStages => 4_000,
+            Self::Tests => 5_000,
+            Self::Materialization => 6_000,
+            Self::Cache => 7_000,
+            Self::Dice => 8_000,
+            Self::Other => 9_000,
+        }
+    }
+
+    fn tid(self, index: usize) -> u64 {
+        self.track_base()
+            .saturating_add(u64::try_from(index).unwrap_or(u64::MAX))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProfileOpenSpan {
+    span_id: u64,
+    parent_id: u64,
+    name: String,
+    lane: ProfileLane,
+    category: &'static str,
+    start_us: i64,
+    args: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug)]
+struct ProfileCompletedSpan {
+    span_id: u64,
+    parent_id: u64,
+    name: String,
+    lane: ProfileLane,
+    category: &'static str,
+    start_us: i64,
+    duration_us: i64,
+    args: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug)]
+struct ProfileSpanDetails {
+    name: String,
+    lane: ProfileLane,
+    category: &'static str,
+    args: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug)]
+struct ProfileFallbackSpan {
+    name: String,
+    start_us: i64,
+    duration_us: i64,
+    args: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CommandProfileBuilder {
+    command_started_at_us: Option<i64>,
+    command_name: Option<String>,
+    open_spans: BTreeMap<u64, ProfileOpenSpan>,
+    completed_spans: Vec<ProfileCompletedSpan>,
+    dropped_spans: usize,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct BazelEventConverter {
     saw_started: bool,
@@ -77,6 +181,8 @@ pub(crate) struct BazelEventConverter {
     test_cases: BTreeMap<TargetKey, Vec<TestCaseState>>,
     pending_patterns: Option<Vec<String>>,
     pattern_expanded_emitted: bool,
+    emitted_build_tool_logs: bool,
+    command_profile: CommandProfileBuilder,
 }
 
 impl BazelEventConverter {
@@ -117,6 +223,8 @@ impl BazelEventConverter {
         span_start: &buck2_data::SpanStartEvent,
         events: &mut Vec<bep::BuildEvent>,
     ) {
+        self.command_profile.record_span_start(event, span_start);
+
         match span_start.data.as_ref() {
             Some(buck2_data::span_start_event::Data::Command(command)) => {
                 if !self.saw_started {
@@ -159,10 +267,21 @@ impl BazelEventConverter {
         span_end: &buck2_data::SpanEndEvent,
         events: &mut Vec<bep::BuildEvent>,
     ) {
+        self.command_profile.record_span_end(event, span_end);
+
         match span_end.data.as_ref() {
             Some(buck2_data::span_end_event::Data::Command(command)) => {
                 self.emit_completed_updates_for_actions(events);
                 self.push_finished(finished_event_from_command_end(event, command), events);
+                self.push_build_tool_logs(
+                    build_tool_logs_event_from_command_end(
+                        event,
+                        span_end,
+                        command,
+                        &self.command_profile,
+                    ),
+                    events,
+                );
             }
             Some(buck2_data::span_end_event::Data::Analysis(analysis)) => {
                 if let Some(completed) = completed_event_from_analysis_end(analysis) {
@@ -352,7 +471,10 @@ impl BazelEventConverter {
                 events.push(build_metrics_event(record));
                 events.push(build_metadata_event_from_invocation(record));
                 self.push_finished(finished_event_from_invocation_record(event, record), events);
-                events.push(build_tool_logs_event_from_invocation(record));
+                self.push_build_tool_logs(
+                    build_tool_logs_event_from_invocation(record, &self.command_profile),
+                    events,
+                );
             }
             Some(buck2_data::record_event::Data::BuildGraphStats(stats)) => {
                 self.emit_pending_pattern_expanded(&stats.build_targets, events);
@@ -372,6 +494,14 @@ impl BazelEventConverter {
             return;
         }
         self.saw_finished = true;
+        events.push(event);
+    }
+
+    fn push_build_tool_logs(&mut self, event: bep::BuildEvent, events: &mut Vec<bep::BuildEvent>) {
+        if self.emitted_build_tool_logs {
+            return;
+        }
+        self.emitted_build_tool_logs = true;
         events.push(event);
     }
 
@@ -445,6 +575,7 @@ impl BazelEventConverter {
                 build_metadata_id(),
                 configuration_event_id(DEFAULT_CONFIGURATION_ID),
                 workspace_config_id(),
+                build_tool_logs_id(),
                 build_finished_id(),
             ],
             payload: Some(build_event::Payload::Started(bep::BuildStarted {
@@ -751,6 +882,289 @@ impl BazelEventConverter {
     }
 }
 
+impl CommandProfileBuilder {
+    fn record_span_start(
+        &mut self,
+        event: &buck2_data::BuckEvent,
+        span_start: &buck2_data::SpanStartEvent,
+    ) {
+        let Some(data) = span_start.data.as_ref() else {
+            return;
+        };
+        if let buck2_data::span_start_event::Data::Command(command) = data {
+            self.command_name = Some(command_name(command));
+            self.command_started_at_us = timestamp_micros(event.timestamp.as_ref());
+        }
+        let Some(start_us) = timestamp_micros(event.timestamp.as_ref()) else {
+            return;
+        };
+        let Some(details) = profile_span_start_details(data) else {
+            return;
+        };
+        self.open_spans.insert(
+            event.span_id,
+            ProfileOpenSpan {
+                span_id: event.span_id,
+                parent_id: event.parent_id,
+                name: details.name,
+                lane: details.lane,
+                category: details.category,
+                start_us,
+                args: details.args,
+            },
+        );
+    }
+
+    fn record_span_end(
+        &mut self,
+        event: &buck2_data::BuckEvent,
+        span_end: &buck2_data::SpanEndEvent,
+    ) {
+        let Some(data) = span_end.data.as_ref() else {
+            return;
+        };
+        let duration_us = span_end
+            .duration
+            .as_ref()
+            .map(duration_micros)
+            .unwrap_or_default()
+            .max(1);
+        if let Some(mut open) = self.open_spans.remove(&event.span_id) {
+            extend_json_map(&mut open.args, profile_span_end_args(data));
+            self.push_completed(ProfileCompletedSpan {
+                span_id: open.span_id,
+                parent_id: open.parent_id,
+                name: open.name,
+                lane: open.lane,
+                category: open.category,
+                start_us: open.start_us,
+                duration_us,
+                args: open.args,
+            });
+            return;
+        }
+
+        let Some(end_us) = timestamp_micros(event.timestamp.as_ref()) else {
+            return;
+        };
+        let Some(details) = profile_span_end_details(data) else {
+            return;
+        };
+        let mut args = details.args;
+        extend_json_map(&mut args, profile_span_end_args(data));
+        self.push_completed(ProfileCompletedSpan {
+            span_id: event.span_id,
+            parent_id: event.parent_id,
+            name: details.name,
+            lane: details.lane,
+            category: details.category,
+            start_us: end_us.saturating_sub(duration_us),
+            duration_us,
+            args,
+        });
+    }
+
+    fn push_completed(&mut self, span: ProfileCompletedSpan) {
+        if self.completed_spans.len() >= MAX_PROFILE_SPANS {
+            self.dropped_spans = self.dropped_spans.saturating_add(1);
+            return;
+        }
+        self.completed_spans.push(span);
+    }
+
+    fn command_end_profile_gzip(
+        &self,
+        event: &buck2_data::BuckEvent,
+        span_end: &buck2_data::SpanEndEvent,
+        command: &buck2_data::CommandEnd,
+    ) -> Option<Vec<u8>> {
+        let command_duration_us = span_end
+            .duration
+            .as_ref()
+            .map(duration_micros)
+            .unwrap_or(1)
+            .max(1);
+        let end_us = timestamp_micros(event.timestamp.as_ref()).unwrap_or(command_duration_us);
+        let command_name = self
+            .command_name
+            .clone()
+            .unwrap_or_else(|| command_end_name(command).to_owned());
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "outcome".to_owned(),
+            serde_json::json!(if command.is_success {
+                "success"
+            } else {
+                "failed"
+            }),
+        );
+        args.insert(
+            "exit_code".to_owned(),
+            serde_json::json!(if command.is_success { 0 } else { 1 }),
+        );
+        args.insert(
+            "trace_id".to_owned(),
+            serde_json::json!(event.trace_id.as_str()),
+        );
+        let fallback = ProfileFallbackSpan {
+            name: format!("buck2 {command_name}"),
+            start_us: end_us.saturating_sub(command_duration_us),
+            duration_us: command_duration_us,
+            args,
+        };
+        gzip_profile_json(self.profile_json(Some(fallback)).ok()?)
+    }
+
+    fn invocation_profile_gzip(&self, record: &buck2_data::InvocationRecord) -> Option<Vec<u8>> {
+        if self.completed_spans.is_empty() {
+            return None;
+        }
+        let command_duration_us = record
+            .command_duration
+            .as_ref()
+            .or(record.client_walltime.as_ref())
+            .map(duration_micros)
+            .unwrap_or_default()
+            .max(1);
+        let fallback_start = self
+            .command_started_at_us
+            .or_else(|| self.completed_spans.iter().map(|span| span.start_us).min())
+            .unwrap_or_default();
+        let command = record
+            .command_name
+            .as_deref()
+            .or(self.command_name.as_deref())
+            .unwrap_or("unknown");
+        let mut args = serde_json::Map::new();
+        args.insert(
+            "outcome".to_owned(),
+            serde_json::json!(invocation_outcome_name(record.outcome)),
+        );
+        if let Some(exit_code) = record.exit_code {
+            args.insert("exit_code".to_owned(), serde_json::json!(exit_code));
+        }
+        let fallback = ProfileFallbackSpan {
+            name: format!("buck2 {command}"),
+            start_us: fallback_start,
+            duration_us: command_duration_us,
+            args,
+        };
+        gzip_profile_json(self.profile_json(Some(fallback)).ok()?)
+    }
+
+    fn profile_json(&self, fallback: Option<ProfileFallbackSpan>) -> serde_json::Result<String> {
+        let mut spans = self.completed_spans.clone();
+        let has_command_span = spans.iter().any(|span| span.lane == ProfileLane::Command);
+        if !has_command_span && let Some(fallback) = fallback {
+            spans.push(ProfileCompletedSpan {
+                span_id: 0,
+                parent_id: 0,
+                name: fallback.name,
+                lane: ProfileLane::Command,
+                category: "command",
+                start_us: fallback.start_us,
+                duration_us: fallback.duration_us,
+                args: fallback.args,
+            });
+        }
+        let base_us = self
+            .command_started_at_us
+            .or_else(|| spans.iter().map(|span| span.start_us).min())
+            .unwrap_or_default();
+
+        spans.sort_by(|left, right| {
+            left.start_us
+                .cmp(&right.start_us)
+                .then_with(|| right.duration_us.cmp(&left.duration_us))
+                .then_with(|| left.span_id.cmp(&right.span_id))
+        });
+
+        let mut trace_events = Vec::new();
+        let mut lane_tracks: BTreeMap<ProfileLane, Vec<i64>> = BTreeMap::new();
+        let mut span_tracks: BTreeMap<u64, (u64, ProfileLane)> = BTreeMap::new();
+
+        for span in spans {
+            let start_us = span.start_us.saturating_sub(base_us).max(0);
+            let duration_us = span.duration_us.max(1);
+            let end_us = start_us.saturating_add(duration_us);
+            let parent_track = (span.parent_id != 0)
+                .then(|| span_tracks.get(&span.parent_id).copied())
+                .flatten();
+            let tid = if let Some((parent_tid, parent_lane)) = parent_track
+                && parent_lane != ProfileLane::Command
+                && (parent_lane == span.lane
+                    || (parent_lane == ProfileLane::Actions
+                        && span.lane == ProfileLane::ActionStages))
+            {
+                parent_tid
+            } else {
+                let tracks = lane_tracks.entry(span.lane).or_default();
+                let track_index = tracks
+                    .iter()
+                    .position(|last_end_us| *last_end_us <= start_us)
+                    .unwrap_or_else(|| {
+                        tracks.push(0);
+                        tracks.len() - 1
+                    });
+                tracks[track_index] = end_us;
+                span.lane.tid(track_index)
+            };
+            span_tracks.insert(span.span_id, (tid, span.lane));
+            trace_events.push(serde_json::json!({
+                "name": span.name,
+                "cat": span.category,
+                "ph": "X",
+                "ts": start_us,
+                "dur": duration_us,
+                "pid": 1,
+                "tid": tid,
+                "args": span.args,
+            }));
+        }
+
+        if self.dropped_spans > 0 {
+            trace_events.push(serde_json::json!({
+                "name": "profile spans dropped",
+                "cat": "profile",
+                "ph": "i",
+                "s": "g",
+                "ts": 0,
+                "pid": 1,
+                "args": {
+                    "dropped_spans": self.dropped_spans,
+                    "max_profile_spans": MAX_PROFILE_SPANS,
+                },
+            }));
+        }
+
+        let mut metadata_events = vec![serde_json::json!({
+            "name": "process_name",
+            "ph": "M",
+            "pid": 1,
+            "args": { "name": "buck2" },
+        })];
+        for (lane, tracks) in &lane_tracks {
+            for index in 0..tracks.len() {
+                let tid = lane.tid(index);
+                let name = if tracks.len() == 1 {
+                    lane.label().to_owned()
+                } else {
+                    format!("{} {}", lane.label(), index + 1)
+                };
+                metadata_events.push(serde_json::json!({
+                    "name": "thread_name",
+                    "ph": "M",
+                    "pid": 1,
+                    "tid": tid,
+                    "args": { "name": name },
+                }));
+            }
+        }
+        metadata_events.extend(trace_events);
+        serialize_trace_events(&metadata_events)
+    }
+}
+
 pub(crate) fn encode_bep_event(event: &bep::BuildEvent) -> Any {
     Any {
         type_url: BEP_EVENT_TYPE_URL.to_owned(),
@@ -973,6 +1387,38 @@ fn command_name(command: &buck2_data::CommandStart) -> String {
         None => "unknown",
     }
     .to_owned()
+}
+
+fn command_end_name(command: &buck2_data::CommandEnd) -> &'static str {
+    use buck2_data::command_end::Data;
+
+    match command.data.as_ref() {
+        Some(Data::Build(_)) => "build",
+        Some(Data::Targets(_)) => "targets",
+        Some(Data::Query(_)) => "query",
+        Some(Data::Cquery(_)) => "cquery",
+        Some(Data::Test(_)) => "test",
+        Some(Data::Audit(_)) => "audit",
+        Some(Data::Docs(_)) => "docs",
+        Some(Data::Clean(_)) => "clean",
+        Some(Data::Aquery(_)) => "aquery",
+        Some(Data::Install(_)) => "install",
+        Some(Data::Materialize(_)) => "materialize",
+        Some(Data::Profile(_)) => "profile",
+        Some(Data::Bxl(_)) => "bxl",
+        Some(Data::Lsp(_)) => "lsp",
+        Some(Data::FileStatus(_)) => "file-status",
+        Some(Data::Starlark(_)) => "starlark",
+        Some(Data::Subscribe(_)) => "subscribe",
+        Some(Data::Trace(_)) => "trace",
+        Some(Data::Ctargets(_)) => "ctargets",
+        Some(Data::StarlarkDebugAttach(_)) => "starlark-debug-attach",
+        Some(Data::Explain(_)) => "explain",
+        Some(Data::ExpandExternalCell(_)) => "expand-external-cell",
+        Some(Data::Complete(_)) => "complete",
+        Some(Data::Hydration(_)) => "hydration",
+        None => "unknown",
+    }
 }
 
 fn unstructured_command_line_event(command: &buck2_data::CommandStart) -> bep::BuildEvent {
@@ -1632,6 +2078,23 @@ fn optional_duration_millis(duration: Option<&prost_types::Duration>) -> Option<
     duration.map(duration_millis)
 }
 
+fn duration_micros(duration: &prost_types::Duration) -> i64 {
+    duration
+        .seconds
+        .saturating_mul(1_000_000)
+        .saturating_add(i64::from(duration.nanos) / 1_000)
+}
+
+fn timestamp_micros(timestamp: Option<&Timestamp>) -> Option<i64> {
+    let timestamp = timestamp?;
+    let micros = i128::from(timestamp.seconds) * 1_000_000 + i128::from(timestamp.nanos) / 1_000;
+    Some(i64::try_from(micros).unwrap_or(if micros.is_negative() {
+        i64::MIN
+    } else {
+        i64::MAX
+    }))
+}
+
 fn target_patterns_from_invocation_record(
     patterns: &buck2_data::ParsedTargetPatterns,
 ) -> Vec<String> {
@@ -1653,7 +2116,845 @@ fn invocation_outcome_name(outcome: Option<i32>) -> &'static str {
     }
 }
 
-fn build_tool_logs_event_from_invocation(record: &buck2_data::InvocationRecord) -> bep::BuildEvent {
+fn profile_span_start_details(
+    data: &buck2_data::span_start_event::Data,
+) -> Option<ProfileSpanDetails> {
+    match data {
+        buck2_data::span_start_event::Data::Command(command) => {
+            let command_name = command_name(command);
+            let mut details = profile_details(
+                format!("buck2 {command_name}"),
+                ProfileLane::Command,
+                "command",
+            );
+            json_arg_u64(
+                &mut details.args,
+                "argv_count",
+                command.cli_args.len() as u64,
+            );
+            Some(details)
+        }
+        buck2_data::span_start_event::Data::CommandCritical(command) => {
+            let mut details =
+                profile_details("command critical section", ProfileLane::Command, "command");
+            json_arg_non_empty(&mut details.args, "dice_version", &command.dice_version);
+            Some(details)
+        }
+        buck2_data::span_start_event::Data::Analysis(analysis) => {
+            let target = configured_target_from_analysis_start(analysis)
+                .and_then(label_for_configured_target)
+                .unwrap_or_else(|| "unknown target".to_owned());
+            let mut details = profile_details(
+                format!("analysis {target}"),
+                ProfileLane::Analysis,
+                "analysis",
+            );
+            json_arg_non_empty(&mut details.args, "rule", &analysis.rule);
+            Some(details)
+        }
+        buck2_data::span_start_event::Data::AnalysisResolveQueries(analysis) => {
+            let target = analysis
+                .standard_target
+                .as_ref()
+                .and_then(label_for_configured_target)
+                .unwrap_or_else(|| "unknown target".to_owned());
+            let details = profile_details(
+                format!("analysis queries {target}"),
+                ProfileLane::Analysis,
+                "analysis",
+            );
+            Some(details)
+        }
+        buck2_data::span_start_event::Data::AnalysisStage(_) => Some(profile_details(
+            "evaluate rule",
+            ProfileLane::Analysis,
+            "analysis",
+        )),
+        buck2_data::span_start_event::Data::Load(load) => {
+            let module = if load.module_id.is_empty() {
+                load.cell.as_str()
+            } else {
+                load.module_id.as_str()
+            };
+            let mut details =
+                profile_details(format!("load {module}"), ProfileLane::Loading, "loading");
+            json_arg_non_empty(&mut details.args, "module_id", &load.module_id);
+            json_arg_non_empty(&mut details.args, "cell", &load.cell);
+            Some(details)
+        }
+        buck2_data::span_start_event::Data::LoadPackage(load) => {
+            let mut details = profile_details(
+                format!("list package {}", load.path),
+                ProfileLane::Loading,
+                "loading",
+            );
+            json_arg_non_empty(&mut details.args, "path", &load.path);
+            Some(details)
+        }
+        buck2_data::span_start_event::Data::ActionExecution(action) => {
+            Some(profile_action_start_details(action))
+        }
+        buck2_data::span_start_event::Data::ExecutorStage(stage) => {
+            profile_executor_stage_name(stage.stage.as_ref())
+                .map(|name| profile_details(name, ProfileLane::ActionStages, "action_stage"))
+        }
+        buck2_data::span_start_event::Data::TestDiscovery(test) => {
+            let target = test
+                .target_label
+                .as_ref()
+                .and_then(label_for_configured_target)
+                .unwrap_or_else(|| "unknown target".to_owned());
+            let mut details = profile_details(
+                format!("discover tests {target}"),
+                ProfileLane::Tests,
+                "test",
+            );
+            json_arg_non_empty(&mut details.args, "suite", &test.suite_name);
+            json_arg_non_empty(&mut details.args, "target", &target);
+            Some(details)
+        }
+        buck2_data::span_start_event::Data::TestRun(test) => {
+            let suite = test.suite.as_ref();
+            let target = suite
+                .and_then(|suite| suite.target_label.as_ref())
+                .and_then(label_for_configured_target)
+                .unwrap_or_else(|| "unknown target".to_owned());
+            let mut details = profile_details(format!("test {target}"), ProfileLane::Tests, "test");
+            if let Some(suite) = suite {
+                json_arg_non_empty(&mut details.args, "suite", &suite.suite_name);
+                json_arg_u64(
+                    &mut details.args,
+                    "test_count",
+                    suite.test_names.len() as u64,
+                );
+            }
+            json_arg_non_empty(&mut details.args, "target", &target);
+            Some(details)
+        }
+        buck2_data::span_start_event::Data::FileWatcher(_) => Some(profile_details(
+            "file watcher sync",
+            ProfileLane::Loading,
+            "loading",
+        )),
+        buck2_data::span_start_event::Data::FinalMaterialization(materialization) => {
+            let mut details = profile_details(
+                "final materialization",
+                ProfileLane::Materialization,
+                "materialization",
+            );
+            if let Some(artifact) = materialization.artifact.as_ref() {
+                json_arg_non_empty(&mut details.args, "path", &artifact.path);
+            }
+            Some(details)
+        }
+        buck2_data::span_start_event::Data::Materialization(materialization) => {
+            let mut details = profile_details(
+                "materialization",
+                ProfileLane::Materialization,
+                "materialization",
+            );
+            if let Some(digest) = materialization.action_digest.as_ref() {
+                json_arg_non_empty(&mut details.args, "action_digest", digest);
+            }
+            Some(details)
+        }
+        buck2_data::span_start_event::Data::CacheUpload(upload) => Some(
+            profile_cache_upload_details(&upload.key, &upload.name, &upload.action_digest),
+        ),
+        buck2_data::span_start_event::Data::DepFileUpload(upload) => Some(
+            profile_cache_upload_details(&upload.key, &upload.name, &upload.remote_dep_file_key),
+        ),
+        buck2_data::span_start_event::Data::ReUpload(_) => Some(profile_details(
+            "remote upload",
+            ProfileLane::Cache,
+            "remote",
+        )),
+        buck2_data::span_start_event::Data::DeferredPreparationStage(_) => Some(profile_details(
+            "deferred preparation",
+            ProfileLane::Materialization,
+            "materialization",
+        )),
+        buck2_data::span_start_event::Data::CreateOutputSymlinks(_) => Some(profile_details(
+            "create output symlinks",
+            ProfileLane::Materialization,
+            "materialization",
+        )),
+        buck2_data::span_start_event::Data::LocalResources(_) => Some(profile_details(
+            "setup local resources",
+            ProfileLane::Other,
+            "local_resources",
+        )),
+        buck2_data::span_start_event::Data::ReleaseLocalResources(_) => Some(profile_details(
+            "release local resources",
+            ProfileLane::Other,
+            "local_resources",
+        )),
+        buck2_data::span_start_event::Data::DynamicLambda(lambda) => {
+            let target = dynamic_lambda_target_label(lambda)
+                .and_then(label_for_configured_target)
+                .unwrap_or_else(|| "dynamic lambda".to_owned());
+            let mut details = profile_details(
+                format!("dynamic lambda {target}"),
+                ProfileLane::Analysis,
+                "analysis",
+            );
+            json_arg_u64(
+                &mut details.args,
+                "dynamic_inputs_bytes",
+                lambda.dynamic_inputs_bytes,
+            );
+            Some(details)
+        }
+        buck2_data::span_start_event::Data::DiceStateUpdate(_)
+        | buck2_data::span_start_event::Data::DiceCriticalSection(_)
+        | buck2_data::span_start_event::Data::DiceBlockConcurrentCommand(_)
+        | buck2_data::span_start_event::Data::DiceSynchronizeSection(_)
+        | buck2_data::span_start_event::Data::DiceCleanup(_) => Some(profile_details(
+            profile_dice_span_name(data),
+            ProfileLane::Dice,
+            "dice",
+        )),
+        buck2_data::span_start_event::Data::ExclusiveCommandWait(wait) => {
+            let mut details = profile_details(
+                "wait for exclusive command",
+                ProfileLane::Command,
+                "command",
+            );
+            if let Some(command_name) = wait.command_name.as_ref() {
+                json_arg_non_empty(&mut details.args, "active_command", command_name);
+            }
+            Some(details)
+        }
+        buck2_data::span_start_event::Data::BxlExecution(bxl) => {
+            let mut details =
+                profile_details(format!("bxl {}", bxl.name), ProfileLane::Other, "bxl");
+            json_arg_non_empty(&mut details.args, "name", &bxl.name);
+            Some(details)
+        }
+        buck2_data::span_start_event::Data::BxlDiceInvocation(_) => {
+            Some(profile_details("bxl dice", ProfileLane::Dice, "dice"))
+        }
+        buck2_data::span_start_event::Data::BxlEnsureArtifacts(_) => Some(profile_details(
+            "bxl ensure artifacts",
+            ProfileLane::Materialization,
+            "materialization",
+        )),
+        buck2_data::span_start_event::Data::ActionErrorHandlerExecution(_) => Some(
+            profile_details("action error handler", ProfileLane::Actions, "action"),
+        ),
+        buck2_data::span_start_event::Data::CqueryUniverseBuild(_) => Some(profile_details(
+            "cquery universe build",
+            ProfileLane::Analysis,
+            "analysis",
+        )),
+        buck2_data::span_start_event::Data::ComputeDetailedAggregatedMetrics(_) => Some(
+            profile_details("compute detailed metrics", ProfileLane::Other, "metrics"),
+        ),
+        buck2_data::span_start_event::Data::InstallEventInfo(install) => {
+            let mut details = profile_details(
+                format!("install {}", install.artifact_name),
+                ProfileLane::Other,
+                "install",
+            );
+            json_arg_non_empty(&mut details.args, "artifact_name", &install.artifact_name);
+            json_arg_non_empty(&mut details.args, "file_path", &install.file_path);
+            Some(details)
+        }
+        buck2_data::span_start_event::Data::ConnectToInstaller(_) => Some(profile_details(
+            "connect to installer",
+            ProfileLane::Other,
+            "install",
+        )),
+        buck2_data::span_start_event::Data::Fake(_) => None,
+        _ => None,
+    }
+}
+
+fn profile_span_end_details(data: &buck2_data::span_end_event::Data) -> Option<ProfileSpanDetails> {
+    match data {
+        buck2_data::span_end_event::Data::Command(command) => Some(profile_details(
+            format!("buck2 {}", command_end_name(command)),
+            ProfileLane::Command,
+            "command",
+        )),
+        buck2_data::span_end_event::Data::Analysis(analysis) => {
+            let target = configured_target_from_analysis_end(analysis)
+                .and_then(label_for_configured_target)
+                .unwrap_or_else(|| "unknown target".to_owned());
+            let mut details = profile_details(
+                format!("analysis {target}"),
+                ProfileLane::Analysis,
+                "analysis",
+            );
+            json_arg_non_empty(&mut details.args, "rule", &analysis.rule);
+            Some(details)
+        }
+        buck2_data::span_end_event::Data::ActionExecution(action) => {
+            Some(profile_action_end_details(action))
+        }
+        buck2_data::span_end_event::Data::Load(load) => {
+            let module = if load.module_id.is_empty() {
+                load.cell.as_str()
+            } else {
+                load.module_id.as_str()
+            };
+            let mut details =
+                profile_details(format!("load {module}"), ProfileLane::Loading, "loading");
+            json_arg_non_empty(&mut details.args, "module_id", &load.module_id);
+            json_arg_non_empty(&mut details.args, "cell", &load.cell);
+            Some(details)
+        }
+        buck2_data::span_end_event::Data::LoadPackage(load) => {
+            let mut details = profile_details(
+                format!("list package {}", load.path),
+                ProfileLane::Loading,
+                "loading",
+            );
+            json_arg_non_empty(&mut details.args, "path", &load.path);
+            Some(details)
+        }
+        buck2_data::span_end_event::Data::ExecutorStage(stage) => {
+            let _ = stage;
+            Some(profile_details(
+                "executor stage",
+                ProfileLane::ActionStages,
+                "action_stage",
+            ))
+        }
+        buck2_data::span_end_event::Data::TestDiscovery(test) => {
+            let target = test
+                .target_label
+                .as_ref()
+                .and_then(label_for_configured_target)
+                .unwrap_or_else(|| "unknown target".to_owned());
+            let mut details = profile_details(
+                format!("discover tests {target}"),
+                ProfileLane::Tests,
+                "test",
+            );
+            json_arg_non_empty(&mut details.args, "suite", &test.suite_name);
+            json_arg_non_empty(&mut details.args, "target", &target);
+            Some(details)
+        }
+        buck2_data::span_end_event::Data::TestRun(test) => {
+            let suite = test.suite.as_ref();
+            let target = suite
+                .and_then(|suite| suite.target_label.as_ref())
+                .and_then(label_for_configured_target)
+                .unwrap_or_else(|| "unknown target".to_owned());
+            let mut details = profile_details(format!("test {target}"), ProfileLane::Tests, "test");
+            if let Some(suite) = suite {
+                json_arg_non_empty(&mut details.args, "suite", &suite.suite_name);
+                json_arg_u64(
+                    &mut details.args,
+                    "test_count",
+                    suite.test_names.len() as u64,
+                );
+            }
+            json_arg_non_empty(&mut details.args, "target", &target);
+            Some(details)
+        }
+        buck2_data::span_end_event::Data::CacheUpload(upload) => Some(
+            profile_cache_upload_details(&upload.key, &upload.name, &upload.action_digest),
+        ),
+        buck2_data::span_end_event::Data::DepFileUpload(upload) => Some(
+            profile_cache_upload_details(&upload.key, &upload.name, &upload.remote_dep_file_key),
+        ),
+        buck2_data::span_end_event::Data::Materialization(materialization) => {
+            let mut details = profile_details(
+                "materialization",
+                ProfileLane::Materialization,
+                "materialization",
+            );
+            if let Some(digest) = materialization.action_digest.as_ref() {
+                json_arg_non_empty(&mut details.args, "action_digest", digest);
+            }
+            Some(details)
+        }
+        buck2_data::span_end_event::Data::FinalMaterialization(materialization) => {
+            let mut details = profile_details(
+                "final materialization",
+                ProfileLane::Materialization,
+                "materialization",
+            );
+            if let Some(artifact) = materialization.artifact.as_ref() {
+                json_arg_non_empty(&mut details.args, "path", &artifact.path);
+            }
+            Some(details)
+        }
+        buck2_data::span_end_event::Data::CommandCritical(_) => Some(profile_details(
+            "command critical section",
+            ProfileLane::Command,
+            "command",
+        )),
+        buck2_data::span_end_event::Data::SpanCancelled(_) => Some(profile_details(
+            "cancelled span",
+            ProfileLane::Other,
+            "cancelled",
+        )),
+        _ => None,
+    }
+}
+
+fn profile_span_end_args(
+    data: &buck2_data::span_end_event::Data,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut args = serde_json::Map::new();
+    match data {
+        buck2_data::span_end_event::Data::Command(command) => {
+            json_arg_bool(&mut args, "success", command.is_success);
+            json_arg_i64(
+                &mut args,
+                "exit_code",
+                if command.is_success { 0 } else { 1 },
+            );
+        }
+        buck2_data::span_end_event::Data::ActionExecution(action) => {
+            json_arg_bool(&mut args, "failed", action.failed);
+            json_arg_u64(&mut args, "output_size", action.output_size);
+            json_arg_u64(&mut args, "output_count", action.outputs.len() as u64);
+            if let Ok(kind) = buck2_data::ActionExecutionKind::try_from(action.execution_kind) {
+                json_arg_non_empty(&mut args, "execution_kind", &format!("{kind:?}"));
+            }
+            if let Some(command) = action.commands.last() {
+                json_arg_non_empty(
+                    &mut args,
+                    "strategy",
+                    action_execution_strategy_for_profile(command),
+                );
+                add_command_profile_args(&mut args, command);
+            }
+        }
+        buck2_data::span_end_event::Data::Analysis(analysis) => {
+            if let Some(declared_actions) = analysis.declared_actions {
+                json_arg_u64(&mut args, "declared_actions", declared_actions);
+            }
+            if let Some(declared_artifacts) = analysis.declared_artifacts {
+                json_arg_u64(&mut args, "declared_artifacts", declared_artifacts);
+            }
+            if let Some(profile) = analysis.profile.as_ref() {
+                json_arg_u64(
+                    &mut args,
+                    "starlark_allocated_bytes",
+                    profile.starlark_allocated_bytes,
+                );
+                json_arg_u64(
+                    &mut args,
+                    "starlark_available_bytes",
+                    profile.starlark_available_bytes,
+                );
+            }
+        }
+        buck2_data::span_end_event::Data::Load(load) => {
+            if let Some(error) = load.error.as_ref() {
+                json_arg_non_empty(&mut args, "error", error);
+            }
+            if let Some(target_count) = load.target_count {
+                json_arg_u64(&mut args, "target_count", target_count);
+            }
+            if let Some(bytes) = load.starlark_peak_allocated_bytes {
+                json_arg_u64(&mut args, "starlark_peak_allocated_bytes", bytes);
+            }
+            if let Some(ticks) = load.starlark_tick_count {
+                json_arg_u64(&mut args, "starlark_tick_count", ticks);
+            }
+            if let Some(instructions) = load.cpu_instruction_count {
+                json_arg_u64(&mut args, "cpu_instruction_count", instructions);
+            }
+        }
+        buck2_data::span_end_event::Data::TestDiscovery(test) => {
+            json_arg_bool(&mut args, "re_cache_enabled", test.re_cache_enabled);
+            if let Some(command) = test.command_report.as_ref() {
+                add_command_profile_args(&mut args, command);
+            }
+        }
+        buck2_data::span_end_event::Data::TestRun(test) => {
+            if let Some(command) = test.command_report.as_ref() {
+                add_command_profile_args(&mut args, command);
+            }
+        }
+        buck2_data::span_end_event::Data::CacheUpload(upload) => {
+            json_arg_bool(&mut args, "success", upload.success);
+            json_arg_non_empty(&mut args, "error", &upload.error);
+            json_arg_u64(&mut args, "file_count", upload.file_digests.len() as u64);
+            json_arg_u64(&mut args, "tree_count", upload.tree_digests.len() as u64);
+            if let Some(bytes) = upload.output_bytes {
+                json_arg_u64(&mut args, "output_bytes", bytes);
+            }
+            if let Some(code) = upload.re_error_code.as_ref() {
+                json_arg_non_empty(&mut args, "re_error_code", code);
+            }
+        }
+        buck2_data::span_end_event::Data::DepFileUpload(upload) => {
+            json_arg_bool(&mut args, "success", upload.success);
+            json_arg_non_empty(&mut args, "error", &upload.error);
+            if let Some(code) = upload.re_error_code.as_ref() {
+                json_arg_non_empty(&mut args, "re_error_code", code);
+            }
+        }
+        buck2_data::span_end_event::Data::Materialization(materialization) => {
+            json_arg_u64(&mut args, "file_count", materialization.file_count);
+            json_arg_u64(&mut args, "total_bytes", materialization.total_bytes);
+            json_arg_non_empty(&mut args, "path", &materialization.path);
+            json_arg_bool(&mut args, "success", materialization.success);
+            if let Some(error) = materialization.error.as_ref() {
+                json_arg_non_empty(&mut args, "error", error);
+            }
+            if let Some(method) = materialization
+                .method
+                .and_then(|method| buck2_data::MaterializationMethod::try_from(method).ok())
+            {
+                json_arg_non_empty(&mut args, "method", &format!("{method:?}"));
+            }
+        }
+        buck2_data::span_end_event::Data::CreateOutputSymlinks(symlinks) => {
+            json_arg_u64(&mut args, "created", symlinks.created);
+        }
+        buck2_data::span_end_event::Data::SpanCancelled(_) => {
+            json_arg_bool(&mut args, "cancelled", true);
+        }
+        _ => {}
+    }
+    args
+}
+
+fn profile_details(
+    name: impl Into<String>,
+    lane: ProfileLane,
+    category: &'static str,
+) -> ProfileSpanDetails {
+    ProfileSpanDetails {
+        name: name.into(),
+        lane,
+        category,
+        args: serde_json::Map::new(),
+    }
+}
+
+fn profile_action_start_details(action: &buck2_data::ActionExecutionStart) -> ProfileSpanDetails {
+    let mut details = profile_details(
+        profile_action_name(action.key.as_ref(), action.name.as_ref(), action.kind),
+        ProfileLane::Actions,
+        "action",
+    );
+    add_action_identity_args(
+        &mut details.args,
+        action.key.as_ref(),
+        action.name.as_ref(),
+        action.kind,
+    );
+    details
+}
+
+fn profile_action_end_details(action: &buck2_data::ActionExecutionEnd) -> ProfileSpanDetails {
+    let mut details = profile_details(
+        profile_action_name(action.key.as_ref(), action.name.as_ref(), action.kind),
+        ProfileLane::Actions,
+        "action",
+    );
+    add_action_identity_args(
+        &mut details.args,
+        action.key.as_ref(),
+        action.name.as_ref(),
+        action.kind,
+    );
+    details
+}
+
+fn profile_cache_upload_details(
+    key: &Option<buck2_data::ActionKey>,
+    name: &Option<buck2_data::ActionName>,
+    digest: &str,
+) -> ProfileSpanDetails {
+    let mut details = profile_details(
+        format!(
+            "upload {}",
+            profile_action_name(key.as_ref(), name.as_ref(), 0)
+        ),
+        ProfileLane::Cache,
+        "cache",
+    );
+    add_action_identity_args(&mut details.args, key.as_ref(), name.as_ref(), 0);
+    json_arg_non_empty(&mut details.args, "digest", digest);
+    details
+}
+
+fn profile_action_name(
+    key: Option<&buck2_data::ActionKey>,
+    name: Option<&buck2_data::ActionName>,
+    kind: i32,
+) -> String {
+    let mnemonic = profile_action_mnemonic(name, kind);
+    let label = key
+        .and_then(action_owner)
+        .and_then(label_for_configured_target);
+    let identifier = name
+        .map(|name| name.identifier.as_str())
+        .filter(|identifier| !identifier.is_empty());
+    match (label, identifier) {
+        (Some(label), Some(identifier)) => format!("{mnemonic}:{identifier} {label}"),
+        (Some(label), None) => format!("{mnemonic} {label}"),
+        (None, Some(identifier)) => format!("{mnemonic}:{identifier}"),
+        (None, None) => mnemonic,
+    }
+}
+
+fn profile_action_mnemonic(name: Option<&buck2_data::ActionName>, kind: i32) -> String {
+    if let Some(name) = name
+        && !name.category.is_empty()
+    {
+        return name.category.clone();
+    }
+    buck2_data::ActionKind::try_from(kind)
+        .ok()
+        .map(|kind| format!("{kind:?}"))
+        .unwrap_or_else(|| "Action".to_owned())
+}
+
+fn add_action_identity_args(
+    args: &mut serde_json::Map<String, serde_json::Value>,
+    key: Option<&buck2_data::ActionKey>,
+    name: Option<&buck2_data::ActionName>,
+    kind: i32,
+) {
+    if let Some(label) = key
+        .and_then(action_owner)
+        .and_then(label_for_configured_target)
+    {
+        json_arg_non_empty(args, "target", &label);
+    }
+    if let Some(key) = key {
+        json_arg_non_empty(args, "action_key", &key.key);
+    }
+    if let Some(name) = name {
+        json_arg_non_empty(args, "category", &name.category);
+        json_arg_non_empty(args, "identifier", &name.identifier);
+    }
+    if let Ok(kind) = buck2_data::ActionKind::try_from(kind) {
+        json_arg_non_empty(args, "action_kind", &format!("{kind:?}"));
+    }
+}
+
+fn profile_executor_stage_name(
+    stage: Option<&buck2_data::executor_stage_start::Stage>,
+) -> Option<String> {
+    Some(match stage? {
+        buck2_data::executor_stage_start::Stage::Re(re) => profile_re_stage_name(re.stage.as_ref()),
+        buck2_data::executor_stage_start::Stage::Local(local) => {
+            profile_local_stage_name(local.stage.as_ref())
+        }
+        buck2_data::executor_stage_start::Stage::CacheQuery(query) => match query.cache_type() {
+            buck2_data::CacheType::ActionCache => "action cache query".to_owned(),
+            buck2_data::CacheType::RemoteDepFileCache => "dep-file cache query".to_owned(),
+        },
+        buck2_data::executor_stage_start::Stage::CacheHit(hit) => match hit.cache_type() {
+            buck2_data::CacheType::ActionCache => "action cache hit".to_owned(),
+            buck2_data::CacheType::RemoteDepFileCache => "dep-file cache hit".to_owned(),
+        },
+        buck2_data::executor_stage_start::Stage::Prepare(_) => "prepare action".to_owned(),
+    })
+}
+
+fn profile_re_stage_name(stage: Option<&buck2_data::re_stage::Stage>) -> String {
+    match stage {
+        Some(buck2_data::re_stage::Stage::Execute(_)) => "remote execute",
+        Some(buck2_data::re_stage::Stage::Download(_)) => "remote download",
+        Some(buck2_data::re_stage::Stage::Queue(_)) => "remote queue",
+        Some(buck2_data::re_stage::Stage::WorkerDownload(_)) => "remote worker download",
+        Some(buck2_data::re_stage::Stage::WorkerUpload(_)) => "remote worker upload",
+        Some(buck2_data::re_stage::Stage::Unknown(_)) => "remote unknown",
+        Some(buck2_data::re_stage::Stage::MaterializeFailedInputs(_)) => {
+            "remote materialize failed inputs"
+        }
+        Some(buck2_data::re_stage::Stage::BeforeActionExecution(_)) => "remote before action",
+        Some(buck2_data::re_stage::Stage::AfterActionExecution(_)) => "remote after action",
+        Some(buck2_data::re_stage::Stage::QueueOverQuota(_)) => "remote queue over quota",
+        Some(buck2_data::re_stage::Stage::QueueNoWorkerAvailable(_)) => "remote queue no worker",
+        Some(buck2_data::re_stage::Stage::QueueAcquiringDependencies(_)) => {
+            "remote queue dependencies"
+        }
+        Some(buck2_data::re_stage::Stage::QueueCancelled(_)) => "remote queue cancelled",
+        None => "remote stage",
+    }
+    .to_owned()
+}
+
+fn profile_local_stage_name(stage: Option<&buck2_data::local_stage::Stage>) -> String {
+    match stage {
+        Some(buck2_data::local_stage::Stage::Queued(_)) => "local queued",
+        Some(buck2_data::local_stage::Stage::Execute(_)) => "local execute",
+        Some(buck2_data::local_stage::Stage::MaterializeInputs(_)) => "local materialize inputs",
+        Some(buck2_data::local_stage::Stage::PrepareOutputs(_)) => "local prepare outputs",
+        Some(buck2_data::local_stage::Stage::AcquireLocalResource(_)) => "local acquire resource",
+        Some(buck2_data::local_stage::Stage::WorkerInit(_)) => "worker init",
+        Some(buck2_data::local_stage::Stage::WorkerExecute(_)) => "worker execute",
+        Some(buck2_data::local_stage::Stage::WorkerQueued(_)) => "worker queued",
+        Some(buck2_data::local_stage::Stage::WorkerWait(_)) => "worker wait",
+        None => "local stage",
+    }
+    .to_owned()
+}
+
+fn dynamic_lambda_target_label(
+    lambda: &buck2_data::DynamicLambdaStart,
+) -> Option<&buck2_data::ConfiguredTargetLabel> {
+    match lambda.owner.as_ref()? {
+        buck2_data::dynamic_lambda_start::Owner::TargetLabel(target) => Some(target),
+        buck2_data::dynamic_lambda_start::Owner::BxlKey(_)
+        | buck2_data::dynamic_lambda_start::Owner::AnonTarget(_) => None,
+    }
+}
+
+fn profile_dice_span_name(data: &buck2_data::span_start_event::Data) -> &'static str {
+    match data {
+        buck2_data::span_start_event::Data::DiceStateUpdate(_) => "dice state update",
+        buck2_data::span_start_event::Data::DiceCriticalSection(_) => "dice critical section",
+        buck2_data::span_start_event::Data::DiceBlockConcurrentCommand(_) => {
+            "dice block concurrent command"
+        }
+        buck2_data::span_start_event::Data::DiceSynchronizeSection(_) => "dice synchronize",
+        buck2_data::span_start_event::Data::DiceCleanup(_) => "dice cleanup",
+        _ => "dice",
+    }
+}
+
+fn action_execution_strategy_for_profile(command: &buck2_data::CommandExecution) -> &'static str {
+    command
+        .details
+        .as_ref()
+        .and_then(|details| details.command_kind.as_ref())
+        .and_then(|kind| kind.command.as_ref())
+        .map(|command| action_execution_strategy(Some(command)))
+        .unwrap_or("unknown")
+}
+
+fn add_command_profile_args(
+    args: &mut serde_json::Map<String, serde_json::Value>,
+    command: &buck2_data::CommandExecution,
+) {
+    let Some(details) = command.details.as_ref() else {
+        return;
+    };
+    if let Some(exit_code) = details.signed_exit_code {
+        json_arg_i64(args, "exit_code", i64::from(exit_code));
+    }
+    json_arg_duration_ms(
+        args,
+        "wall_time_ms",
+        details.metadata.as_ref().and_then(|m| m.wall_time.as_ref()),
+    );
+    json_arg_duration_ms(
+        args,
+        "execution_time_ms",
+        details
+            .metadata
+            .as_ref()
+            .and_then(|m| m.execution_time.as_ref()),
+    );
+    json_arg_duration_ms(
+        args,
+        "queue_duration_ms",
+        details
+            .metadata
+            .as_ref()
+            .and_then(|m| m.queue_duration.as_ref()),
+    );
+}
+
+fn json_arg_non_empty(
+    args: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    value: &str,
+) {
+    if !value.is_empty() {
+        args.insert(name.to_owned(), serde_json::json!(value));
+    }
+}
+
+fn json_arg_bool(args: &mut serde_json::Map<String, serde_json::Value>, name: &str, value: bool) {
+    args.insert(name.to_owned(), serde_json::json!(value));
+}
+
+fn json_arg_i64(args: &mut serde_json::Map<String, serde_json::Value>, name: &str, value: i64) {
+    args.insert(name.to_owned(), serde_json::json!(value));
+}
+
+fn json_arg_u64(args: &mut serde_json::Map<String, serde_json::Value>, name: &str, value: u64) {
+    args.insert(name.to_owned(), serde_json::json!(value));
+}
+
+fn json_arg_duration_ms(
+    args: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    duration: Option<&prost_types::Duration>,
+) {
+    if let Some(duration) = duration {
+        json_arg_i64(args, name, duration_millis(duration));
+    }
+}
+
+fn extend_json_map(
+    args: &mut serde_json::Map<String, serde_json::Value>,
+    more: serde_json::Map<String, serde_json::Value>,
+) {
+    for (key, value) in more {
+        args.insert(key, value);
+    }
+}
+
+fn serialize_trace_events(events: &[serde_json::Value]) -> serde_json::Result<String> {
+    let mut profile = "{\"traceEvents\":[\n".to_owned();
+    for (i, event) in events.iter().enumerate() {
+        if i != 0 {
+            profile.push_str(",\n");
+        }
+        profile.push_str(&serde_json::to_string(event)?);
+    }
+    profile.push_str("\n]}\n");
+    Ok(profile)
+}
+
+fn gzip_profile_json(profile: String) -> Option<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(profile.as_bytes()).ok()?;
+    encoder.finish().ok()
+}
+
+fn build_tool_logs_event_from_command_end(
+    event: &buck2_data::BuckEvent,
+    span_end: &buck2_data::SpanEndEvent,
+    command: &buck2_data::CommandEnd,
+    profile: &CommandProfileBuilder,
+) -> bep::BuildEvent {
+    let command_name = command_end_name(command);
+    let outcome = if command.is_success {
+        "success"
+    } else {
+        "failed"
+    };
+    let exit_code = if command.is_success { 0 } else { 1 };
+    let duration_ms = optional_duration_millis(span_end.duration.as_ref());
+    let summary = serde_json::json!({
+        "tool": BUILD_TOOL_VERSION,
+        "command": command_name,
+        "outcome": outcome,
+        "exit_code": exit_code,
+        "timings_ms": {
+            "command": duration_ms,
+        },
+    });
+    let summary = serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_owned());
+    let mut logs = vec![file_with_contents("buck2-invocation.json", summary)];
+    if let Some(profile) = profile.command_end_profile_gzip(event, span_end, command) {
+        logs.push(file_with_bytes(COMMAND_PROFILE_NAME, profile));
+    }
+    build_tool_logs_event(logs)
+}
+
+fn build_tool_logs_event_from_invocation(
+    record: &buck2_data::InvocationRecord,
+    profile: &CommandProfileBuilder,
+) -> bep::BuildEvent {
     let target_patterns = record
         .parsed_target_patterns
         .as_ref()
@@ -1709,14 +3010,141 @@ fn build_tool_logs_event_from_invocation(record: &buck2_data::InvocationRecord) 
         },
     });
     let summary = serde_json::to_string_pretty(&summary).unwrap_or_else(|_| "{}".to_owned());
+    let mut logs = vec![file_with_contents("buck2-invocation.json", summary)];
+    if let Some(profile) = profile
+        .invocation_profile_gzip(record)
+        .or_else(|| command_profile_gzip(record))
+    {
+        logs.push(file_with_bytes(COMMAND_PROFILE_NAME, profile));
+    }
+    build_tool_logs_event(logs)
+}
+
+fn build_tool_logs_event(logs: Vec<bep::File>) -> bep::BuildEvent {
     bep::BuildEvent {
         id: Some(build_tool_logs_id()),
         children: Vec::new(),
         payload: Some(build_event::Payload::BuildToolLogs(bep::BuildToolLogs {
-            log: vec![file_with_contents("buck2-invocation.json", summary)],
+            log: logs,
         })),
         last_message: false,
     }
+}
+
+fn command_profile_gzip(record: &buck2_data::InvocationRecord) -> Option<Vec<u8>> {
+    gzip_profile_json(command_profile_json(record).ok()?)
+}
+
+fn command_profile_json(record: &buck2_data::InvocationRecord) -> serde_json::Result<String> {
+    let command_duration_us = record
+        .command_duration
+        .as_ref()
+        .or(record.client_walltime.as_ref())
+        .map(duration_micros)
+        .unwrap_or_default()
+        .max(1);
+    let command = record.command_name.as_deref().unwrap_or("unknown");
+    let outcome = invocation_outcome_name(record.outcome);
+    let total_actions = record
+        .run_local_count
+        .saturating_add(record.run_remote_count)
+        .saturating_add(record.run_action_cache_count)
+        .saturating_add(record.run_remote_dep_file_cache_count)
+        .saturating_add(record.run_skipped_count);
+
+    let mut trace_events = vec![
+        serde_json::json!({
+            "name": "thread_name",
+            "ph": "M",
+            "pid": 1,
+            "tid": 1,
+            "args": { "name": "Buck2 command" },
+        }),
+        serde_json::json!({
+            "name": format!("buck2 {command}"),
+            "cat": "command",
+            "ph": "X",
+            "ts": 0,
+            "dur": command_duration_us,
+            "pid": 1,
+            "tid": 1,
+            "args": {
+                "outcome": outcome,
+                "exit_code": record.exit_code,
+                "exit_result_name": record.exit_result_name.as_deref(),
+                "cache_hit_rate": record.cache_hit_rate,
+                "re_session_id": record.re_session_id.as_str(),
+            },
+        }),
+        serde_json::json!({
+            "name": "action count",
+            "cat": "buck2",
+            "ph": "C",
+            "ts": command_duration_us,
+            "pid": 1,
+            "tid": 1,
+            "args": {
+                "action": total_actions,
+                "local action": record.run_local_count,
+                "remote action": record.run_remote_count,
+                "local action cache": record.run_action_cache_count,
+                "remote dep file cache": record.run_remote_dep_file_cache_count,
+                "skipped action": record.run_skipped_count,
+            },
+        }),
+    ];
+
+    if let (Some(first), Some(last)) = (
+        record.time_to_first_action_execution_ms,
+        record.time_to_last_action_execution_end_ms,
+    ) && last >= first
+    {
+        trace_events.push(serde_json::json!({
+            "name": "thread_name",
+            "ph": "M",
+            "pid": 1,
+            "tid": 2,
+            "args": { "name": "Buck2 actions" },
+        }));
+        trace_events.push(serde_json::json!({
+            "name": "action execution",
+            "cat": "action",
+            "ph": "X",
+            "ts": first.saturating_mul(1000),
+            "dur": last.saturating_sub(first).max(1).saturating_mul(1000),
+            "pid": 1,
+            "tid": 2,
+            "args": {
+                "local": record.run_local_count,
+                "remote": record.run_remote_count,
+                "remote_cache": record.run_action_cache_count,
+                "skipped": record.run_skipped_count,
+            },
+        }));
+    }
+
+    if let Some(critical_path) = record.critical_path_duration.as_ref() {
+        let critical_path_us = duration_micros(critical_path).max(1);
+        trace_events.push(serde_json::json!({
+            "name": "thread_name",
+            "ph": "M",
+            "pid": 1,
+            "tid": 3,
+            "args": { "name": "Buck2 critical path" },
+        }));
+        trace_events.push(serde_json::json!({
+            "name": "critical path",
+            "cat": "critical_path",
+            "ph": "X",
+            "ts": command_duration_us.saturating_sub(critical_path_us),
+            "dur": critical_path_us,
+            "pid": 1,
+            "tid": 3,
+            "args": {},
+        }));
+    }
+
+    serialize_trace_events(&trace_events)
 }
 
 fn configured_target_children_from_build_targets(
@@ -2477,6 +3905,17 @@ fn file_with_contents(name: &str, contents: String) -> bep::File {
     }
 }
 
+fn file_with_bytes(name: &str, contents: Vec<u8>) -> bep::File {
+    let length = contents.len() as i64;
+    bep::File {
+        name: name.to_owned(),
+        path_prefix: Vec::new(),
+        file: Some(bep::file::File::Contents(contents)),
+        digest: String::new(),
+        length,
+    }
+}
+
 fn test_status(status: i32) -> i32 {
     match buck2_data::TestStatus::try_from(status) {
         Ok(buck2_data::TestStatus::Pass) | Ok(buck2_data::TestStatus::ListingSuccess) => {
@@ -2760,6 +4199,9 @@ fn first_metadata(metadata: &HashMap<String, String>, keys: &[&str]) -> Option<S
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
+    use flate2::read::GzDecoder;
     use prost::Message as _;
 
     use super::*;
@@ -2775,6 +4217,44 @@ mod tests {
             parent_id: 0,
             data: Some(data),
         }
+    }
+
+    fn trace_event_at(
+        span_id: u64,
+        parent_id: u64,
+        micros: i64,
+        data: buck2_data::buck_event::Data,
+    ) -> buck2_data::BuckEvent {
+        buck2_data::BuckEvent {
+            timestamp: Some(Timestamp {
+                seconds: 1 + micros / 1_000_000,
+                nanos: ((micros % 1_000_000) * 1_000) as i32,
+            }),
+            trace_id: "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa".to_owned(),
+            span_id,
+            parent_id,
+            data: Some(data),
+        }
+    }
+
+    fn decode_profile_from_logs(logs: &bep::BuildToolLogs) -> serde_json::Value {
+        let profile_contents = logs
+            .log
+            .iter()
+            .find(|log| log.name == COMMAND_PROFILE_NAME)
+            .and_then(|log| log.file.as_ref())
+            .unwrap_or_else(|| panic!("expected {COMMAND_PROFILE_NAME}"));
+        let profile_contents = match profile_contents {
+            bep::file::File::Contents(contents) => contents,
+            other => panic!("expected inline command profile, got {other:?}"),
+        };
+        let mut decoder = GzDecoder::new(profile_contents.as_slice());
+        let mut profile = String::new();
+        decoder
+            .read_to_string(&mut profile)
+            .expect("valid gzip profile");
+        assert!(profile.contains("\"traceEvents\":[\n"));
+        serde_json::from_str(&profile).expect("valid profile json")
     }
 
     fn configured_target() -> buck2_data::ConfiguredTargetLabel {
@@ -3053,6 +4533,7 @@ mod tests {
             })
             .expect("build tool logs event");
         assert_eq!(logs.log[0].name, "buck2-invocation.json");
+        assert_eq!(logs.log[1].name, COMMAND_PROFILE_NAME);
         let contents = match logs.log[0].file.as_ref() {
             Some(bep::file::File::Contents(contents)) => contents,
             other => panic!("expected inline invocation summary, got {other:?}"),
@@ -3063,6 +4544,25 @@ mod tests {
         assert_eq!(summary["outcome"], "success");
         assert_eq!(summary["re_session_id"], "re-session");
         assert_eq!(summary["actions"]["remote_cache"], 5);
+        let profile_contents = match logs.log[1].file.as_ref() {
+            Some(bep::file::File::Contents(contents)) => contents,
+            other => panic!("expected inline command profile, got {other:?}"),
+        };
+        let mut decoder = GzDecoder::new(profile_contents.as_slice());
+        let mut profile = String::new();
+        decoder
+            .read_to_string(&mut profile)
+            .expect("valid gzip profile");
+        assert!(profile.contains("\"traceEvents\":[\n"));
+        let profile_json: serde_json::Value =
+            serde_json::from_str(&profile).expect("valid profile json");
+        assert!(
+            profile_json["traceEvents"]
+                .as_array()
+                .expect("trace events array")
+                .iter()
+                .any(|event| event["name"] == "buck2 build")
+        );
     }
 
     #[test]
@@ -3083,6 +4583,10 @@ mod tests {
                             }),
                         },
                     )),
+                    duration: Some(prost_types::Duration {
+                        seconds: 2,
+                        nanos: 500_000_000,
+                    }),
                     ..Default::default()
                 },
             )),
@@ -3099,6 +4603,216 @@ mod tests {
         let exit_code = finished.exit_code.as_ref().expect("exit code");
         assert_eq!(exit_code.code, 1);
         assert_eq!(exit_code.name, "FAILED");
+
+        let logs = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::BuildToolLogs(logs)) => Some(logs),
+                _ => None,
+            })
+            .expect("build tool logs event");
+        assert_eq!(logs.log[1].name, COMMAND_PROFILE_NAME);
+        let profile_contents = match logs.log[1].file.as_ref() {
+            Some(bep::file::File::Contents(contents)) => contents,
+            other => panic!("expected inline command profile, got {other:?}"),
+        };
+        let mut decoder = GzDecoder::new(profile_contents.as_slice());
+        let mut profile = String::new();
+        decoder
+            .read_to_string(&mut profile)
+            .expect("valid gzip profile");
+        let profile_json: serde_json::Value =
+            serde_json::from_str(&profile).expect("valid profile json");
+        assert!(
+            profile_json["traceEvents"]
+                .as_array()
+                .expect("trace events array")
+                .iter()
+                .any(|event| event["name"] == "buck2 query" && event["dur"] == 2_500_000)
+        );
+    }
+
+    #[test]
+    fn command_profile_includes_buck_spans_and_lanes() {
+        let mut converter = BazelEventConverter::default();
+        let target = configured_target();
+        let command_start = trace_event_at(
+            1,
+            0,
+            0,
+            buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                data: Some(buck2_data::span_start_event::Data::Command(
+                    buck2_data::CommandStart {
+                        cli_args: vec![
+                            "buck2".to_owned(),
+                            "build".to_owned(),
+                            "//:main".to_owned(),
+                        ],
+                        data: Some(buck2_data::command_start::Data::Build(
+                            buck2_data::BuildCommandStart {},
+                        )),
+                        ..Default::default()
+                    },
+                )),
+            }),
+        );
+        converter.convert(1, &command_start);
+
+        let analysis_start = trace_event_at(
+            2,
+            1,
+            1_000,
+            buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                data: Some(buck2_data::span_start_event::Data::Analysis(
+                    buck2_data::AnalysisStart {
+                        target: Some(buck2_data::analysis_start::Target::StandardTarget(
+                            target.clone(),
+                        )),
+                        rule: "genrule".to_owned(),
+                    },
+                )),
+            }),
+        );
+        converter.convert(2, &analysis_start);
+
+        let analysis_end = trace_event_at(
+            2,
+            1,
+            11_000,
+            buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+                data: Some(buck2_data::span_end_event::Data::Analysis(
+                    buck2_data::AnalysisEnd {
+                        target: Some(buck2_data::analysis_end::Target::StandardTarget(
+                            target.clone(),
+                        )),
+                        rule: "genrule".to_owned(),
+                        declared_actions: Some(1),
+                        ..Default::default()
+                    },
+                )),
+                duration: Some(prost_types::Duration {
+                    seconds: 0,
+                    nanos: 10_000_000,
+                }),
+                ..Default::default()
+            }),
+        );
+        converter.convert(3, &analysis_end);
+
+        let action_key = buck2_data::ActionKey {
+            owner: Some(buck2_data::action_key::Owner::TargetLabel(target.clone())),
+            key: "action-key".to_owned(),
+            ..Default::default()
+        };
+        let action_name = buck2_data::ActionName {
+            category: "write".to_owned(),
+            identifier: "main".to_owned(),
+        };
+        let action_start = trace_event_at(
+            3,
+            1,
+            12_000,
+            buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                data: Some(buck2_data::span_start_event::Data::ActionExecution(
+                    buck2_data::ActionExecutionStart {
+                        key: Some(action_key.clone()),
+                        kind: buck2_data::ActionKind::Write as i32,
+                        name: Some(action_name.clone()),
+                    },
+                )),
+            }),
+        );
+        converter.convert(4, &action_start);
+
+        let action_end = trace_event_at(
+            3,
+            1,
+            32_000,
+            buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+                data: Some(buck2_data::span_end_event::Data::ActionExecution(Box::new(
+                    buck2_data::ActionExecutionEnd {
+                        key: Some(action_key),
+                        kind: buck2_data::ActionKind::Write as i32,
+                        name: Some(action_name),
+                        execution_kind: buck2_data::ActionExecutionKind::Local as i32,
+                        output_size: 42,
+                        ..Default::default()
+                    },
+                ))),
+                duration: Some(prost_types::Duration {
+                    seconds: 0,
+                    nanos: 20_000_000,
+                }),
+                ..Default::default()
+            }),
+        );
+        converter.convert(5, &action_end);
+
+        let command_end = trace_event_at(
+            1,
+            0,
+            50_000,
+            buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+                data: Some(buck2_data::span_end_event::Data::Command(
+                    buck2_data::CommandEnd {
+                        data: Some(buck2_data::command_end::Data::Build(
+                            buck2_data::BuildCommandEnd::default(),
+                        )),
+                        is_success: true,
+                        ..Default::default()
+                    },
+                )),
+                duration: Some(prost_types::Duration {
+                    seconds: 0,
+                    nanos: 50_000_000,
+                }),
+                ..Default::default()
+            }),
+        );
+        let events = converter.convert(6, &command_end);
+        let logs = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::BuildToolLogs(logs)) => Some(logs),
+                _ => None,
+            })
+            .expect("build tool logs event");
+        let profile_json = decode_profile_from_logs(logs);
+        let trace_events = profile_json["traceEvents"]
+            .as_array()
+            .expect("trace events array");
+        assert!(
+            trace_events
+                .iter()
+                .filter(|event| event["ph"] == "X")
+                .count()
+                >= 3
+        );
+        assert!(
+            trace_events
+                .iter()
+                .any(|event| { event["ph"] == "M" && event["args"]["name"] == "Buck2 command" })
+        );
+        assert!(
+            trace_events
+                .iter()
+                .any(|event| { event["ph"] == "M" && event["args"]["name"] == "Buck2 analysis" })
+        );
+        assert!(
+            trace_events
+                .iter()
+                .any(|event| event["ph"] == "M" && event["args"]["name"] == "Buck2 actions")
+        );
+        assert!(
+            trace_events
+                .iter()
+                .any(|event| event["name"] == "analysis //pkg:main")
+        );
+        assert!(
+            trace_events
+                .iter()
+                .any(|event| event["name"] == "write:main //pkg:main")
+        );
     }
 
     #[test]
