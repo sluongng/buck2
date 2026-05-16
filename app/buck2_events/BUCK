@@ -13,6 +13,7 @@ rust_library(
         "fbsource//third-party/rust:console",
         "fbsource//third-party/rust:crossbeam-channel",
         "fbsource//third-party/rust:derive_more",
+        "fbsource//third-party/rust:flate2",
         "fbsource//third-party/rust:futures",
         "fbsource//third-party/rust:hostname",
         "fbsource//third-party/rust:is_proc_translated",
