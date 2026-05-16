@@ -5195,6 +5195,7 @@ mod tests {
                             commands: vec![buck2_data::CommandExecution {
                                 details: Some(buck2_data::CommandExecutionDetails {
                                     signed_exit_code: Some(1),
+                                    cmd_stdout: "compiler stdout".to_owned(),
                                     cmd_stderr: "compile failed".to_owned(),
                                     command_kind: Some(buck2_data::CommandExecutionKind {
                                         command: Some(
@@ -5307,6 +5308,30 @@ mod tests {
         let Some(build_event::Payload::Action(action_payload)) = action[0].payload.as_ref() else {
             panic!("expected ActionExecuted payload");
         };
+        let action_stdout = match action_payload
+            .stdout
+            .as_ref()
+            .and_then(|file| file.file.as_ref())
+        {
+            Some(bep::file::File::Contents(contents)) => contents,
+            other => panic!("expected inline action stdout, got {other:?}"),
+        };
+        assert_eq!(
+            std::str::from_utf8(action_stdout).expect("action stdout utf8"),
+            "compiler stdout"
+        );
+        let action_stderr = match action_payload
+            .stderr
+            .as_ref()
+            .and_then(|file| file.file.as_ref())
+        {
+            Some(bep::file::File::Contents(contents)) => contents,
+            other => panic!("expected inline action stderr, got {other:?}"),
+        };
+        assert_eq!(
+            std::str::from_utf8(action_stderr).expect("action stderr utf8"),
+            "compile failed"
+        );
         assert_eq!(
             action_payload
                 .failure_detail
