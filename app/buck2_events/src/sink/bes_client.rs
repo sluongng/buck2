@@ -70,6 +70,7 @@ pub struct BesConfig {
     pub grpc_timeout: Duration,
     pub bes_backend: Option<String>,
     pub bes_headers: Vec<(String, String)>,
+    pub build_metadata: Vec<(String, String)>,
     pub event_format: BesEventFormat,
     pub bazel_artifact_upload: bool,
     pub upload_successful_action_events: bool,
@@ -98,6 +99,7 @@ impl Default for BesConfig {
             grpc_timeout: Duration::from_secs(10),
             bes_backend: None,
             bes_headers: Vec::new(),
+            build_metadata: Vec::new(),
             event_format: BesEventFormat::Buck,
             bazel_artifact_upload: true,
             upload_successful_action_events: true,
@@ -143,6 +145,7 @@ pub struct Message {
 
 struct SendNowRequest {
     messages: Vec<Message>,
+    wait_for_acks: bool,
     done: oneshot::Sender<buck2_error::Result<()>>,
 }
 
@@ -683,10 +686,11 @@ impl BesClient {
         }
     }
 
-    // Send through a dedicated priority lane on the background worker and wait
-    // for completion. This keeps emergency delivery semantics while reusing the
-    // worker's existing per-invocation stream state.
-    pub async fn send_messages_now(&self, messages: Vec<Message>) -> buck2_error::Result<()> {
+    async fn send_messages_with_priority(
+        &self,
+        messages: Vec<Message>,
+        wait_for_acks: bool,
+    ) -> buck2_error::Result<()> {
         if messages.is_empty() {
             return Ok(());
         }
@@ -695,6 +699,7 @@ impl BesClient {
         self.send_now_tx
             .send(SendNowRequest {
                 messages,
+                wait_for_acks,
                 done: done_tx,
             })
             .map_err(|_| {
@@ -710,6 +715,20 @@ impl BesClient {
                 "BES worker dropped priority send response channel"
             )
         })?
+    }
+
+    // Send through a dedicated priority lane on the background worker and wait
+    // for completion. This keeps emergency delivery semantics while reusing the
+    // worker's existing per-invocation stream state.
+    pub async fn send_messages_now(&self, messages: Vec<Message>) -> buck2_error::Result<()> {
+        self.send_messages_with_priority(messages, true).await
+    }
+
+    pub async fn send_messages_without_waiting_for_acks(
+        &self,
+        messages: Vec<Message>,
+    ) -> buck2_error::Result<()> {
+        self.send_messages_with_priority(messages, false).await
     }
 
     pub fn export_counters(&self) -> Counters {
@@ -731,7 +750,8 @@ fn process_send_now_request(
     worker: &mut WorkerState,
     request: SendNowRequest,
 ) {
-    // Desired behavior (mirroring Bazel's BES uploader semantics):
+    // Desired behavior for the ACK-waiting path (mirroring Bazel's BES
+    // uploader semantics):
     //
     // 1) `send_messages_now()` is an emergency path. Returning `Ok(())` means all events from this
     //    request were ACKed by BES.
@@ -762,7 +782,7 @@ fn process_send_now_request(
             }
         }
     }
-    if result.is_ok() && !ack_targets.is_empty() {
+    if request.wait_for_acks && result.is_ok() && !ack_targets.is_empty() {
         if let Err(status) = runtime.block_on(worker.wait_for_acks(&ack_targets)) {
             worker.record_status_failure(&status);
             result = Err(buck2_error::buck2_error!(
@@ -921,7 +941,7 @@ impl WorkerState {
             return Ok(());
         }
         let upload_config = BazelArtifactUploadConfig::from_bes(&self.config, &self.connection)?;
-        let stream = StreamState::new(parsed, upload_config);
+        let stream = StreamState::new(parsed, &self.config.build_metadata, upload_config);
         self.streams.insert(parsed.invocation_id.clone(), stream);
         Ok(())
     }
@@ -1211,6 +1231,7 @@ struct PendingClose {
 impl StreamState {
     fn new(
         parsed: &ParsedMessage,
+        build_metadata: &[(String, String)],
         bazel_artifact_upload_config: Option<BazelArtifactUploadConfig>,
     ) -> Self {
         Self {
@@ -1225,7 +1246,7 @@ impl StreamState {
             ack_task: None,
             project_id: parsed.project_id.clone(),
             pending_unacked: VecDeque::new(),
-            bazel_converter: BazelEventConverter::default(),
+            bazel_converter: BazelEventConverter::new(build_metadata.iter().cloned()),
             bazel_artifact_uploader: bazel_artifact_upload_config.map(BazelArtifactUploader::new),
             last_sent_sequence_number: 0,
             saw_command_end: false,
@@ -1841,7 +1862,7 @@ mod tests {
             command_start_data(),
         );
         let parsed = ParsedMessage::from_message(&message).expect("valid message");
-        let mut stream = StreamState::new(&parsed, None);
+        let mut stream = StreamState::new(&parsed, &[], None);
 
         let last_sequence = stream.enqueue_event(&parsed, BesEventFormat::Bazel).await;
 

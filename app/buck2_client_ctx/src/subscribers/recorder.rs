@@ -423,6 +423,8 @@ impl InvocationRecorder {
                 #[cfg(not(fbcode_build))]
                 bes_headers: Vec::new(),
                 #[cfg(not(fbcode_build))]
+                build_metadata: Vec::new(),
+                #[cfg(not(fbcode_build))]
                 event_format: Default::default(),
                 #[cfg(not(fbcode_build))]
                 bazel_artifact_upload: true,
@@ -651,6 +653,8 @@ impl InvocationRecorder {
                 bes_backend: None,
                 #[cfg(not(fbcode_build))]
                 bes_headers: Vec::new(),
+                #[cfg(not(fbcode_build))]
+                build_metadata: Vec::new(),
                 #[cfg(not(fbcode_build))]
                 event_format: Default::default(),
                 #[cfg(not(fbcode_build))]
