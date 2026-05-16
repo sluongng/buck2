@@ -39,6 +39,8 @@ const MAX_INLINE_FILE_BYTES: usize = 16 * 1024;
 const CANONICAL_COMMAND_LINE_LABEL: &str = "canonical";
 const ORIGINAL_COMMAND_LINE_LABEL: &str = "original";
 const STRUCT_TYPE_URL: &str = "type.googleapis.com/google.protobuf.Struct";
+const BUILDBUDDY_VISIBILITY_KEY: &str = "VISIBILITY";
+const BUILDBUDDY_PUBLIC_VISIBILITY: &str = "PUBLIC";
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TargetKey {
@@ -1398,6 +1400,9 @@ fn build_metadata_event_from_command(command: &buck2_data::CommandStart) -> bep:
     if env::var("CI").is_ok_and(|ci| !ci.is_empty()) {
         metadata.entry("ROLE".to_owned()).or_insert("CI".to_owned());
     }
+    metadata
+        .entry(BUILDBUDDY_VISIBILITY_KEY.to_owned())
+        .or_insert_with(|| BUILDBUDDY_PUBLIC_VISIBILITY.to_owned());
     build_metadata_event(&metadata)
 }
 
@@ -2880,6 +2885,28 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.payload, Some(build_event::Payload::Configuration(_))))
         );
+        let build_metadata = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::BuildMetadata(metadata)) => Some(metadata),
+                _ => None,
+            })
+            .expect("build metadata");
+        assert_eq!(
+            build_metadata
+                .metadata
+                .get(BUILDBUDDY_VISIBILITY_KEY)
+                .map(String::as_str),
+            Some(BUILDBUDDY_PUBLIC_VISIBILITY)
+        );
+        assert_eq!(
+            build_metadata.metadata.get("USER").map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            build_metadata.metadata.get("HOST").map(String::as_str),
+            Some("workstation")
+        );
 
         let any = encode_bep_event(&events[0]);
         assert_eq!(any.type_url, BEP_EVENT_TYPE_URL);
@@ -2888,6 +2915,26 @@ mod tests {
             decoded.payload,
             Some(build_event::Payload::Started(_))
         ));
+    }
+
+    #[test]
+    fn command_start_preserves_explicit_buildbuddy_visibility() {
+        let event = build_metadata_event_from_command(&buck2_data::CommandStart {
+            metadata: HashMap::from([(BUILDBUDDY_VISIBILITY_KEY.to_owned(), "PRIVATE".to_owned())]),
+            ..Default::default()
+        });
+
+        let build_metadata = match event.payload.as_ref() {
+            Some(build_event::Payload::BuildMetadata(metadata)) => metadata,
+            other => panic!("expected build metadata, got {other:?}"),
+        };
+        assert_eq!(
+            build_metadata
+                .metadata
+                .get(BUILDBUDDY_VISIBILITY_KEY)
+                .map(String::as_str),
+            Some("PRIVATE")
+        );
     }
 
     #[test]
