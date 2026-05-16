@@ -18,6 +18,15 @@ fn truncate(s: &str, max_bytes: usize) -> String {
 
 #[cfg_attr(not(fbcode_build), allow(dead_code))]
 pub(crate) fn smart_truncate_event(d: &mut buck2_data::buck_event::Data) {
+    smart_truncate_event_impl(d, false)
+}
+
+#[cfg(not(fbcode_build))]
+pub(crate) fn smart_truncate_event_preserving_logs(d: &mut buck2_data::buck_event::Data) {
+    smart_truncate_event_impl(d, true)
+}
+
+fn smart_truncate_event_impl(d: &mut buck2_data::buck_event::Data, preserve_logs: bool) {
     use buck2_data::buck_event::Data;
 
     match d {
@@ -26,16 +35,16 @@ pub(crate) fn smart_truncate_event(d: &mut buck2_data::buck_event::Data) {
 
             match &mut s.data {
                 Some(Data::ActionExecution(action_execution)) => {
-                    truncate_action_execution_end(action_execution);
+                    truncate_action_execution_end(action_execution, preserve_logs);
                 }
                 Some(Data::Command(command_end)) => {
                     truncate_command_end(command_end, false);
                 }
                 Some(Data::TestRun(test_end)) => {
-                    truncate_test_end(test_end);
+                    truncate_test_end(test_end, preserve_logs);
                 }
                 Some(Data::TestDiscovery(test_discovery_end)) => {
-                    truncate_test_discovery_end(test_discovery_end);
+                    truncate_test_discovery_end(test_discovery_end, preserve_logs);
                 }
                 _ => {}
             };
@@ -112,7 +121,10 @@ fn truncate_invocation_record(invocation_record: &mut buck2_data::InvocationReco
     }
 }
 
-fn truncate_action_execution_end(action_execution_end: &mut buck2_data::ActionExecutionEnd) {
+fn truncate_action_execution_end(
+    action_execution_end: &mut buck2_data::ActionExecutionEnd,
+    preserve_logs: bool,
+) {
     let per_command_size_budget = (500 * 1024) / action_execution_end.commands.len().max(1);
 
     let truncate_cmd = |cmd: &mut buck2_data::CommandExecution, truncate_all: bool| {
@@ -128,6 +140,13 @@ fn truncate_action_execution_end(action_execution_end: &mut buck2_data::ActionEx
         }
     };
 
+    if preserve_logs {
+        for command in &mut action_execution_end.commands {
+            truncate_command_std_streams(command, per_command_size_budget);
+        }
+        return;
+    }
+
     if let Some((last_command, retries)) = action_execution_end.commands.split_last_mut() {
         for retried in retries {
             truncate_cmd(retried, false);
@@ -135,6 +154,13 @@ fn truncate_action_execution_end(action_execution_end: &mut buck2_data::ActionEx
         // Current Scribe tailers don't read stderr of successful actions.
         // Save some bytes.
         truncate_cmd(last_command, !action_execution_end.failed);
+    }
+}
+
+fn truncate_command_std_streams(command: &mut buck2_data::CommandExecution, max_bytes: usize) {
+    if let Some(details) = &mut command.details {
+        details.cmd_stdout = truncate(&console::strip_ansi_codes(&details.cmd_stdout), max_bytes);
+        details.cmd_stderr = truncate(&console::strip_ansi_codes(&details.cmd_stderr), max_bytes);
     }
 }
 
@@ -179,7 +205,7 @@ fn truncate_file_watcher_stats(file_watcher_stats: &mut buck2_data::FileWatcherS
     }
 }
 
-fn truncate_test_end(test_end: &mut buck2_data::TestRunEnd) {
+fn truncate_test_end(test_end: &mut buck2_data::TestRunEnd, preserve_logs: bool) {
     const MAX_TEST_NAMES_BYTES: usize = 512 * 1024;
     if let Some(ref mut suite) = test_end.suite {
         let orig_len = suite.test_names.len();
@@ -197,6 +223,10 @@ fn truncate_test_end(test_end: &mut buck2_data::TestRunEnd) {
 
     // Scribe tailer logs neither stdout nor stderr of tests, so don't send these.
     if let Some(ref mut command_report) = test_end.command_report {
+        if preserve_logs {
+            truncate_command_std_streams(command_report, 20 * 1024);
+            return;
+        }
         if let Some(ref mut details) = command_report.details {
             if !details.cmd_stdout.is_empty() {
                 details.cmd_stdout = "<<omitted>>".to_owned();
@@ -208,9 +238,16 @@ fn truncate_test_end(test_end: &mut buck2_data::TestRunEnd) {
     }
 }
 
-fn truncate_test_discovery_end(test_discovery_end: &mut buck2_data::TestDiscoveryEnd) {
+fn truncate_test_discovery_end(
+    test_discovery_end: &mut buck2_data::TestDiscoveryEnd,
+    preserve_logs: bool,
+) {
     // Scribe tailer logs neither stdout nor stderr of test discovery, so don't send these.
     if let Some(ref mut command_report) = test_discovery_end.command_report {
+        if preserve_logs {
+            truncate_command_std_streams(command_report, 20 * 1024);
+            return;
+        }
         if let Some(ref mut details) = command_report.details {
             if !details.cmd_stdout.is_empty() {
                 details.cmd_stdout = "<<omitted>>".to_owned();
@@ -263,6 +300,7 @@ fn truncate_action_error(action_error: &mut buck2_data::ActionError) {
 #[cfg(test)]
 mod tests {
     use crate::sink::smart_truncate_event::smart_truncate_event;
+    use crate::sink::smart_truncate_event::smart_truncate_event_preserving_logs;
 
     fn make_invocation_record(data: buck2_data::InvocationRecord) -> buck2_data::buck_event::Data {
         buck2_data::buck_event::Data::Record(buck2_data::RecordEvent {
@@ -766,6 +804,20 @@ mod tests {
         }
     }
 
+    fn make_command_execution_with_streams(
+        stdout: &str,
+        stderr: &str,
+    ) -> buck2_data::CommandExecution {
+        buck2_data::CommandExecution {
+            details: Some(buck2_data::CommandExecutionDetails {
+                cmd_stdout: stdout.to_owned(),
+                cmd_stderr: stderr.to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn smart_truncate_test_end_command_report_stdout_truncated() {
         let test_end = buck2_data::TestRunEnd {
@@ -802,6 +854,35 @@ mod tests {
         let event_data_expected = make_test_discovery_end(test_discovery_end_truncated);
 
         smart_truncate_event(&mut event_data);
+
+        assert_eq!(event_data, event_data_expected);
+    }
+
+    #[test]
+    fn smart_truncate_preserving_logs_keeps_success_action_stderr() {
+        let action_execution_end = buck2_data::ActionExecutionEnd {
+            commands: vec![make_command_execution_with_streams("stdout", "stderr")],
+            failed: false,
+            ..Default::default()
+        };
+        let mut event_data = make_action_execution_end(action_execution_end.clone());
+        let event_data_expected = make_action_execution_end(action_execution_end);
+
+        smart_truncate_event_preserving_logs(&mut event_data);
+
+        assert_eq!(event_data, event_data_expected);
+    }
+
+    #[test]
+    fn smart_truncate_preserving_logs_keeps_test_command_report_streams() {
+        let test_end = buck2_data::TestRunEnd {
+            command_report: Some(make_command_execution_with_streams("stdout", "stderr")),
+            ..Default::default()
+        };
+        let mut event_data = make_test_end(test_end.clone());
+        let event_data_expected = make_test_end(test_end);
+
+        smart_truncate_event_preserving_logs(&mut event_data);
 
         assert_eq!(event_data, event_data_expected);
     }

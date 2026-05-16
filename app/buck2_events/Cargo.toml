@@ -25,6 +25,7 @@ crossbeam-channel.workspace = true
 derive_more.workspace = true
 dupe.workspace = true
 fbinit.workspace = true
+flate2.workspace = true
 futures.workspace = true
 gazebo.workspace = true
 google_grpc_proto.workspace = true
