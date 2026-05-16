@@ -41,6 +41,8 @@ pub use crate::sink::bes_client::BesConfig as RemoteEventConfig;
 #[cfg(not(fbcode_build))]
 pub use crate::sink::bes_client::BesEventFormat;
 use crate::sink::smart_truncate_event::smart_truncate_event;
+#[cfg(not(fbcode_build))]
+use crate::sink::smart_truncate_event::smart_truncate_event_preserving_logs;
 
 // 1 MiB limit
 static SCRIBE_MESSAGE_SIZE_LIMIT: usize = 1024 * 1024;
@@ -56,6 +58,8 @@ pub struct RemoteEventSink {
     client: crate::sink::bes_client::BesClient,
     #[cfg(not(fbcode_build))]
     upload_successful_action_events: bool,
+    #[cfg(not(fbcode_build))]
+    preserve_bazel_logs: bool,
     schedule_type: SandcastleScheduleType,
 }
 
@@ -72,6 +76,8 @@ impl RemoteEventSink {
         #[cfg(not(fbcode_build))]
         let upload_successful_action_events = config.upload_successful_action_events;
         #[cfg(not(fbcode_build))]
+        let preserve_bazel_logs = config.event_format == BesEventFormat::Bazel;
+        #[cfg(not(fbcode_build))]
         let client = crate::sink::bes_client::BesClient::new(fb, config)?;
 
         let schedule_type = SandcastleScheduleType::new()?;
@@ -80,6 +86,8 @@ impl RemoteEventSink {
             client,
             #[cfg(not(fbcode_build))]
             upload_successful_action_events,
+            #[cfg(not(fbcode_build))]
+            preserve_bazel_logs,
             schedule_type,
         })
     }
@@ -99,7 +107,7 @@ impl RemoteEventSink {
                     let message_key = e.trace_id().unwrap().hash();
                     scribe_client::Message {
                         category: self.category.clone(),
-                        message: Self::encode_message(e),
+                        message: Self::encode_message(e, false),
                         message_key: Some(message_key),
                     }
                 })
@@ -117,7 +125,7 @@ impl RemoteEventSink {
                     let message_key = e.trace_id().unwrap().hash();
                     crate::sink::bes_client::Message {
                         category: self.category.clone(),
-                        message: Self::encode_message(e),
+                        message: Self::encode_message(e, self.preserve_bazel_logs),
                         message_key: Some(message_key),
                     }
                 })
@@ -132,20 +140,27 @@ impl RemoteEventSink {
         #[cfg(fbcode_build)]
         self.client.offer(scribe_client::Message {
             category: self.category.clone(),
-            message: Self::encode_message(event),
+            message: Self::encode_message(event, false),
             message_key: Some(message_key),
         });
         #[cfg(not(fbcode_build))]
         self.client.offer(crate::sink::bes_client::Message {
             category: self.category.clone(),
-            message: Self::encode_message(event),
+            message: Self::encode_message(event, self.preserve_bazel_logs),
             message_key: Some(message_key),
         });
     }
 
     // Encodes message for transport.
-    fn encode_message(mut event: BuckEvent) -> Vec<u8> {
-        smart_truncate_event(event.data_mut());
+    fn encode_message(mut event: BuckEvent, preserve_logs: bool) -> Vec<u8> {
+        if preserve_logs {
+            #[cfg(not(fbcode_build))]
+            smart_truncate_event_preserving_logs(event.data_mut());
+            #[cfg(fbcode_build)]
+            smart_truncate_event(event.data_mut());
+        } else {
+            smart_truncate_event(event.data_mut());
+        }
         let mut proto: Box<buck2_data::BuckEvent> = event.into();
 
         Self::prepare_event(&mut proto);
@@ -515,7 +530,7 @@ mod tests {
             }),
         );
 
-        let res = RemoteEventSink::encode_message(event);
+        let res = RemoteEventSink::encode_message(event, false);
         let size_approx = res.len() * 8;
         assert!(size_approx > TRUNCATED_SCRIBE_MESSAGE_SIZE);
         assert!(size_approx < SCRIBE_MESSAGE_SIZE_LIMIT);
