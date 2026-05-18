@@ -48,9 +48,19 @@ def _if(cond, a, b):
 def _if_inner(cond, a, b):
     return a if cond else b
 
+def _fmt(format_string: str, *args):
+    if not args:
+        return format_string
+
+    return _prelude_selects.apply_n(
+        args,
+        lambda *values: format_string.format(*values),
+    )
+
 selects = struct(
     and_ = _and,
     cond = _cond,
+    fmt = _fmt,
     or_ = _or,
     if_ = _if,
 )
