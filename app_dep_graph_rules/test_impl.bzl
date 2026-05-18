@@ -7,9 +7,10 @@
 # above-listed licenses.
 
 # @oss-disable[end= ]: load("@fbcode_macros//build_defs:platform_utils.bzl", "platform_utils")
+load("@shim//build_defs/lib:oss.bzl", "translate_target")
 load(":rules.bzl", "BANNED_DEP_PATHS", "LATE_BINDING_ONLY_CRATES", "TOP_LEVEL_ONLY_CRATES")
 
-platform_utils = None # @oss-enable
+platform_utils = None  # @oss-enable
 
 def _dtp():
     return platform_utils.get_cxx_platform_for_base_path(package_name()).target_platform if platform_utils else None
@@ -36,7 +37,7 @@ def _check_top_level_only(ctx: AnalysisContext):
     for all_paths in ctx.attrs.top_level_only_paths:
         all_paths = list(all_paths)
         target = all_paths.pop()
-        remainder = filter(lambda t: not str(t.label).startswith("fbcode//buck2/app/buck2:"), all_paths)
+        remainder = filter(lambda t: not str(t.label).startswith(_BUCK2_APP_PREFIX), all_paths)
 
         if len(remainder) != 0:
             m = "Top-level-only crate `" + str(target.label) + "` may not be depended on by:"
@@ -69,11 +70,13 @@ _test_buck2_dep_graph = rule(
     },
 )
 
-_CLIENT_BIN = "fbcode//buck2/app/buck2:buck2_client-bin"
+_BUCK2_APP_PREFIX = translate_target("fbcode//buck2/app/buck2:")
 
-_BUCK2_BIN = "fbcode//buck2/app/buck2:buck2-bin"
+_CLIENT_BIN = translate_target("fbcode//buck2/app/buck2:buck2_client-bin")
 
-_RE_CLIENT_TARGET = "//remote_execution/client_lib/wrappers/rust:re_client_lib"
+_BUCK2_BIN = translate_target("fbcode//buck2/app/buck2:buck2-bin")
+
+_RE_CLIENT_TARGET = translate_target("fbcode//buck2/remote_execution:remote_execution")
 
 _CLIENT_TO_RE = "somepath({}, filter(fbcode//remote_execution/, deps({})) + {})".format(_CLIENT_BIN, _CLIENT_BIN, _RE_CLIENT_TARGET)
 
