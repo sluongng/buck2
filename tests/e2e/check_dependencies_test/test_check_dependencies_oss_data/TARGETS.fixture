@@ -1,0 +1,21 @@
+load(":defs.bzl", "dependency_fixture_rule")
+
+dependency_fixture_rule(
+    name = "useless_target_1",
+)
+
+dependency_fixture_rule(
+    name = "useless_target_2",
+    deps = [":useless_target_1"],
+)
+
+dependency_fixture_rule(
+    name = "useless_target_3",
+    deps = [":useless_target_2"],
+)
+
+dependency_fixture_rule(
+    name = "platform_specific_deps_target",
+    deps = [":useless_target_1"],
+)
+
