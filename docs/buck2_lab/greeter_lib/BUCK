@@ -11,12 +11,12 @@ rust_library(
     srcs = ["src/lib.rs"],
     visibility = ["PUBLIC"],
     deps = [
-        "fbcode//buck2/docs/buck2_lab/logging_lib:logging_lib",
+        "//docs/buck2_lab/logging_lib:logging_lib",
     ],
 )
 
 # @oss-disable: rust_unittest(
-    rust_test( # @oss-enable
+rust_test( # @oss-enable
     name = "test",
     srcs = ["tests/test.rs"],
     deps = [
