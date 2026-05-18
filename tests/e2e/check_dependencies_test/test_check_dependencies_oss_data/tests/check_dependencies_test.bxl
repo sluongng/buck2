@@ -1,0 +1,95 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the root directory of this source tree. You may
+# select, at your option, one of the above-listed licenses.
+
+"""BXL tests for checking dependencies."""
+
+load(":dependencies_test_util.bzl", "rule_list_regex")
+
+_MAX_DEPTH = 2147483647
+
+def _fail_with_message(msg: str, targets: bxl.ConfiguredTargetSet) -> None:
+    targets_str = "  \n".join([str(t.label.raw_target()) for t in targets])
+    fail(msg + "\n" + targets_str)
+
+def _impl_check_dependencies_test(
+        ctx: bxl.Context,
+        verification_mode: str,
+        allowlist_patterns: list[str] | None,
+        blocklist_patterns: list[str] | None,
+        target: TargetLabel,
+        target_deps: bool,
+        deps_filter_pattern: str | None = None,
+        deps_exclude_pattern: str | None = None):
+    """Test the dependencies of a given rule."""
+    if not allowlist_patterns and not blocklist_patterns:
+        fail("Self-check and self-documentation: must provide allow or block list")
+
+    cquery = ctx.cquery()
+    cquery_kwargs = {}
+    if deps_filter_pattern:
+        base = "target_deps()" if target_deps else "first_order_deps()"
+        filter_expr = 'filter("{}", {})'.format(deps_filter_pattern, base)
+        if deps_exclude_pattern:
+            filter_expr = '{} - filter("{}", {})'.format(filter_expr, deps_exclude_pattern, base)
+        cquery_kwargs["filter"] = filter_expr
+    elif deps_exclude_pattern:
+        base = "target_deps()" if target_deps else "first_order_deps()"
+        cquery_kwargs["filter"] = '{} - filter("{}", {})'.format(base, deps_exclude_pattern, base)
+    elif target_deps:
+        cquery_kwargs["filter"] = "target_deps()"
+
+    transitive_deps = cquery.deps(
+        ctx.target_universe(target, modifiers = ctx.modifiers).target_set(),
+        _MAX_DEPTH,
+        **cquery_kwargs
+    )
+
+    allowlist_regex = rule_list_regex(allowlist_patterns)
+    blocklist_regex = rule_list_regex(blocklist_patterns)
+
+    allowlisted = filter(lambda target: regex_match(allowlist_regex, str(target.label.raw_target())), transitive_deps)
+    blocklisted = filter(lambda target: regex_match(blocklist_regex, str(target.label.raw_target())), transitive_deps)
+
+    allowlisted_deps = ctx.target_universe(allowlisted).target_set()
+    blocklisted_deps = ctx.target_universe(blocklisted).target_set()
+
+    if verification_mode == "allowlist":
+        res = (transitive_deps - allowlisted_deps) + (transitive_deps & blocklisted_deps)
+        if len(res) > 0:
+            _fail_with_message("Found banned targets:", res)
+    elif verification_mode == "blocklist":
+        res = blocklisted_deps & (transitive_deps - allowlisted_deps)
+        if len(res) > 0:
+            _fail_with_message("Found blocklisted targets:", res)
+    else:
+        fail("Invalid verification mode: " + verification_mode)
+
+def _impl(ctx: bxl.Context):
+    _impl_check_dependencies_test(
+        ctx,
+        ctx.cli_args.verification_mode,
+        ctx.cli_args.allowlist_patterns,
+        ctx.cli_args.blocklist_patterns,
+        ctx.cli_args.target,
+        ctx.cli_args.target_deps,
+        ctx.cli_args.deps_filter_pattern,
+        ctx.cli_args.deps_exclude_pattern,
+    )
+
+test = bxl_main(
+    cli_args = {
+        "allowlist_patterns": cli_args.option(cli_args.list(cli_args.string())),
+        "blocklist_patterns": cli_args.option(cli_args.list(cli_args.string())),
+        "deps_exclude_pattern": cli_args.option(cli_args.string()),
+        "deps_filter_pattern": cli_args.option(cli_args.string()),
+        "target": cli_args.target_label(),
+        "target_deps": cli_args.bool(default = True),
+        "verification_mode": cli_args.string(),
+    },
+    impl = _impl,
+)
+
