@@ -44,4 +44,4 @@ event_format = bazel
 # Keep failed-action diagnostics while avoiding a long tail of successful
 # action events before the terminal BES events on fully remote no-cache builds.
 upload_successful_action_events = false
-results_url = https://app.buildbuddy.io/invocation/
+results_url = https://sluongng.buildbuddy.io/invocation/
