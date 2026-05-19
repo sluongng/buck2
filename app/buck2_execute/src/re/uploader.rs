@@ -176,7 +176,10 @@ impl Uploader {
             })
         } else {
             let client = client.clone();
-            let metadata = use_case.metadata(identity);
+            let mut metadata = use_case.metadata(identity);
+            if let Some(id) = identity.and_then(|id| id.action_id.clone()) {
+                metadata.action_id = Some(id);
+            }
             let digests = input_digests.iter().map(|d| d.to_re()).collect();
             let digests_ttl = client.get_digests_ttl(digests, metadata).await;
 
@@ -326,6 +329,7 @@ impl Uploader {
                             // a very long time, it might have expired.
                             if file.digest.to_re() == digest {
                                 if should_error_for_missing_digest(info) {
+                                    client.record_missing_remote_cas_digest(digest.clone());
                                     soft_error!(
                                         "cas_missing_fatal",
                                         buck2_error::buck2_error!(
@@ -427,12 +431,17 @@ impl Uploader {
 
         // Upload
         if !upload_files.is_empty() || !upload_blobs.is_empty() {
+            let mut metadata = use_case.metadata(identity);
+            if let Some(id) = identity.and_then(|id| id.action_id.clone()) {
+                metadata.action_id = Some(id);
+            }
             with_error_handler(
                 "upload",
                 client.get_session_id(),
-                client.get_raw_re_client()
+                client
+                    .get_raw_re_client()
                     .upload(
-                        use_case.metadata(identity),
+                        metadata,
                         UploadRequest {
                             files_with_digest: Some(upload_files),
                             inlined_blobs_with_digest: Some(upload_blobs),
@@ -661,7 +670,10 @@ fn query_digest_ttls<'s>(
     input_digests: Vec<TrackedFileDigest>,
 ) -> BoxFuture<'s, buck2_error::Result<StdBuckHashMap<TrackedFileDigest, i64>>> {
     let client = client.dupe();
-    let metadata = use_case.metadata(identity);
+    let mut metadata = use_case.metadata(identity);
+    if let Some(id) = identity.and_then(|id| id.action_id.clone()) {
+        metadata.action_id = Some(id);
+    }
     let digests = input_digests.iter().map(|d| d.to_re()).collect();
 
     async move {
