@@ -1,9 +1,7 @@
 name: Build, upload, and tag `buck2`
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 jobs:
   set_version_info:
