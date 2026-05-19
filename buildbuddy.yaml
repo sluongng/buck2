@@ -3,7 +3,7 @@ actions:
     container_image: ubuntu-24.04
     user: root
     resource_requests:
-      disk: 27GB
+      disk: 64GB
     triggers: {}
     steps:
       - run: |
@@ -49,6 +49,8 @@ actions:
           rustup default "$rust_toolchain"
 
           cargo build --bin=buck2
+          install -m 0755 target/debug/buck2 /usr/local/bin/buck2-built
+          rm -rf target
 
           cat > .buckconfig.local <<EOF
           <file:.buckconfig.buildbuddy>
@@ -63,5 +65,5 @@ actions:
           buildbuddy/run_buck2_test_matrix.sh \
             --mode both \
             --matrix app-rust \
-            --buck2 target/debug/buck2 \
+            --buck2 /usr/local/bin/buck2-built \
             --clean-output
