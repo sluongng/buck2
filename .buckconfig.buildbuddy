@@ -1,5 +1,5 @@
 [buck2]
-digest_algorithms = BLAKE3
+digest_algorithms = SHA256
 file_watcher = watchman
 # Keep remote outputs deferred, but persist materializer state so Buck can
 # reuse files that are already present on disk after daemon restarts.
