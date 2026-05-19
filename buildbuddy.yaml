@@ -23,7 +23,9 @@ actions:
             libzstd-dev \
             lld \
             pkg-config \
-            python3
+            python3 \
+            watchman
+          watchman version
 
           rust_toolchain=$(python3 - <<'PY'
           from pathlib import Path
@@ -50,9 +52,6 @@ actions:
 
           cat > .buckconfig.local <<EOF
           <file:.buckconfig.buildbuddy>
-
-          [buck2]
-          file_watcher = none
 
           [buck2_re_client]
           http_headers = x-buildbuddy-api-key:$BUILDBUDDY_API_KEY
