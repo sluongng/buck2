@@ -22,7 +22,10 @@ static BUCK2_RE_CLIENT_CFG_SECTION: &str = "buck2_re_client";
 /// We put functions here that both things need to implement for code that isn't gated behind a
 /// fbcode_build or not(fbcode_build)
 pub trait RemoteExecutionStaticMetadataImpl: Sized {
-    fn from_legacy_config(legacy_config: &LegacyBuckConfig) -> buck2_error::Result<Self>;
+    fn from_legacy_config(
+        legacy_config: &LegacyBuckConfig,
+        digest_algorithms: Vec<String>,
+    ) -> buck2_error::Result<Self>;
     fn cas_semaphore_size(&self) -> usize;
     fn exec_semaphore_size(&self) -> usize;
 }
@@ -162,7 +165,10 @@ mod fbcode {
     }
 
     impl RemoteExecutionStaticMetadataImpl for RemoteExecutionStaticMetadata {
-        fn from_legacy_config(legacy_config: &LegacyBuckConfig) -> buck2_error::Result<Self> {
+        fn from_legacy_config(
+            legacy_config: &LegacyBuckConfig,
+            _digest_algorithms: Vec<String>,
+        ) -> buck2_error::Result<Self> {
             Ok(Self {
                 cas_address: legacy_config.parse(BuckconfigKeyRef {
                     section: BUCK2_RE_CLIENT_CFG_SECTION,
@@ -399,9 +405,13 @@ mod not_fbcode {
     pub struct RemoteExecutionStaticMetadata(pub Buck2OssReConfiguration);
 
     impl RemoteExecutionStaticMetadataImpl for RemoteExecutionStaticMetadata {
-        fn from_legacy_config(legacy_config: &LegacyBuckConfig) -> buck2_error::Result<Self> {
+        fn from_legacy_config(
+            legacy_config: &LegacyBuckConfig,
+            digest_algorithms: Vec<String>,
+        ) -> buck2_error::Result<Self> {
             Ok(Self(Buck2OssReConfiguration::from_legacy_config(
                 legacy_config,
+                digest_algorithms,
             )?))
         }
 
@@ -421,21 +431,25 @@ mod not_fbcode {
 #[derive(Clone, Debug, Default, Allocative)]
 pub struct Buck2OssReConfiguration {
     /// Address for RBE Content Addresable Storage service (including bytestream uploads service).
+    /// Accepted schemes: grpc, grpcs, http, https, dns, ipv4, ipv6. If no scheme is provided,
+    /// TLS is enabled by default.
     pub cas_address: Option<String>,
-    /// Address for RBE Engine service (including capabilities service).
+    /// Address for RBE Engine service (including capabilities service). Accepted schemes:
+    /// grpc, grpcs, http, https, dns, ipv4, ipv6. If no scheme is provided, TLS is enabled by
+    /// default.
     pub engine_address: Option<String>,
-    /// Address for RBE Action Cache service.
+    /// Address for RBE Action Cache service. Accepted schemes: grpc, grpcs, http, https, dns,
+    /// ipv4, ipv6. If no scheme is provided, TLS is enabled by default.
     pub action_cache_address: Option<String>,
-    /// Whether to use TLS to interact with remote execution.
-    pub tls: bool,
-    /// Path to a CA certificates bundle. This must be PEM-encoded. If none is set, a default
-    /// bundle will be used.
+    /// Path to a CA certificates bundle. This must be PEM-encoded. If set, this replaces the
+    /// default trust roots. If none is set, a default bundle will be used when TLS is enabled by
+    /// endpoint scheme.
     ///
     /// This can contain environment variables using shell interpolation syntax (i.e. $VAR). They
     /// will be substituted before using the value.
     pub tls_ca_certs: Option<String>,
     /// Path to a client certificate (and intermediate chain), as well as its associated private
-    /// key. This must be PEM-encoded.
+    /// key. This must be PEM-encoded and is only used when TLS is enabled by endpoint scheme.
     ///
     /// This can contain environment variables using shell interpolation syntax (i.e. $VAR). They
     /// will be substituted before using the value.
@@ -460,6 +474,11 @@ pub struct Buck2OssReConfiguration {
     pub max_concurrent_uploads_per_action: Option<usize>,
     /// Time that digests are assumed to live in CAS after being touched.
     pub cas_ttl_secs: Option<i64>,
+    /// Number of retry attempts for transient gRPC errors. This is the number of retries, not
+    /// total attempts, so a value of 5 means each RPC may be attempted up to 6 times.
+    pub retries: Option<usize>,
+    /// Maximum backoff delay in milliseconds between retry attempts.
+    pub retry_max_delay_ms: Option<u64>,
     /// Interval in seconds for HTTP/2 ping frames to detect stale connections.
     pub grpc_keepalive_time_secs: Option<u64>,
     /// Timeout in seconds for receiving HTTP/2 ping acknowledgement.
@@ -468,6 +487,12 @@ pub struct Buck2OssReConfiguration {
     pub grpc_keepalive_while_idle: Option<bool>,
     /// Maximum number of concurrent execution requests.
     pub execution_concurrency_limit: Option<usize>,
+    /// Interval in seconds for TCP keepalive probes on the socket.
+    pub tcp_keepalive_secs: Option<u64>,
+    /// Effective digest algorithms used by the daemon.
+    /// This is used by OSS RE clients to disambiguate hash validation when
+    /// multiple algorithms share the same digest length (for example, SHA256 and BLAKE3).
+    pub digest_algorithms: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Allocative)]
@@ -496,7 +521,10 @@ impl FromStr for HttpHeader {
 }
 
 impl Buck2OssReConfiguration {
-    pub fn from_legacy_config(legacy_config: &LegacyBuckConfig) -> buck2_error::Result<Self> {
+    pub fn from_legacy_config(
+        legacy_config: &LegacyBuckConfig,
+        digest_algorithms: Vec<String>,
+    ) -> buck2_error::Result<Self> {
         // this is used for all three services by default, if given; if one of
         // them has an explicit address given as well though, use that instead
         let default_address: Option<String> = legacy_config.parse(BuckconfigKeyRef {
@@ -523,12 +551,6 @@ impl Buck2OssReConfiguration {
                     property: "action_cache_address",
                 })?
                 .or(default_address),
-            tls: legacy_config
-                .parse(BuckconfigKeyRef {
-                    section: BUCK2_RE_CLIENT_CFG_SECTION,
-                    property: "tls",
-                })?
-                .unwrap_or(true),
             tls_ca_certs: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "tls_ca_certs",
@@ -573,6 +595,14 @@ impl Buck2OssReConfiguration {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "cas_ttl_secs",
             })?,
+            retries: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "retries",
+            })?,
+            retry_max_delay_ms: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "retry_max_delay_ms",
+            })?,
             grpc_keepalive_time_secs: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "grpc_keepalive_time_secs",
@@ -589,6 +619,11 @@ impl Buck2OssReConfiguration {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "execution_concurrency_limit",
             })?,
+            tcp_keepalive_secs: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "tcp_keepalive_secs",
+            })?,
+            digest_algorithms,
         })
     }
 }
