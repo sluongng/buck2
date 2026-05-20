@@ -68,6 +68,7 @@ actions:
 
           [bes]
           header = x-buildbuddy-api-key=$BUILDBUDDY_API_KEY
+          build_metadata = PARENT_RUN_ID=$BUILDBUDDY_RUN_ID,PARENT_INVOCATION_ID=$BUILDBUDDY_INVOCATION_ID
           EOF
 
           "$buck2_bootstrap" \

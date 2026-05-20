@@ -168,6 +168,7 @@ struct CommandProfileBuilder {
 
 #[derive(Debug, Default)]
 pub(crate) struct BazelEventConverter {
+    build_metadata: BTreeMap<String, String>,
     saw_started: bool,
     saw_finished: bool,
     progress_count: i32,
@@ -186,6 +187,16 @@ pub(crate) struct BazelEventConverter {
 }
 
 impl BazelEventConverter {
+    pub(crate) fn new<I>(build_metadata: I) -> Self
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        Self {
+            build_metadata: build_metadata.into_iter().collect(),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn convert(
         &mut self,
         sequence_hint: i64,
@@ -238,11 +249,15 @@ impl BazelEventConverter {
                 events.push(default_configuration_event());
                 events.push(workspace_info_event(command));
                 events.push(workspace_status_event(command));
-                events.push(build_metadata_event_from_command(command));
+                events.push(build_metadata_event(&build_metadata_from_command(
+                    command,
+                    &self.build_metadata,
+                )));
             }
             Some(buck2_data::span_start_event::Data::CommandCritical(command)) => {
-                if let Some(metadata) = build_metadata_event_from_map(&command.metadata) {
-                    events.push(metadata);
+                let metadata = metadata_map_from_hash_map(&command.metadata);
+                if !metadata.is_empty() || !self.build_metadata.is_empty() {
+                    events.push(self.build_metadata_event(&metadata));
                 }
             }
             Some(buck2_data::span_start_event::Data::Analysis(analysis)) => {
@@ -354,14 +369,12 @@ impl BazelEventConverter {
                 events.push(self.progress_event(sequence_hint, None, Some(error.payload.clone())));
             }
             Some(buck2_data::instant_event::Data::ReSession(session)) => {
-                let mut metadata = BTreeMap::from([(
-                    "REMOTE_EXECUTION_ENABLED".to_owned(),
-                    "1".to_owned(),
-                )]);
+                let mut metadata =
+                    BTreeMap::from([("REMOTE_EXECUTION_ENABLED".to_owned(), "1".to_owned())]);
                 if !session.session_id.is_empty() {
                     metadata.insert("BUCK2_RE_SESSION_ID".to_owned(), session.session_id.clone());
                 }
-                events.push(build_metadata_event(&metadata));
+                events.push(self.build_metadata_event(&metadata));
             }
             Some(buck2_data::instant_event::Data::TargetPatterns(patterns)) => {
                 self.remember_target_patterns(patterns);
@@ -378,7 +391,7 @@ impl BazelEventConverter {
                     );
                 }
                 if !metadata.is_empty() {
-                    events.push(build_metadata_event(&metadata));
+                    events.push(self.build_metadata_event(&metadata));
                 }
             }
             Some(buck2_data::instant_event::Data::BuildGraphInfo(info)) => {
@@ -411,7 +424,7 @@ impl BazelEventConverter {
                     metadata.insert("BUCK2_ISOLATION_DIR".to_owned(), isolation_dir.clone());
                 }
                 if !metadata.is_empty() {
-                    events.push(build_metadata_event(&metadata));
+                    events.push(self.build_metadata_event(&metadata));
                 }
             }
             Some(buck2_data::instant_event::Data::VersionControlRevision(revision)) => {
@@ -426,7 +439,7 @@ impl BazelEventConverter {
                     );
                 }
                 if !metadata.is_empty() {
-                    events.push(build_metadata_event(&metadata));
+                    events.push(self.build_metadata_event(&metadata));
                 }
             }
             Some(buck2_data::instant_event::Data::TestDiscovery(discovery)) => {
@@ -469,7 +482,7 @@ impl BazelEventConverter {
                 self.emit_pending_pattern_expanded(&[], events);
                 self.emit_completed_updates_for_actions(events);
                 events.push(build_metrics_event(record));
-                events.push(build_metadata_event_from_invocation(record));
+                events.push(self.build_metadata_event(&build_metadata_from_invocation(record)));
                 self.push_finished(finished_event_from_invocation_record(event, record), events);
                 self.push_build_tool_logs(
                     build_tool_logs_event_from_invocation(record, &self.command_profile),
@@ -503,6 +516,10 @@ impl BazelEventConverter {
         }
         self.emitted_build_tool_logs = true;
         events.push(event);
+    }
+
+    fn build_metadata_event(&self, metadata: &BTreeMap<String, String>) -> bep::BuildEvent {
+        build_metadata_event_with_defaults(&self.build_metadata, metadata)
     }
 
     fn remember_target_patterns(&mut self, patterns: &buck2_data::ParsedTargetPatterns) {
@@ -1800,12 +1817,12 @@ fn workspace_info_event(command: &buck2_data::CommandStart) -> bep::BuildEvent {
     }
 }
 
-fn build_metadata_event_from_command(command: &buck2_data::CommandStart) -> bep::BuildEvent {
-    let mut metadata: BTreeMap<String, String> = command
-        .metadata
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+fn build_metadata_from_command(
+    command: &buck2_data::CommandStart,
+    defaults: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut metadata = defaults.clone();
+    metadata.extend(command.metadata.iter().map(|(k, v)| (k.clone(), v.clone())));
     add_metadata_alias(
         &mut metadata,
         "USER",
@@ -1849,10 +1866,12 @@ fn build_metadata_event_from_command(command: &buck2_data::CommandStart) -> bep:
     metadata
         .entry(BUILDBUDDY_VISIBILITY_KEY.to_owned())
         .or_insert_with(|| BUILDBUDDY_PUBLIC_VISIBILITY.to_owned());
-    build_metadata_event(&metadata)
+    metadata
 }
 
-fn build_metadata_event_from_invocation(record: &buck2_data::InvocationRecord) -> bep::BuildEvent {
+fn build_metadata_from_invocation(
+    record: &buck2_data::InvocationRecord,
+) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
     if let Some(command_name) = record.command_name.as_ref()
         && !command_name.is_empty()
@@ -1871,15 +1890,23 @@ fn build_metadata_event_from_invocation(record: &buck2_data::InvocationRecord) -
             metadata.insert("PATTERN".to_owned(), patterns.join(" "));
         }
     }
-    build_metadata_event(&metadata)
+    metadata
 }
 
-fn build_metadata_event_from_map(metadata: &HashMap<String, String>) -> Option<bep::BuildEvent> {
-    let metadata: BTreeMap<String, String> = metadata
+fn metadata_map_from_hash_map(metadata: &HashMap<String, String>) -> BTreeMap<String, String> {
+    metadata
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    Some(build_metadata_event(&metadata))
+        .collect()
+}
+
+fn build_metadata_event_with_defaults(
+    defaults: &BTreeMap<String, String>,
+    metadata: &BTreeMap<String, String>,
+) -> bep::BuildEvent {
+    let mut merged = defaults.clone();
+    merged.extend(metadata.iter().map(|(k, v)| (k.clone(), v.clone())));
+    build_metadata_event(&merged)
 }
 
 fn build_metadata_event(metadata: &BTreeMap<String, String>) -> bep::BuildEvent {
@@ -4399,15 +4426,64 @@ mod tests {
 
     #[test]
     fn command_start_preserves_explicit_buildbuddy_visibility() {
-        let event = build_metadata_event_from_command(&buck2_data::CommandStart {
-            metadata: HashMap::from([(BUILDBUDDY_VISIBILITY_KEY.to_owned(), "PRIVATE".to_owned())]),
-            ..Default::default()
-        });
+        let event = build_metadata_event(&build_metadata_from_command(
+            &buck2_data::CommandStart {
+                metadata: HashMap::from([(
+                    BUILDBUDDY_VISIBILITY_KEY.to_owned(),
+                    "PRIVATE".to_owned(),
+                )]),
+                ..Default::default()
+            },
+            &BTreeMap::new(),
+        ));
 
         let build_metadata = match event.payload.as_ref() {
             Some(build_event::Payload::BuildMetadata(metadata)) => metadata,
             other => panic!("expected build metadata, got {other:?}"),
         };
+        assert_eq!(
+            build_metadata
+                .metadata
+                .get(BUILDBUDDY_VISIBILITY_KEY)
+                .map(String::as_str),
+            Some("PRIVATE")
+        );
+    }
+
+    #[test]
+    fn command_start_includes_configured_build_metadata() {
+        let mut converter = BazelEventConverter::new([
+            ("PARENT_RUN_ID".to_owned(), "workflow-run".to_owned()),
+            (BUILDBUDDY_VISIBILITY_KEY.to_owned(), "PRIVATE".to_owned()),
+        ]);
+        let event = trace_event(buck2_data::buck_event::Data::SpanStart(
+            buck2_data::SpanStartEvent {
+                data: Some(buck2_data::span_start_event::Data::Command(
+                    buck2_data::CommandStart {
+                        data: Some(buck2_data::command_start::Data::Build(
+                            buck2_data::BuildCommandStart {},
+                        )),
+                        ..Default::default()
+                    },
+                )),
+            },
+        ));
+
+        let events = converter.convert(1, &event);
+        let build_metadata = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::BuildMetadata(metadata)) => Some(metadata),
+                _ => None,
+            })
+            .expect("build metadata");
+        assert_eq!(
+            build_metadata
+                .metadata
+                .get("PARENT_RUN_ID")
+                .map(String::as_str),
+            Some("workflow-run")
+        );
         assert_eq!(
             build_metadata
                 .metadata
@@ -4874,11 +4950,17 @@ mod tests {
             })
             .expect("build metadata");
         assert_eq!(
-            metadata.metadata.get("REMOTE_EXECUTION_ENABLED").map(String::as_str),
+            metadata
+                .metadata
+                .get("REMOTE_EXECUTION_ENABLED")
+                .map(String::as_str),
             Some("1")
         );
         assert_eq!(
-            metadata.metadata.get("BUCK2_RE_SESSION_ID").map(String::as_str),
+            metadata
+                .metadata
+                .get("BUCK2_RE_SESSION_ID")
+                .map(String::as_str),
             Some("re-session")
         );
     }
