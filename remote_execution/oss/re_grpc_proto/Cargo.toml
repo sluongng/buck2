@@ -14,6 +14,7 @@ tonic = { workspace = true }
 tonic-prost = { workspace = true }
 
 buck2_data = { workspace = true }
+google_grpc_proto = { path = "../google_grpc_proto" }
 
 [build-dependencies]
 buck2_protoc_dev = { workspace = true }

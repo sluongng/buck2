@@ -63,6 +63,7 @@ use remote_execution::ExtendDigestsTtlRequest;
 use remote_execution::GetDigestsTtlRequest;
 use remote_execution::GetDigestsTtlResponse;
 use remote_execution::InlinedBlobWithDigest;
+use remote_execution::InlinedDigestWithStatus;
 use remote_execution::NamedDigest;
 use remote_execution::NamedDigestWithPermissions;
 use remote_execution::OperationMetadata;
@@ -256,13 +257,14 @@ impl RemoteExecutionClient {
         action_digest: ActionDigest,
         use_case: RemoteExecutorUseCase,
         platform: &RE::Platform,
+        identity: Option<&ReActionIdentity<'_>>,
     ) -> buck2_error::Result<Option<ActionResultResponse>> {
         self.data
             .action_cache
             .op(self
                 .data
                 .client
-                .action_cache(action_digest, use_case, platform))
+                .action_cache(action_digest, use_case, platform, identity))
             .await
     }
 
@@ -304,6 +306,7 @@ impl RemoteExecutionClient {
         directories: Vec<remote_execution::Path>,
         inlined_blobs_with_digest: Vec<InlinedBlobWithDigest>,
         use_case: RemoteExecutorUseCase,
+        identity: Option<&ReActionIdentity<'_>>,
     ) -> buck2_error::Result<()> {
         self.data
             .uploads
@@ -312,6 +315,7 @@ impl RemoteExecutionClient {
                 directories,
                 inlined_blobs_with_digest,
                 use_case,
+                identity,
             ))
             .await
     }
@@ -436,12 +440,9 @@ impl RemoteExecutionClient {
         metadata: RemoteExecutionMetadata,
     ) -> buck2_error::Result<Vec<(TDigest, DateTime<Utc>)>> {
         let now = Utc::now();
+        let expected_digests = digests.clone();
         let ttls = self.get_digests_ttl(digests, metadata).await?;
-        Ok(ttls
-            .digests_with_ttl
-            .into_iter()
-            .map(|t| (t.digest, now + chrono::Duration::seconds(t.ttl)))
-            .collect())
+        validate_digest_expirations(expected_digests, ttls, now)
     }
 
     pub async fn extend_digest_ttl(
@@ -461,6 +462,7 @@ impl RemoteExecutionClient {
         digest: ActionDigest,
         result: TActionResult2,
         use_case: RemoteExecutorUseCase,
+        identity: Option<&ReActionIdentity<'_>>,
         platform: &RE::Platform,
         write_type: ActionCacheWriteType,
     ) -> buck2_error::Result<WriteActionResultResponse> {
@@ -469,7 +471,7 @@ impl RemoteExecutionClient {
             .op(self
                 .data
                 .client
-                .write_action_result(digest, result, use_case, platform, write_type))
+                .write_action_result(digest, result, use_case, identity, platform, write_type))
             .await
     }
 
@@ -1060,6 +1062,7 @@ impl RemoteExecutionClientImpl {
         action_digest: ActionDigest,
         use_case: RemoteExecutorUseCase,
         platform: &RE::Platform,
+        identity: Option<&ReActionIdentity<'_>>,
     ) -> buck2_error::Result<Option<ActionResultResponse>> {
         if let Some(m) = &*INDUCED_CACHE_MISSES {
             if m.get(&action_digest.to_string())
@@ -1069,13 +1072,16 @@ impl RemoteExecutionClientImpl {
             }
         }
 
+        let mut metadata = use_case.metadata(identity);
+        metadata.action_id = Some(action_digest.raw_digest().to_string());
+
         let res = with_error_handler(
             "action_cache",
             self.get_session_id(),
             self.client()
                 .get_action_cache_client()
                 .get_action_result(
-                    use_case.metadata(None),
+                    metadata,
                     ActionResultRequest {
                         digest: action_digest.to_re(),
                         platform: Some(re_platform(platform)),
@@ -1115,14 +1121,19 @@ impl RemoteExecutionClientImpl {
         directories: Vec<remote_execution::Path>,
         inlined_blobs_with_digest: Vec<InlinedBlobWithDigest>,
         use_case: RemoteExecutorUseCase,
+        identity: Option<&ReActionIdentity<'_>>,
     ) -> buck2_error::Result<()> {
+        let mut metadata = use_case.metadata(identity);
+        metadata.action_id = identity
+            .and_then(|id| id.action_id.clone())
+            .or(metadata.action_id);
         with_error_handler(
             "upload_files_and_directories",
             self.get_session_id(),
             self.client()
                 .get_cas_client()
                 .upload(
-                    use_case.metadata(None),
+                    metadata,
                     UploadRequest {
                         files_with_digest: Some(files_with_digest),
                         inlined_blobs_with_digest: Some(inlined_blobs_with_digest),
@@ -1519,6 +1530,7 @@ impl RemoteExecutionClientImpl {
                 ..Default::default()
             }),
             respect_file_symlinks: Some(self.respect_file_symlinks),
+            action_id: Some(action_digest.raw_digest().to_string()),
             ..use_case.metadata(Some(identity))
         };
 
@@ -1751,15 +1763,19 @@ impl RemoteExecutionClientImpl {
             return Ok((Vec::new(), TLocalCacheStats::default()));
         }
         let expected_blobs = digests.len();
+        let mut metadata = use_case.metadata(identity);
+        metadata.action_id = identity
+            .and_then(|id| id.action_id.clone())
+            .or(metadata.action_id);
         let response = with_error_handler(
             "download_typed_blobs",
             self.get_session_id(),
             self.client()
                 .get_cas_client()
                 .download(
-                    use_case.metadata(identity),
+                    metadata,
                     DownloadRequest {
-                        inlined_digests: Some(digests),
+                        inlined_digests: Some(digests.clone()),
                         ..Default::default()
                     },
                 )
@@ -1769,7 +1785,8 @@ impl RemoteExecutionClientImpl {
 
         let mut blobs: Vec<T> = Vec::with_capacity(expected_blobs);
         if let Some(ds) = response.inlined_blobs {
-            for d in ds {
+            for (expected_digest, d) in digests.iter().zip(ds) {
+                validate_inlined_blob(expected_digest, &d)?;
                 blobs.push(
                     Message::decode(d.blob.as_slice()).with_buck_error_context(|| {
                         format!("Failed to Protobuf decode tree at `{}`", d.digest)
@@ -1795,13 +1812,15 @@ impl RemoteExecutionClientImpl {
         use_case: RemoteExecutorUseCase,
     ) -> buck2_error::Result<(Vec<u8>, TLocalCacheStats)> {
         let re_action = format!("download_blob for digest {digest}");
+        let mut metadata = use_case.metadata(None);
+        metadata.action_id = Some(digest.hash.clone());
         let response = with_error_handler(
             re_action.as_str(),
             self.get_session_id(),
             self.client()
                 .get_cas_client()
                 .download(
-                    use_case.metadata(None),
+                    metadata,
                     DownloadRequest {
                         inlined_digests: Some(vec![digest.clone()]),
                         ..Default::default()
@@ -1813,13 +1832,18 @@ impl RemoteExecutionClientImpl {
         )
         .await?;
 
-        response
-            .inlined_blobs
-            .into_iter()
-            .flat_map(|blobs| blobs.into_iter())
+        let mut blobs = response.inlined_blobs.unwrap_or_default().into_iter();
+        let blob = blobs
             .next()
-            .map(|blob| (blob.blob, response.local_cache_stats))
-            .ok_or_else(|| internal_error!("No digest was returned in request for {digest}"))
+            .ok_or_else(|| internal_error!("No digest was returned in request for {digest}"))?;
+        if blobs.next().is_some() {
+            return Err(buck2_error!(
+                buck2_error::ErrorTag::ReInvalidGetCasResponse,
+                "CAS client returned more than one blob for `{digest}`"
+            ));
+        }
+        validate_inlined_blob(digest, &blob)?;
+        Ok((blob.blob, response.local_cache_stats))
     }
 
     pub async fn upload_blob(
@@ -1972,6 +1996,7 @@ impl RemoteExecutionClientImpl {
         digest: ActionDigest,
         result: TActionResult2,
         use_case: RemoteExecutorUseCase,
+        identity: Option<&ReActionIdentity<'_>>,
         platform: &RE::Platform,
         write_type: ActionCacheWriteType,
     ) -> buck2_error::Result<WriteActionResultResponse> {
@@ -1997,7 +2022,8 @@ impl RemoteExecutionClientImpl {
                             attributes,
                             ..Default::default()
                         }),
-                        ..use_case.metadata(None)
+                        action_id: Some(digest.raw_digest().to_string()),
+                        ..use_case.metadata(identity)
                     },
                     WriteActionResultRequest {
                         action_digest: digest.to_re(),
@@ -2056,9 +2082,125 @@ fn chunks<T>(v: Vec<T>, chunk_size: usize) -> impl Iterator<Item = Vec<T>> {
     Either::Right(chunks.into_iter())
 }
 
+fn validate_inlined_blob(
+    expected_digest: &TDigest,
+    blob: &InlinedDigestWithStatus,
+) -> buck2_error::Result<()> {
+    if blob.status.code != TCode::OK {
+        return Err(buck2_error!(
+            buck2_error::ErrorTag::ReInvalidGetCasResponse,
+            "CAS client returned status `{}` for `{}`: {}",
+            blob.status.code,
+            expected_digest,
+            blob.status.message
+        ));
+    }
+
+    if blob.digest.hash != expected_digest.hash
+        || blob.digest.size_in_bytes != expected_digest.size_in_bytes
+    {
+        return Err(buck2_error!(
+            buck2_error::ErrorTag::ReInvalidGetCasResponse,
+            "CAS client returned digest `{}` when `{}` was requested",
+            blob.digest,
+            expected_digest
+        ));
+    }
+
+    let expected_size: usize = expected_digest.size_in_bytes.try_into().map_err(|_| {
+        buck2_error!(
+            buck2_error::ErrorTag::ReInvalidGetCasResponse,
+            "CAS client was asked to download invalid negative-size digest `{}`",
+            expected_digest
+        )
+    })?;
+    if blob.blob.len() != expected_size {
+        return Err(buck2_error!(
+            buck2_error::ErrorTag::ReInvalidGetCasResponse,
+            "CAS client returned {} bytes for `{}`, expected {} bytes",
+            blob.blob.len(),
+            expected_digest,
+            expected_size
+        ));
+    }
+
+    Ok(())
+}
+
+fn compare_digest(left: &TDigest, right: &TDigest) -> std::cmp::Ordering {
+    left.hash
+        .cmp(&right.hash)
+        .then_with(|| left.size_in_bytes.cmp(&right.size_in_bytes))
+}
+
+fn validate_digest_expirations(
+    mut expected_digests: Vec<TDigest>,
+    response: GetDigestsTtlResponse,
+    now: DateTime<Utc>,
+) -> buck2_error::Result<Vec<(TDigest, DateTime<Utc>)>> {
+    let mut digests_with_ttl = response.digests_with_ttl;
+
+    if expected_digests.len() != digests_with_ttl.len() {
+        return Err(buck2_error!(
+            buck2_error::ErrorTag::DigestTtlMismatch,
+            "Invalid response from get_digests_ttl: expected {}, got {} digests",
+            expected_digests.len(),
+            digests_with_ttl.len()
+        ));
+    }
+
+    expected_digests.sort_by(compare_digest);
+    digests_with_ttl.sort_by(|left, right| compare_digest(&left.digest, &right.digest));
+
+    digests_with_ttl
+        .into_iter()
+        .zip(expected_digests)
+        .map(|(t, expected_digest)| {
+            if t.digest.hash != expected_digest.hash
+                || t.digest.size_in_bytes != expected_digest.size_in_bytes
+            {
+                return Err(buck2_error!(
+                    buck2_error::ErrorTag::DigestTtlInvalidResponse,
+                    "Invalid response from get_digests_ttl"
+                ));
+            }
+
+            Ok((t.digest, now + chrono::Duration::seconds(t.ttl)))
+        })
+        .collect::<buck2_error::Result<_>>()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_digest(size: i64) -> TDigest {
+        TDigest {
+            hash: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            size_in_bytes: size,
+            ..Default::default()
+        }
+    }
+
+    fn test_digest_with_hash(hash: &str, size: i64) -> TDigest {
+        TDigest {
+            hash: hash.to_owned(),
+            size_in_bytes: size,
+            ..Default::default()
+        }
+    }
+
+    fn test_blob(digest: TDigest, blob: Vec<u8>) -> InlinedDigestWithStatus {
+        InlinedDigestWithStatus {
+            digest,
+            status: remote_execution::TStatus {
+                code: TCode::OK,
+                message: String::new(),
+                ..Default::default()
+            },
+            blob,
+        }
+    }
 
     #[test]
     fn test_chunks_skips() {
@@ -2082,5 +2224,112 @@ mod tests {
         assert_eq!(it.next(), Some(vec![1, 2]));
         assert_eq!(it.next(), Some(vec![3]));
         assert_eq!(it.next(), None);
+    }
+
+    #[test]
+    fn validate_inlined_blob_accepts_matching_blob() {
+        let digest = test_digest(4);
+        let blob = test_blob(digest.clone(), b"test".to_vec());
+
+        validate_inlined_blob(&digest, &blob).unwrap();
+    }
+
+    #[test]
+    fn validate_inlined_blob_rejects_wrong_digest() {
+        let digest = test_digest(4);
+        let mut returned_digest = digest.clone();
+        returned_digest.hash = "fedcba9876543210fedcba9876543210fedcba98".to_owned();
+        let blob = test_blob(returned_digest, b"test".to_vec());
+
+        assert!(validate_inlined_blob(&digest, &blob).is_err());
+    }
+
+    #[test]
+    fn validate_inlined_blob_rejects_wrong_size() {
+        let digest = test_digest(4);
+        let blob = test_blob(digest.clone(), b"too long".to_vec());
+
+        assert!(validate_inlined_blob(&digest, &blob).is_err());
+    }
+
+    #[test]
+    fn validate_inlined_blob_rejects_remote_error() {
+        let digest = test_digest(4);
+        let mut blob = test_blob(digest.clone(), b"test".to_vec());
+        blob.status.code = TCode::DATA_LOSS;
+        blob.status.message = "corrupt blob".to_owned();
+
+        assert!(validate_inlined_blob(&digest, &blob).is_err());
+    }
+
+    #[test]
+    fn validate_digest_expirations_accepts_out_of_order_response() {
+        let now = Utc::now();
+        let digest_a = test_digest_with_hash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1);
+        let digest_b = test_digest_with_hash("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 2);
+
+        let expirations = validate_digest_expirations(
+            vec![digest_b.clone(), digest_a.clone()],
+            GetDigestsTtlResponse {
+                digests_with_ttl: vec![
+                    remote_execution::DigestWithTtl {
+                        digest: digest_a.clone(),
+                        ttl: 10,
+                    },
+                    remote_execution::DigestWithTtl {
+                        digest: digest_b.clone(),
+                        ttl: 20,
+                    },
+                ],
+            },
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(
+            expirations,
+            vec![
+                (digest_a, now + chrono::Duration::seconds(10)),
+                (digest_b, now + chrono::Duration::seconds(20))
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_digest_expirations_rejects_wrong_count() {
+        let now = Utc::now();
+        let digest = test_digest(1);
+
+        assert!(
+            validate_digest_expirations(
+                vec![digest],
+                GetDigestsTtlResponse {
+                    digests_with_ttl: Vec::new(),
+                },
+                now,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_digest_expirations_rejects_wrong_digest() {
+        let now = Utc::now();
+        let digest = test_digest_with_hash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1);
+        let returned_digest = test_digest_with_hash("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 1);
+
+        assert!(
+            validate_digest_expirations(
+                vec![digest],
+                GetDigestsTtlResponse {
+                    digests_with_ttl: vec![remote_execution::DigestWithTtl {
+                        digest: returned_digest,
+                        ttl: 10,
+                    }],
+                },
+                now,
+            )
+            .is_err()
+        );
     }
 }

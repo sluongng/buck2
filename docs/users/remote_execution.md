@@ -24,10 +24,14 @@ Keys supported include:
 - `engine_address` - address to your RE's engine.
 - `action_cache_address` - address to your action cache endpoint.
 - `cas_address` - address to your content-addressable storage (CAS) endpoint.
+  - Supported schemes: `grpc://`, `grpcs://`, `http://`, `https://`, and gRPC
+    resolver schemes (`dns://`, `ipv4://`, `ipv6://`).
+  - If no scheme is provided, Buck2 treats the endpoint as TLS-enabled.
 - `tls_ca_certs` - path to a CA certificates bundle. This must be PEM-encoded.
-  If none is set, a default bundle will be used. This path contains environment
-  variables using shell interpolation syntax (i.e. $VAR). They will be
-  substituted before reading the file.
+  If set, this replaces the default trust roots. If none is set, a default
+  bundle will be used. This path contains environment variables using shell
+  interpolation syntax (i.e. $VAR). They will be substituted before reading the
+  file.
 - `tls_client_cert` - path to a client certificate (and intermediate chain), as
   well as its associated private key. This must be PEM-encoded. This path can
   contain environment variables using shell interpolation syntax (i.e. $VAR).
@@ -70,3 +74,28 @@ as follows:
 - `remote_execution_properties` - other additional properties.
   - If the RE engine requires a container image, this can be done by setting
     `container-image` to an image URL, as is done in the example above.
+
+## Remote cache policy
+
+Remote-enabled executors can use the same RE backend for action-cache lookups,
+dep-file-cache lookups, uploads, and execution. These settings are controlled on
+`CommandExecutorConfig`:
+
+- `remote_cache_enabled` - query the remote action cache before executing.
+- `remote_dep_file_cache_enabled` - query the remote dep-file cache.
+- `allow_cache_uploads` - upload locally produced action results to the remote
+  cache.
+- `max_cache_upload_mebibytes` - skip remote cache uploads above this size.
+- `remote_cache_unavailable_fallback` - treat transient remote cache lookup
+  failures as misses and continue with the next executor.
+
+`remote_cache_unavailable_fallback` is intended for availability incidents where
+execution can still proceed locally or remotely after a cache read fails. It
+applies to cache lookup failures such as unavailable or timed-out cache
+requests; non-cache execution failures still follow the executor's normal
+fallback policy.
+
+Buck2 also treats a stale action-cache hit as a cache miss when the action-cache
+entry exists but one of the referenced output blobs is missing from CAS during
+cache materialization. This allows the action to be re-executed instead of
+failing the build on the stale cache entry.
