@@ -98,17 +98,26 @@ async fn query_action_cache_and_download_result(
         CacheType::RemoteDepFileCache(key) => key.dupe().coerce::<ActionDigestKind>(),
         CacheType::ActionCache => action_digest.dupe(),
     };
+    let identity = ReActionIdentity::new(
+        command.target,
+        re_action_key.as_deref(),
+        command.request.paths(),
+        Some(action_digest.raw_digest().to_string()),
+    );
 
     let action_cache_response = executor_stage_async(
         buck2_data::CacheQuery {
             action_digest: digest.to_string(),
             cache_type: cache_type.to_proto().into(),
         },
-        re_client.action_cache(digest.dupe(), &command.prepared_action.platform),
+        re_client.action_cache(
+            digest.dupe(),
+            &command.prepared_action.platform,
+            Some(&identity),
+        ),
     )
     .await;
 
-    let identity = None; // TODO(#503): implement this
     if upload_all_actions {
         if let Err(e) = re_client
             .upload(
@@ -117,7 +126,7 @@ async fn query_action_cache_and_download_result(
                 action_blobs,
                 ProjectRelativePath::empty(),
                 request.paths().input_directory(),
-                identity,
+                Some(&identity),
                 digest_config,
                 deduplicate_get_digests_ttl_calls,
             )
@@ -161,12 +170,6 @@ async fn query_action_cache_and_download_result(
         }
     };
 
-    let identity = ReActionIdentity::new(
-        command.target,
-        re_action_key.as_deref(),
-        command.request.paths(),
-    );
-
     let response = ActionCacheResult(response, cache_type.to_proto());
     let res = download_action_results(
         request,
@@ -198,10 +201,22 @@ async fn query_action_cache_and_download_result(
         false,
         None,
         output_trees_download_config,
+        true,
     )
     .await;
 
-    let DownloadResult::Result(mut res) = res;
+    let mut res = match res {
+        DownloadResult::Result(res) => res,
+        DownloadResult::CacheMiss { manager, error } => {
+            tracing::info!(
+                "Ignoring stale remote cache entry for action `{}` because referenced CAS blobs \
+                are missing: {:#}",
+                digest,
+                error
+            );
+            return ControlFlow::Continue(manager);
+        }
+    };
     match &cache_type {
         CacheType::RemoteDepFileCache(key) => {
             tracing::trace!(
