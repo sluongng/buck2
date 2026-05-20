@@ -1,0 +1,76 @@
+actions:
+  - name: Buck2 Stack Test
+    container_image: ubuntu-24.04
+    user: root
+    resource_requests:
+      disk: 64GB
+    triggers: {}
+    steps:
+      - run: |
+          set -euo pipefail
+
+          : "${BUILDBUDDY_API_KEY:?BuildBuddy should inject BUILDBUDDY_API_KEY for trusted workflows}"
+          export DEBIAN_FRONTEND=noninteractive
+
+          apt-get update
+          apt-get install -y \
+            b3sum \
+            ca-certificates \
+            curl \
+            git \
+            python3 \
+            watchman \
+            zstd
+          watchman version
+
+          platform=$(uname -m)
+          case "$platform" in
+            x86_64)
+              dotslash_platform=linux-x86_64
+              ;;
+            aarch64 | arm64)
+              dotslash_platform=linux-aarch64
+              ;;
+            *)
+              echo "Unsupported workflow runner architecture: $platform" >&2
+              exit 2
+              ;;
+          esac
+
+          read -r buck2_url buck2_digest buck2_path <<EOF
+          $(python3 - "$dotslash_platform" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          manifest = json.loads(Path("bootstrap/buck2").read_text().split("\n", 1)[1])
+          platform = manifest["platforms"][sys.argv[1]]
+          print(platform["providers"][0]["url"], platform["digest"], platform["path"])
+          PY
+          )
+          EOF
+
+          curl -fsSL "$buck2_url" -o /tmp/bootstrap-buck2.zst
+          echo "$buck2_digest  /tmp/bootstrap-buck2.zst" | b3sum --check
+          zstd -q -dc /tmp/bootstrap-buck2.zst > /usr/local/bin/buck2-bootstrap
+          chmod 0755 /usr/local/bin/buck2-bootstrap
+          /usr/local/bin/buck2-bootstrap --version
+
+          cp shim/third-party/rust/BUCK.reindeer shim/third-party/rust/BUCK
+
+          cat > .buckconfig.local <<EOF
+          <file:.buckconfig.buildbuddy>
+
+          [buck2_re_client]
+          http_headers = x-buildbuddy-api-key:$BUILDBUDDY_API_KEY
+
+          [bes]
+          header = x-buildbuddy-api-key=$BUILDBUDDY_API_KEY
+          EOF
+
+          /usr/local/bin/buck2-bootstrap \
+            --isolation-dir buildbuddy-rbe-build \
+            build \
+            --config-file .buckconfig.local \
+            --remote-only \
+            //:buck2
