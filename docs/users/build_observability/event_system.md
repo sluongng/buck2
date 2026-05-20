@@ -103,6 +103,17 @@ BES server to understand Buck2's `BuckEvent` schema. The `bazel` format is a
 best-effort compatibility mode for BES servers and web UIs that already know how
 to render Bazel BEP, such as BuildBuddy.
 
+Additional Bazel `BuildMetadata` entries can be configured under `[bes]`:
+
+```ini
+[bes]
+event_format = bazel
+build_metadata = PARENT_RUN_ID=workflow-run-id,PARENT_INVOCATION_ID=workflow-invocation-id
+```
+
+These entries are merged into Bazel-format `BuildMetadata` events. Metadata
+already present on the Buck2 command takes precedence over configured defaults.
+
 In `bazel` mode, Buck2 translates the event stream into
 `build_event_stream.BuildEvent` messages. The converter currently maps:
 
