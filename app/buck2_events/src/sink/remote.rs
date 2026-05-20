@@ -14,83 +14,26 @@ use std::sync::atomic::Ordering;
 
 use fbinit::FacebookInit;
 
-#[cfg(fbcode_build)]
-mod fbcode {
-    pub use scribe_client::ScribeConfig;
-
-    pub use crate::sink::scribe::RemoteEventSink;
-    pub(crate) use crate::sink::scribe::scribe_category;
-}
-
 #[cfg(not(fbcode_build))]
-mod fbcode {
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use async_trait::async_trait;
-
-    use crate::BuckEvent;
-    use crate::Event;
-    use crate::EventSink;
-    use crate::EventSinkStats;
-    use crate::EventSinkWithStats;
-
-    pub enum RemoteEventSink {}
-
-    impl RemoteEventSink {
-        pub async fn send_now(&self, _event: BuckEvent) -> buck2_error::Result<()> {
-            Ok(())
-        }
-        pub async fn send_messages_now(&self, _events: Vec<BuckEvent>) -> buck2_error::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[async_trait]
-    impl EventSink for RemoteEventSink {
-        fn send(&self, _event: Event) {}
-    }
-
-    impl EventSinkWithStats for RemoteEventSink {
-        fn to_event_sync(self: Arc<Self>) -> Arc<dyn EventSink> {
-            self as _
-        }
-
-        fn stats(&self) -> EventSinkStats {
-            match *self {}
-        }
-    }
-
-    #[derive(Default)]
-    pub struct ScribeConfig {
-        pub buffer_size: usize,
-        pub retry_backoff: Duration,
-        pub retry_attempts: usize,
-        pub message_batch_size: Option<usize>,
-        pub thrift_timeout: Duration,
-    }
-}
-
-pub use fbcode::*;
+pub use crate::sink::scribe::BesEventFormat;
+pub use crate::sink::scribe::RemoteEventConfig;
+pub use crate::sink::scribe::RemoteEventSink;
+pub(crate) use crate::sink::scribe::scribe_category;
 
 fn new_remote_event_sink_if_fbcode(
     fb: FacebookInit,
-    config: ScribeConfig,
+    config: RemoteEventConfig,
 ) -> buck2_error::Result<Option<RemoteEventSink>> {
-    #[cfg(fbcode_build)]
-    {
-        Ok(Some(RemoteEventSink::new(fb, scribe_category()?, config)?))
-    }
     #[cfg(not(fbcode_build))]
-    {
-        let _ = (fb, config);
-        Ok(None)
+    if !config.bes_enabled() {
+        return Ok(None);
     }
+    Ok(Some(RemoteEventSink::new(fb, scribe_category()?, config)?))
 }
 
 pub fn new_remote_event_sink_if_enabled(
     fb: FacebookInit,
-    config: ScribeConfig,
+    config: RemoteEventConfig,
 ) -> buck2_error::Result<Option<RemoteEventSink>> {
     if is_enabled() {
         new_remote_event_sink_if_fbcode(fb, config)

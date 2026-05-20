@@ -1,0 +1,95 @@
+actions:
+  - name: Buck2 Stack Test
+    container_image: ubuntu-24.04
+    user: root
+    resource_requests:
+      disk: 64GB
+    triggers: {}
+    steps:
+      - run: |
+          set -euo pipefail
+
+          : "${BUILDBUDDY_API_KEY:?BuildBuddy should inject BUILDBUDDY_API_KEY for trusted workflows}"
+          : "${BUILDBUDDY_RUN_ID:?BuildBuddy should inject BUILDBUDDY_RUN_ID for trusted workflows}"
+          : "${BUILDBUDDY_INVOCATION_ID:?BuildBuddy should inject BUILDBUDDY_INVOCATION_ID for trusted workflows}"
+          export DEBIAN_FRONTEND=noninteractive
+
+          apt-get update
+          apt-get install -y \
+            b3sum \
+            ca-certificates \
+            curl \
+            git \
+            python3 \
+            watchman \
+            zstd
+          watchman version
+
+          platform=$(uname -m)
+          case "$platform" in
+            x86_64)
+              dotslash_platform=linux-x86_64
+              ;;
+            aarch64 | arm64)
+              dotslash_platform=linux-aarch64
+              ;;
+            *)
+              echo "Unsupported workflow runner architecture: $platform" >&2
+              exit 2
+              ;;
+          esac
+
+          read -r buck2_url buck2_digest buck2_path <<EOF
+          $(python3 - "$dotslash_platform" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          manifest = json.loads(Path("bootstrap/buck2").read_text().split("\n", 1)[1])
+          platform = manifest["platforms"][sys.argv[1]]
+          print(platform["providers"][0]["url"], platform["digest"], platform["path"])
+          PY
+          )
+          EOF
+
+          curl -fsSL "$buck2_url" -o /tmp/bootstrap-buck2.zst
+          echo "$buck2_digest  /tmp/bootstrap-buck2.zst" | b3sum --check
+          buck2_bootstrap="$(mktemp /tmp/buck2-bootstrap.XXXXXX)"
+          trap 'rm -f "$buck2_bootstrap"' EXIT
+          zstd -q -dc /tmp/bootstrap-buck2.zst > "$buck2_bootstrap"
+          chmod 0755 "$buck2_bootstrap"
+          "$buck2_bootstrap" --version
+
+          cp shim/third-party/rust/BUCK.reindeer shim/third-party/rust/BUCK
+
+          cat > .buckconfig.local <<EOF
+          <file:.buckconfig.buildbuddy>
+
+          [buck2_re_client]
+          http_headers = x-buildbuddy-api-key:$BUILDBUDDY_API_KEY
+
+          [bes]
+          header = x-buildbuddy-api-key=$BUILDBUDDY_API_KEY
+          build_metadata = PARENT_RUN_ID=$BUILDBUDDY_RUN_ID,PARENT_INVOCATION_ID=$BUILDBUDDY_INVOCATION_ID
+
+          [scuba]
+          defaults = {\"normals\":{\"PARENT_RUN_ID\":\"$BUILDBUDDY_RUN_ID\",\"PARENT_INVOCATION_ID\":\"$BUILDBUDDY_INVOCATION_ID\"}}
+          EOF
+
+          built_buck2_json="$("$buck2_bootstrap" \
+            --isolation-dir buildbuddy-rbe-build \
+            build \
+            --show-full-json-output \
+            --config-file .buckconfig.local \
+            --remote-only \
+            //:buck2)"
+          built_buck2="$(python3 -c 'import json, sys; outputs = json.load(sys.stdin); output = next(iter(outputs.values())); print(output[0] if isinstance(output, list) else output)' <<< "$built_buck2_json")"
+          test -x "$built_buck2"
+          "$built_buck2" --version
+
+          "$built_buck2" \
+            --isolation-dir buildbuddy-rbe-selftest \
+            build \
+            --config-file .buckconfig.local \
+            --remote-only \
+            //:buck2
