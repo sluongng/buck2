@@ -23,7 +23,10 @@ cas_address = remote.buildbuddy.io
 # protocol features, including ByteStream and BatchUpdate compression.
 capabilities = true
 request_metadata_tool_name = bazel
-execution_concurrency_limit = 2000
+# BuildBuddy Workflows run through a single gRPC session. Keep remote execution
+# parallelism high enough to exercise RBE, but conservative enough for a cold
+# //:buck2 build to avoid HTTP/2 stream resets in the workflow runner.
+execution_concurrency_limit = 16
 # Match BuildBuddy's client-side batch RPC limit: blobs or batches above 2 MiB
 # use ByteStream, which is faster for larger transfers.
 max_total_batch_size = 2097152
