@@ -6527,6 +6527,23 @@ mod tests {
         assert_eq!(configured_connection_count(Some(16), Some(2000)), 16);
     }
 
+    #[test]
+    fn prepare_uri_adds_root_path_to_bare_authority() -> anyhow::Result<()> {
+        let (uri, tls) = prepare_uri("remote.buildbuddy.io".parse()?)?;
+        assert_eq!(uri.to_string(), "https://remote.buildbuddy.io/");
+        assert!(tls);
+
+        let (uri, tls) = prepare_uri("grpc://localhost:8980".parse()?)?;
+        assert_eq!(uri.to_string(), "http://localhost:8980/");
+        assert!(!tls);
+
+        let (uri, tls) = prepare_uri("grpcs://remote.buildbuddy.io/cache".parse()?)?;
+        assert_eq!(uri.to_string(), "https://remote.buildbuddy.io/cache");
+        assert!(tls);
+
+        Ok(())
+    }
+
     fn decode_request_metadata<T>(request: &tonic::Request<T>) -> RequestMetadata {
         let metadata = request
             .metadata()
