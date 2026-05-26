@@ -19,6 +19,7 @@ use buck2_events::sink::remote::RemoteEventConfig;
 struct BuckconfigBesSettings {
     bes_backend: Option<String>,
     bes_headers: Vec<(String, String)>,
+    build_metadata: Vec<(String, String)>,
     bes_event_format: Option<BesEventFormat>,
     bazel_artifact_upload: Option<bool>,
     upload_successful_action_events: Option<bool>,
@@ -42,6 +43,7 @@ pub fn with_buckconfig_overrides(
                 config.bes_backend = Some(bes_backend);
             }
             config.bes_headers = settings.bes_headers;
+            config.build_metadata = settings.build_metadata;
             if let Some(bes_event_format) = settings.bes_event_format {
                 config.event_format = bes_event_format;
             }
@@ -120,6 +122,7 @@ fn read_buckconfig_bes_settings(
         return Ok(BuckconfigBesSettings {
             bes_backend: None,
             bes_headers: Vec::new(),
+            build_metadata: Vec::new(),
             bes_event_format: None,
             bazel_artifact_upload: None,
             upload_successful_action_events: None,
@@ -176,6 +179,12 @@ fn read_buckconfig_bes_settings(
             section: "bes",
             property: "header",
         })?)?,
+        build_metadata: parse_bes_build_metadata(root_config.parse_list::<String>(
+            BuckconfigKeyRef {
+                section: "bes",
+                property: "build_metadata",
+            },
+        )?)?,
         bes_event_format: root_config.parse::<BesEventFormat>(BuckconfigKeyRef {
             section: "bes",
             property: "event_format",
@@ -249,4 +258,63 @@ fn parse_bes_headers(
         headers.push((key.to_owned(), value.to_owned()));
     }
     Ok(headers)
+}
+
+#[cfg(not(fbcode_build))]
+fn parse_bes_build_metadata(
+    raw_entries: Option<Vec<String>>,
+) -> buck2_error::Result<Vec<(String, String)>> {
+    let mut metadata = Vec::new();
+    for raw_entry in raw_entries.unwrap_or_default() {
+        let (key, value) = raw_entry.split_once('=').ok_or_else(|| {
+            buck2_error::buck2_error!(
+                ErrorTag::Input,
+                "Invalid bes.build_metadata entry '{}' (expected KEY=VALUE)",
+                raw_entry
+            )
+        })?;
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(buck2_error::buck2_error!(
+                ErrorTag::Input,
+                "Invalid bes.build_metadata entry '{}' (metadata key is empty)",
+                raw_entry
+            ));
+        }
+        metadata.push((key.to_owned(), value.to_owned()));
+    }
+    Ok(metadata)
+}
+
+#[cfg(all(test, not(fbcode_build)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_bes_build_metadata_entries() {
+        let metadata = parse_bes_build_metadata(Some(vec![
+            "PARENT_RUN_ID=workflow-run".to_owned(),
+            " PARENT_INVOCATION_ID=workflow-invocation".to_owned(),
+            "EXTRA=left=right".to_owned(),
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            metadata,
+            vec![
+                ("PARENT_RUN_ID".to_owned(), "workflow-run".to_owned()),
+                (
+                    "PARENT_INVOCATION_ID".to_owned(),
+                    "workflow-invocation".to_owned()
+                ),
+                ("EXTRA".to_owned(), "left=right".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_bes_build_metadata_entries() {
+        assert!(parse_bes_build_metadata(Some(vec!["PARENT_RUN_ID".to_owned()])).is_err());
+        assert!(parse_bes_build_metadata(Some(vec!["=workflow-run".to_owned()])).is_err());
+    }
 }

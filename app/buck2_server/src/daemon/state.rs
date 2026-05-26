@@ -384,6 +384,13 @@ impl DaemonState {
                     property: "header",
                 })?)?;
             #[cfg(not(fbcode_build))]
+            let build_metadata = Self::parse_bes_build_metadata(
+                root_config.parse_list::<String>(BuckconfigKeyRef {
+                    section: "bes",
+                    property: "build_metadata",
+                })?,
+            )?;
+            #[cfg(not(fbcode_build))]
             let bes_event_format = root_config
                 .parse::<remote::BesEventFormat>(BuckconfigKeyRef {
                     section: "bes",
@@ -472,6 +479,8 @@ impl DaemonState {
                     bes_backend,
                     #[cfg(not(fbcode_build))]
                     bes_headers,
+                    #[cfg(not(fbcode_build))]
+                    build_metadata,
                     #[cfg(not(fbcode_build))]
                     event_format: bes_event_format,
                     #[cfg(not(fbcode_build))]
@@ -966,6 +975,32 @@ impl DaemonState {
             headers.push((key.to_owned(), value.to_owned()));
         }
         Ok(headers)
+    }
+
+    #[cfg(not(fbcode_build))]
+    fn parse_bes_build_metadata(
+        raw_entries: Option<Vec<String>>,
+    ) -> buck2_error::Result<Vec<(String, String)>> {
+        let mut metadata = Vec::new();
+        for raw_entry in raw_entries.unwrap_or_default() {
+            let (key, value) = raw_entry.split_once('=').ok_or_else(|| {
+                buck2_error!(
+                    ErrorTag::Input,
+                    "Invalid bes.build_metadata entry '{}' (expected KEY=VALUE)",
+                    raw_entry
+                )
+            })?;
+            let key = key.trim();
+            if key.is_empty() {
+                return Err(buck2_error!(
+                    ErrorTag::Input,
+                    "Invalid bes.build_metadata entry '{}' (metadata key is empty)",
+                    raw_entry
+                ));
+            }
+            metadata.push((key.to_owned(), value.to_owned()));
+        }
+        Ok(metadata)
     }
 
     /// Prepares an event stream for a request by bootstrapping an event source and EventDispatcher pair. The given
