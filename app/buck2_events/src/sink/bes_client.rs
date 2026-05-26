@@ -70,6 +70,7 @@ pub struct BesConfig {
     pub grpc_timeout: Duration,
     pub bes_backend: Option<String>,
     pub bes_headers: Vec<(String, String)>,
+    pub build_metadata: Vec<(String, String)>,
     pub event_format: BesEventFormat,
     pub bazel_artifact_upload: bool,
     pub upload_successful_action_events: bool,
@@ -98,6 +99,7 @@ impl Default for BesConfig {
             grpc_timeout: Duration::from_secs(10),
             bes_backend: None,
             bes_headers: Vec::new(),
+            build_metadata: Vec::new(),
             event_format: BesEventFormat::Buck,
             bazel_artifact_upload: true,
             upload_successful_action_events: true,
@@ -921,7 +923,7 @@ impl WorkerState {
             return Ok(());
         }
         let upload_config = BazelArtifactUploadConfig::from_bes(&self.config, &self.connection)?;
-        let stream = StreamState::new(parsed, upload_config);
+        let stream = StreamState::new(parsed, &self.config.build_metadata, upload_config);
         self.streams.insert(parsed.invocation_id.clone(), stream);
         Ok(())
     }
@@ -1211,6 +1213,7 @@ struct PendingClose {
 impl StreamState {
     fn new(
         parsed: &ParsedMessage,
+        build_metadata: &[(String, String)],
         bazel_artifact_upload_config: Option<BazelArtifactUploadConfig>,
     ) -> Self {
         Self {
@@ -1225,7 +1228,7 @@ impl StreamState {
             ack_task: None,
             project_id: parsed.project_id.clone(),
             pending_unacked: VecDeque::new(),
-            bazel_converter: BazelEventConverter::default(),
+            bazel_converter: BazelEventConverter::new(build_metadata.iter().cloned()),
             bazel_artifact_uploader: bazel_artifact_upload_config.map(BazelArtifactUploader::new),
             last_sent_sequence_number: 0,
             saw_command_end: false,
@@ -1841,7 +1844,7 @@ mod tests {
             command_start_data(),
         );
         let parsed = ParsedMessage::from_message(&message).expect("valid message");
-        let mut stream = StreamState::new(&parsed, None);
+        let mut stream = StreamState::new(&parsed, &[], None);
 
         let last_sequence = stream.enqueue_event(&parsed, BesEventFormat::Bazel).await;
 
