@@ -1,7 +1,5 @@
 name: Build and test
 on:
-  push:
-  pull_request:
   workflow_dispatch: # allows manual triggering
 
 permissions:

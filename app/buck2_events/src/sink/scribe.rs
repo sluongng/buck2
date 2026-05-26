@@ -17,12 +17,15 @@ use buck2_data::ActionExecutionEnd;
 use buck2_data::InstantEvent;
 use buck2_data::Location;
 use buck2_data::StructuredError;
+#[cfg(fbcode_build)]
 use buck2_error::ErrorTag;
+#[cfg(fbcode_build)]
 use buck2_error::conversion::from_any_with_tag;
 use buck2_util::truncate::truncate;
 use fbinit::FacebookInit;
 use prost::Message;
-pub use scribe_client::ScribeConfig;
+#[cfg(fbcode_build)]
+pub use scribe_client::ScribeConfig as RemoteEventConfig;
 
 use crate::BuckEvent;
 use crate::Event;
@@ -33,34 +36,58 @@ use crate::TraceId;
 use crate::daemon_id::get_daemon_id_for_panics;
 use crate::metadata;
 use crate::schedule_type::SandcastleScheduleType;
+#[cfg(not(fbcode_build))]
+pub use crate::sink::bes_client::BesConfig as RemoteEventConfig;
+#[cfg(not(fbcode_build))]
+pub use crate::sink::bes_client::BesEventFormat;
 use crate::sink::smart_truncate_event::smart_truncate_event;
+#[cfg(not(fbcode_build))]
+use crate::sink::smart_truncate_event::smart_truncate_event_preserving_logs;
 
 // 1 MiB limit
 static SCRIBE_MESSAGE_SIZE_LIMIT: usize = 1024 * 1024;
 // 50k characters
 static TRUNCATED_SCRIBE_MESSAGE_SIZE: usize = 50000;
 
-/// RemoteEventSink is a ScribeSink backed by the Thrift-based client in the `buck2_scribe_client` crate.
+/// RemoteEventSink forwards events to a remote backend.
 pub struct RemoteEventSink {
     category: String,
+    #[cfg(fbcode_build)]
     client: scribe_client::ScribeClient,
+    #[cfg(not(fbcode_build))]
+    client: crate::sink::bes_client::BesClient,
+    #[cfg(not(fbcode_build))]
+    upload_successful_action_events: bool,
+    #[cfg(not(fbcode_build))]
+    preserve_bazel_logs: bool,
     schedule_type: SandcastleScheduleType,
 }
 
 impl RemoteEventSink {
-    /// Creates a new RemoteEventSink that forwards messages onto the Thrift-backed Scribe client.
+    /// Creates a new RemoteEventSink that forwards messages onto a remote backend.
     pub fn new(
         fb: FacebookInit,
         category: String,
-        config: ScribeConfig,
+        config: RemoteEventConfig,
     ) -> buck2_error::Result<RemoteEventSink> {
+        #[cfg(fbcode_build)]
         let client = scribe_client::ScribeClient::new(fb, config)
             .map_err(|e| from_any_with_tag(e, ErrorTag::Tier0))?;
+        #[cfg(not(fbcode_build))]
+        let upload_successful_action_events = config.upload_successful_action_events;
+        #[cfg(not(fbcode_build))]
+        let preserve_bazel_logs = config.event_format == BesEventFormat::Bazel;
+        #[cfg(not(fbcode_build))]
+        let client = crate::sink::bes_client::BesClient::new(fb, config)?;
 
         let schedule_type = SandcastleScheduleType::new()?;
         Ok(RemoteEventSink {
             category,
             client,
+            #[cfg(not(fbcode_build))]
+            upload_successful_action_events,
+            #[cfg(not(fbcode_build))]
+            preserve_bazel_logs,
             schedule_type,
         })
     }
@@ -72,36 +99,68 @@ impl RemoteEventSink {
 
     // Send multiple events now, bypassing internal message queue.
     pub async fn send_messages_now(&self, events: Vec<BuckEvent>) -> buck2_error::Result<()> {
-        let messages = events
-            .into_iter()
-            .map(|e| {
-                let message_key = e.trace_id().unwrap().hash();
-                scribe_client::Message {
-                    category: self.category.clone(),
-                    message: Self::encode_message(e),
-                    message_key: Some(message_key),
-                }
-            })
-            .collect();
-        self.client
-            .send_messages_now(messages)
-            .await
-            .map_err(|e| from_any_with_tag(e, ErrorTag::Tier0))
+        #[cfg(fbcode_build)]
+        {
+            let messages = events
+                .into_iter()
+                .map(|e| {
+                    let message_key = e.trace_id().unwrap().hash();
+                    scribe_client::Message {
+                        category: self.category.clone(),
+                        message: Self::encode_message(e, false),
+                        message_key: Some(message_key),
+                    }
+                })
+                .collect();
+            self.client
+                .send_messages_now(messages)
+                .await
+                .map_err(|e| from_any_with_tag(e, ErrorTag::Tier0))
+        }
+        #[cfg(not(fbcode_build))]
+        {
+            let messages = events
+                .into_iter()
+                .map(|e| {
+                    let message_key = e.trace_id().unwrap().hash();
+                    crate::sink::bes_client::Message {
+                        category: self.category.clone(),
+                        message: Self::encode_message(e, self.preserve_bazel_logs),
+                        message_key: Some(message_key),
+                    }
+                })
+                .collect();
+            self.client.send_messages_now(messages).await
+        }
     }
 
     // Send this event by placing it on the internal message queue.
     pub fn offer(&self, event: BuckEvent) {
         let message_key = event.trace_id().unwrap().hash();
+        #[cfg(fbcode_build)]
         self.client.offer(scribe_client::Message {
             category: self.category.clone(),
-            message: Self::encode_message(event),
+            message: Self::encode_message(event, false),
+            message_key: Some(message_key),
+        });
+        #[cfg(not(fbcode_build))]
+        self.client.offer(crate::sink::bes_client::Message {
+            category: self.category.clone(),
+            message: Self::encode_message(event, self.preserve_bazel_logs),
             message_key: Some(message_key),
         });
     }
 
-    // Encodes message into something scribe understands.
-    fn encode_message(mut event: BuckEvent) -> Vec<u8> {
-        smart_truncate_event(event.data_mut());
+    // Encodes message for transport.
+    fn encode_message(mut event: BuckEvent, preserve_logs: bool) -> Vec<u8> {
+        if preserve_logs {
+            #[cfg(not(fbcode_build))]
+            smart_truncate_event_preserving_logs(event.data_mut());
+            #[cfg(fbcode_build)]
+            smart_truncate_event(event.data_mut());
+        } else {
+            smart_truncate_event(event.data_mut());
+        }
         let mut proto: Box<buck2_data::BuckEvent> = event.into();
 
         Self::prepare_event(&mut proto);
@@ -149,6 +208,16 @@ impl RemoteEventSink {
     fn prepare_event(event: &mut buck2_data::BuckEvent) {
         use buck2_data::buck_event::Data;
 
+        #[cfg(not(fbcode_build))]
+        {
+            if let Some(Data::Instant(i)) = &mut event.data
+                && let Some(buck2_data::instant_event::Data::BuckconfigInputValues(values)) =
+                    &mut i.data
+            {
+                redact_sensitive_buckconfig_values(values);
+            }
+        }
+
         if let Some(Data::SpanEnd(s)) = &mut event.data
             && let Some(buck2_data::span_end_event::Data::ActionExecution(action)) = &mut s.data
         {
@@ -181,29 +250,24 @@ impl RemoteEventSink {
 
                 match &s.data {
                     Some(Data::Command(..)) => true,
+                    // Buck2->BuildBuddy OSS integration needs this to capture
+                    // metadata sourced from buckconfigs.
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::CommandCritical(..)) => true,
+                    // Buck2->BuildBuddy target mapping uses analysis start to
+                    // synthesize target configured events.
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::Analysis(..)) => true,
                     None => false,
                     _ => false,
                 }
             }
             Data::SpanEnd(s) => {
-                use buck2_data::ActionExecutionKind;
                 use buck2_data::span_end_event::Data;
 
                 match &s.data {
                     Some(Data::Command(..)) => true,
-                    Some(Data::ActionExecution(a)) => {
-                        a.failed
-                            || match ActionExecutionKind::try_from(a.execution_kind) {
-                                // Those kinds are not used in downstreams
-                                Ok(ActionExecutionKind::Simple) => false,
-                                Ok(ActionExecutionKind::Deferred) => false,
-                                Ok(ActionExecutionKind::NotSet) => false,
-                                _ => !matches!(
-                                    (action_has_cache_hit(a), self.schedule_type.is_diff()),
-                                    (true, true)
-                                ),
-                            }
-                    }
+                    Some(Data::ActionExecution(a)) => self.should_send_action_execution(a),
                     Some(Data::Analysis(..)) => !self.schedule_type.is_diff(),
                     Some(Data::Load(..)) => true,
                     Some(Data::CacheUpload(..)) => true,
@@ -220,6 +284,31 @@ impl RemoteEventSink {
 
                 match i.data {
                     Some(Data::BuildGraphInfo(..)) => true,
+                    // Required by BuildBuddy Buck2 mapping for target/test
+                    // details and invocation metadata.
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::TestDiscovery(..)) => true,
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::TestResult(..)) => true,
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::TargetPatterns(..)) => true,
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::TargetCfg(..)) => true,
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::CommandOptions(..)) => true,
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::VersionControlRevision(..)) => true,
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::BuckconfigInputValues(..)) => true,
+                    // Required for BuildBuddy build log rendering.
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::ConsoleMessage(..)) => true,
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::ConsoleWarning(..)) => true,
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::StreamingOutput(..)) => true,
+                    #[cfg(not(fbcode_build))]
+                    Some(Data::ActionError(..)) => true,
                     Some(Data::RageResult(..)) => true,
                     Some(Data::ReSession(..)) => true,
                     Some(Data::StructuredError(..)) => true,
@@ -243,6 +332,42 @@ impl RemoteEventSink {
                 }
             }
         }
+    }
+
+    fn should_send_action_execution(&self, action: &ActionExecutionEnd) -> bool {
+        #[cfg(not(fbcode_build))]
+        let upload_successful_action_events = self.upload_successful_action_events;
+        #[cfg(fbcode_build)]
+        let upload_successful_action_events = true;
+
+        should_send_action_execution(action, &self.schedule_type, upload_successful_action_events)
+    }
+}
+
+fn should_send_action_execution(
+    action: &ActionExecutionEnd,
+    schedule_type: &SandcastleScheduleType,
+    upload_successful_action_events: bool,
+) -> bool {
+    use buck2_data::ActionExecutionKind;
+
+    if action.failed {
+        return true;
+    }
+
+    if !upload_successful_action_events {
+        return false;
+    }
+
+    match ActionExecutionKind::try_from(action.execution_kind) {
+        // Those kinds are not used in downstreams.
+        Ok(ActionExecutionKind::Simple) => false,
+        Ok(ActionExecutionKind::Deferred) => false,
+        Ok(ActionExecutionKind::NotSet) => false,
+        _ => !matches!(
+            (action_has_cache_hit(action), schedule_type.is_diff()),
+            (true, true)
+        ),
     }
 }
 
@@ -271,6 +396,50 @@ impl EventSink for RemoteEventSink {
             Event::PartialResult(..) => {}
         }
     }
+}
+
+#[cfg(not(fbcode_build))]
+fn redact_sensitive_buckconfig_values(values: &mut buck2_data::BuckconfigInputValues) {
+    use buck2_data::buckconfig_component::Data;
+
+    for component in &mut values.components {
+        let Some(data) = component.data.as_mut() else {
+            continue;
+        };
+        let config_values = match data {
+            Data::ConfigValue(value) => std::slice::from_mut(value),
+            Data::ConfigFile(config_file) => match config_file.data.as_mut() {
+                Some(buck2_data::config_file::Data::GlobalExternalConfig(config)) => {
+                    config.values.as_mut_slice()
+                }
+                _ => continue,
+            },
+            Data::GlobalExternalConfigFile(config) => config.values.as_mut_slice(),
+        };
+
+        for value in config_values {
+            if is_sensitive_buckconfig_value(value) {
+                value.value = "<redacted>".to_owned();
+            }
+        }
+    }
+}
+
+#[cfg(not(fbcode_build))]
+fn is_sensitive_buckconfig_value(value: &buck2_data::ConfigValue) -> bool {
+    let section = value.section.to_ascii_lowercase();
+    let key = value.key.to_ascii_lowercase();
+    section.contains("credential")
+        || section.contains("secret")
+        || section.contains("token")
+        || key.contains("credential")
+        || key.contains("password")
+        || key.contains("secret")
+        || key.contains("token")
+        || key.contains("api_key")
+        || key.contains("api-key")
+        || key == "header"
+        || key == "http_headers"
 }
 
 fn action_has_cache_hit(action: &ActionExecutionEnd) -> bool {
@@ -334,6 +503,8 @@ pub(crate) fn scribe_category() -> buck2_error::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use buck2_data::ActionExecutionEnd;
+    use buck2_data::ActionExecutionKind;
     use buck2_data::CommandExecutionDetails;
     use buck2_data::CommandExecutionKind;
     use buck2_data::RemoteCommand;
@@ -359,7 +530,7 @@ mod tests {
             }),
         );
 
-        let res = RemoteEventSink::encode_message(event);
+        let res = RemoteEventSink::encode_message(event, false);
         let size_approx = res.len() * 8;
         assert!(size_approx > TRUNCATED_SCRIBE_MESSAGE_SIZE);
         assert!(size_approx < SCRIBE_MESSAGE_SIZE_LIMIT);
@@ -390,5 +561,42 @@ mod tests {
             ..Default::default()
         };
         assert!(!get_is_cache_hit(&details_no_cache_hit));
+    }
+
+    #[test]
+    fn upload_successful_action_events_keeps_failures() {
+        let schedule_type = SandcastleScheduleType::testing_empty();
+        let failed_remote = ActionExecutionEnd {
+            failed: true,
+            execution_kind: ActionExecutionKind::Remote as i32,
+            ..Default::default()
+        };
+
+        assert!(should_send_action_execution(
+            &failed_remote,
+            &schedule_type,
+            false
+        ));
+    }
+
+    #[test]
+    fn upload_successful_action_events_filters_successes() {
+        let schedule_type = SandcastleScheduleType::testing_empty();
+        let successful_remote = ActionExecutionEnd {
+            failed: false,
+            execution_kind: ActionExecutionKind::Remote as i32,
+            ..Default::default()
+        };
+
+        assert!(should_send_action_execution(
+            &successful_remote,
+            &schedule_type,
+            true
+        ));
+        assert!(!should_send_action_execution(
+            &successful_remote,
+            &schedule_type,
+            false
+        ));
     }
 }
