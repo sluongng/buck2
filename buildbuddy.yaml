@@ -4,7 +4,10 @@ actions:
     user: root
     resource_requests:
       disk: 64GB
-    triggers: {}
+    triggers:
+      push:
+        branches:
+          - codex-linkage-proof-*
     steps:
       - run: |
           set -euo pipefail
