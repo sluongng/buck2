@@ -1045,7 +1045,7 @@ fn prepare_uri(uri: Uri) -> anyhow::Result<(Uri, bool)> {
     // Is this API actually designed to be unusable? If you've got a scheme, you must
     // have a path_and_query. I'm sure there's a good reason, so we abide:
     if parts.path_and_query.is_none() {
-        parts.path_and_query = Some(http::uri::PathAndQuery::from_static(""));
+        parts.path_and_query = Some(http::uri::PathAndQuery::from_static("/"));
     }
 
     Ok((Uri::from_parts(parts)?, tls))
@@ -6207,6 +6207,23 @@ mod tests {
     fn configured_connection_count_honors_override() {
         assert_eq!(configured_connection_count(Some(0), Some(2000)), 1);
         assert_eq!(configured_connection_count(Some(16), Some(2000)), 16);
+    }
+
+    #[test]
+    fn prepare_uri_adds_root_path_to_bare_authority() -> anyhow::Result<()> {
+        let (uri, tls) = prepare_uri("remote.buildbuddy.io".parse()?)?;
+        assert_eq!(uri.to_string(), "https://remote.buildbuddy.io/");
+        assert!(tls);
+
+        let (uri, tls) = prepare_uri("grpc://localhost:8980".parse()?)?;
+        assert_eq!(uri.to_string(), "http://localhost:8980/");
+        assert!(!tls);
+
+        let (uri, tls) = prepare_uri("grpcs://remote.buildbuddy.io/cache".parse()?)?;
+        assert_eq!(uri.to_string(), "https://remote.buildbuddy.io/cache");
+        assert!(tls);
+
+        Ok(())
     }
 
     fn decode_request_metadata<T>(request: &tonic::Request<T>) -> RequestMetadata {
