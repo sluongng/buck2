@@ -1453,11 +1453,20 @@ fn unstructured_command_line_event(command: &buck2_data::CommandStart) -> bep::B
 
 fn original_structured_command_line_event(command: &buck2_data::CommandStart) -> bep::BuildEvent {
     let mut sections = Vec::new();
-    if let Some(command) = command.cli_args.first() {
-        sections.push(chunk_section("command", vec![command.clone()]));
+    if let Some(executable) = command.cli_args.first() {
+        sections.push(chunk_section(
+            "executable",
+            vec![display_executable(executable)],
+        ));
     }
-    if command.cli_args.len() > 1 {
-        sections.push(chunk_section("arguments", command.cli_args[1..].to_vec()));
+    sections.push(chunk_section("command", vec![command_name(command)]));
+
+    let parsed = ParsedCliArgs::new(command);
+    if !parsed.options.is_empty() {
+        sections.push(option_section("command options", parsed.options));
+    }
+    if !parsed.residue.is_empty() {
+        sections.push(chunk_section("residual", parsed.residue));
     }
 
     bep::BuildEvent {
@@ -1529,9 +1538,11 @@ struct ParsedCliArgs {
 impl ParsedCliArgs {
     fn new(command: &buck2_data::CommandStart) -> Self {
         let args = command.cli_args.as_slice();
+        let command_name = command_name(command);
         let mut options = Vec::new();
         let mut residue = Vec::new();
-        let mut i = command_arg_start(args);
+        let mut i = 1;
+        let mut skipped_command = false;
         let mut force_residue = false;
         while i < args.len() {
             let arg = &args[i];
@@ -1545,10 +1556,20 @@ impl ParsedCliArgs {
                 i += 1;
                 continue;
             }
+            if !skipped_command && arg == &command_name {
+                skipped_command = true;
+                i += 1;
+                continue;
+            }
             if let Some(mut option) = option_from_arg(arg) {
                 if option.option_value.is_empty()
                     && i + 1 < args.len()
-                    && !args[i + 1].starts_with('-')
+                    && should_consume_option_value(
+                        &option.option_name,
+                        &args[i + 1],
+                        &command_name,
+                        skipped_command,
+                    )
                 {
                     option.option_value = args[i + 1].clone();
                     option.combined_form = format!("{}={}", arg, option.option_value);
@@ -1568,16 +1589,63 @@ impl ParsedCliArgs {
     }
 }
 
-fn command_arg_start(args: &[String]) -> usize {
-    if args.is_empty() {
-        return 0;
+fn display_executable(executable: &str) -> String {
+    executable
+        .rsplit(|c| c == '/' || c == '\\')
+        .find(|component| !component.is_empty())
+        .unwrap_or(executable)
+        .to_owned()
+}
+
+fn should_consume_option_value(
+    option_name: &str,
+    next_arg: &str,
+    command_name: &str,
+    skipped_command: bool,
+) -> bool {
+    if next_arg == "--" || next_arg.starts_with('-') || is_boolean_option(option_name) {
+        return false;
     }
-    // Buck2 command args are generally: executable, command, command args...
-    if args.len() > 1 && !args[1].starts_with('-') {
-        2
-    } else {
-        1
+    if option_takes_value(option_name) {
+        return true;
     }
+    if !skipped_command && next_arg == command_name {
+        return false;
+    }
+    !looks_like_residue_arg(next_arg)
+}
+
+fn option_takes_value(option_name: &str) -> bool {
+    matches!(
+        option_name,
+        "build_report"
+            | "build_report_options"
+            | "config"
+            | "config_file"
+            | "fake_architecture"
+            | "fake_host"
+            | "isolation_dir"
+            | "num_threads"
+            | "streaming_build_report"
+            | "target_platforms"
+            | "unstable_target_platforms"
+    )
+}
+
+fn is_boolean_option(option_name: &str) -> bool {
+    matches!(
+        option_name,
+        "local_only"
+            | "prefer_local"
+            | "prefer_remote"
+            | "remote_only"
+            | "unstable_no_execution"
+            | "unstable_no_remote_cache"
+    )
+}
+
+fn looks_like_residue_arg(arg: &str) -> bool {
+    arg.starts_with("//") || arg.starts_with(':') || arg.starts_with('@')
 }
 
 fn option_from_arg(arg: &str) -> Option<cl::Option> {
@@ -1685,14 +1753,21 @@ fn insert_env_option(values: &mut BTreeMap<String, String>, key: &str, value: Op
 }
 
 fn options_parsed_event(command: &buck2_data::CommandStart) -> bep::BuildEvent {
+    let parsed = ParsedCliArgs::new(command);
+    let cmd_line = parsed
+        .options
+        .iter()
+        .map(|option| option.combined_form.clone())
+        .collect::<Vec<_>>();
+
     bep::BuildEvent {
         id: Some(options_parsed_id()),
         children: Vec::new(),
         payload: Some(build_event::Payload::OptionsParsed(bep::OptionsParsed {
             startup_options: Vec::new(),
             explicit_startup_options: Vec::new(),
-            cmd_line: command.cli_args.clone(),
-            explicit_cmd_line: command.cli_args.clone(),
+            cmd_line: cmd_line.clone(),
+            explicit_cmd_line: cmd_line,
             invocation_policy: None,
             tool_tag: String::new(),
         })),
@@ -4319,6 +4394,53 @@ mod tests {
         }
     }
 
+    fn command_line_from_event(event: &bep::BuildEvent) -> &cl::CommandLine {
+        match event.payload.as_ref() {
+            Some(build_event::Payload::StructuredCommandLine(command_line)) => command_line,
+            _ => panic!("expected structured command line"),
+        }
+    }
+
+    fn chunk_values(command_line: &cl::CommandLine, section_label: &str) -> Vec<String> {
+        command_line
+            .sections
+            .iter()
+            .find_map(|section| {
+                if section.section_label != section_label {
+                    return None;
+                }
+                match section.section_type.as_ref() {
+                    Some(cl::command_line_section::SectionType::ChunkList(chunks)) => {
+                        Some(chunks.chunk.clone())
+                    }
+                    _ => None,
+                }
+            })
+            .unwrap_or_default()
+    }
+
+    fn option_values(command_line: &cl::CommandLine, section_label: &str) -> Vec<String> {
+        command_line
+            .sections
+            .iter()
+            .find_map(|section| {
+                if section.section_label != section_label {
+                    return None;
+                }
+                match section.section_type.as_ref() {
+                    Some(cl::command_line_section::SectionType::OptionList(options)) => Some(
+                        options
+                            .option
+                            .iter()
+                            .map(|option| option.combined_form.clone())
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                }
+            })
+            .unwrap_or_default()
+    }
+
     #[test]
     fn command_start_emits_started_and_metadata() {
         let mut converter = BazelEventConverter::default();
@@ -4422,6 +4544,62 @@ mod tests {
             decoded.payload,
             Some(build_event::Payload::Started(_))
         ));
+    }
+
+    #[test]
+    fn command_line_events_render_as_buck2_in_buildbuddy() {
+        let command = buck2_data::CommandStart {
+            cli_args: vec![
+                "/root/workspace/repo-root/buck-out/buildbuddy-rbe-build/art/gh_facebook_buck2/7703741d4b7244c6/app/buck2/__buck2-bin__/buck2".to_owned(),
+                "--isolation-dir".to_owned(),
+                "buildbuddy-rbe-selftest".to_owned(),
+                "build".to_owned(),
+                "--config-file".to_owned(),
+                ".buckconfig.local".to_owned(),
+                "--remote-only".to_owned(),
+                "//:buck2".to_owned(),
+            ],
+            data: Some(buck2_data::command_start::Data::Build(
+                buck2_data::BuildCommandStart {},
+            )),
+            ..Default::default()
+        };
+
+        let original_event = original_structured_command_line_event(&command);
+        let original = command_line_from_event(&original_event);
+        assert_eq!(chunk_values(original, "executable"), vec!["buck2"]);
+        assert_eq!(chunk_values(original, "command"), vec!["build"]);
+        assert_eq!(
+            option_values(original, "command options"),
+            vec![
+                "--isolation-dir=buildbuddy-rbe-selftest",
+                "--config-file=.buckconfig.local",
+                "--remote-only",
+            ]
+        );
+        assert_eq!(chunk_values(original, "residual"), vec!["//:buck2"]);
+
+        let canonical_event = canonical_structured_command_line_event(&command);
+        let canonical = command_line_from_event(&canonical_event);
+        let canonical_options = option_values(canonical, "command options");
+        assert!(canonical_options.contains(&"--remote-only".to_owned()));
+        assert!(!canonical_options.contains(&"--remote-only=//:buck2".to_owned()));
+        assert_eq!(chunk_values(canonical, "residue"), vec!["//:buck2"]);
+
+        let options_parsed_event = options_parsed_event(&command);
+        let Some(build_event::Payload::OptionsParsed(options_parsed)) =
+            options_parsed_event.payload.as_ref()
+        else {
+            panic!("expected options parsed");
+        };
+        assert_eq!(
+            options_parsed.explicit_cmd_line,
+            vec![
+                "--isolation-dir=buildbuddy-rbe-selftest",
+                "--config-file=.buckconfig.local",
+                "--remote-only",
+            ]
+        );
     }
 
     #[test]
