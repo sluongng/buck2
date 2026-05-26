@@ -28,7 +28,7 @@ gazebo.workspace = true
 hex.workspace = true
 hostname.workspace = true
 itertools.workspace = true
-lock_free_hashtable.workspace = true
+lock_free_hashtable = { workspace = true, features = ["allocative"] }
 memchr.workspace = true
 os_str_bytes.workspace = true
 pagable.workspace = true
