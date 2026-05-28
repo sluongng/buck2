@@ -22,6 +22,8 @@ use bazel_bep_proto::build_event_stream::build_event;
 use bazel_bep_proto::build_event_stream::build_event_id;
 use bazel_bep_proto::command_line as cl;
 use bazel_bep_proto::failure_details as failure;
+use chrono::DateTime;
+use chrono::Utc;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use prost::Message as _;
@@ -243,7 +245,11 @@ impl BazelEventConverter {
         let mut events = Vec::new();
 
         if !self.saw_started && !is_command_start(event) {
-            events.push(self.started_event(event, None));
+            if let Some(record) = invocation_record(event) {
+                events.push(self.started_event_from_invocation(event, record));
+            } else {
+                events.push(self.started_event(event, None));
+            }
             self.saw_started = true;
         }
 
@@ -294,7 +300,7 @@ impl BazelEventConverter {
                 events.push(options_parsed_event(command));
                 events.push(default_configuration_event());
                 events.push(workspace_info_event(command));
-                events.push(workspace_status_event(command));
+                events.push(workspace_status_event(command, event.timestamp.as_ref()));
                 events.push(build_metadata_event(&build_metadata_from_command(
                     command,
                     &self.build_metadata,
@@ -510,15 +516,7 @@ impl BazelEventConverter {
             }
             Some(buck2_data::instant_event::Data::VersionControlRevision(revision)) => {
                 let mut metadata = BTreeMap::new();
-                if let Some(revision) = revision.hg_revision.as_ref() {
-                    metadata.insert("COMMIT_SHA".to_owned(), revision.clone());
-                }
-                if let Some(has_local_changes) = revision.has_local_changes {
-                    metadata.insert(
-                        "HAS_LOCAL_CHANGES".to_owned(),
-                        has_local_changes.to_string(),
-                    );
-                }
+                add_version_control_metadata(&mut metadata, revision);
                 if !metadata.is_empty() {
                     events.push(self.build_metadata_event(&metadata));
                 }
@@ -581,6 +579,8 @@ impl BazelEventConverter {
     ) {
         match record.data.as_ref() {
             Some(buck2_data::record_event::Data::InvocationRecord(record)) => {
+                self.remember_invocation_target_patterns(record);
+                self.emit_invocation_command_context(event, record, events);
                 self.emit_pending_pattern_expanded(&[], events);
                 self.emit_completed_updates_for_actions(events);
                 events.push(self.build_metadata_event(&build_metadata_from_invocation(record)));
@@ -676,6 +676,64 @@ impl BazelEventConverter {
         events.splice(insert_at..insert_at, aborted);
     }
 
+    fn emit_invocation_command_context(
+        &mut self,
+        event: &buck2_data::BuckEvent,
+        record: &buck2_data::InvocationRecord,
+        events: &mut Vec<bep::BuildEvent>,
+    ) {
+        if record.cli_args.is_empty() {
+            return;
+        }
+
+        let command_name = invocation_command_name(record);
+        let metadata = invocation_metadata(record);
+        self.push_unposted_event(
+            unstructured_command_line_event_from_args(&record.cli_args),
+            events,
+        );
+        self.push_unposted_event(
+            original_structured_command_line_event_from_args(&record.cli_args, &command_name),
+            events,
+        );
+        self.push_unposted_event(
+            canonical_structured_command_line_event_from_args(
+                &record.cli_args,
+                &command_name,
+                client_env_options_from_metadata(metadata),
+            ),
+            events,
+        );
+        self.push_unposted_event(tool_structured_command_line_event(), events);
+        self.push_unposted_event(
+            options_parsed_event_from_args(&record.cli_args, &command_name),
+            events,
+        );
+        self.push_unposted_event(default_configuration_event(), events);
+        self.push_unposted_event(workspace_info_event_from_metadata(metadata), events);
+        self.push_unposted_event(
+            workspace_status_event_from_invocation(record, event.timestamp.as_ref()),
+            events,
+        );
+    }
+
+    fn push_unposted_event(&mut self, event: bep::BuildEvent, events: &mut Vec<bep::BuildEvent>) {
+        let Some(id) = event.id.as_ref() else {
+            events.push(event);
+            return;
+        };
+        let key = event_id_key(id);
+        if self.posted_event_ids.contains(&key)
+            || events
+                .iter()
+                .filter_map(|event| event.id.as_ref())
+                .any(|id| event_id_key(id) == key)
+        {
+            return;
+        }
+        events.push(event);
+    }
+
     fn build_metadata_event(&self, metadata: &BTreeMap<String, String>) -> bep::BuildEvent {
         build_metadata_event_with_defaults(&self.build_metadata, metadata)
     }
@@ -759,12 +817,50 @@ impl BazelEventConverter {
         command: Option<&buck2_data::CommandStart>,
     ) -> bep::BuildEvent {
         let cli_args = command.map(|c| c.cli_args.as_slice()).unwrap_or(&[]);
+        let command_name = command
+            .map(command_name)
+            .unwrap_or_else(|| "unknown".to_owned());
+        let patterns = command.map(target_patterns_from_cli).unwrap_or_default();
+        self.started_event_from_parts(
+            event,
+            cli_args,
+            &command_name,
+            command.map(|c| &c.metadata),
+            None,
+            patterns,
+        )
+    }
+
+    fn started_event_from_invocation(
+        &self,
+        event: &buck2_data::BuckEvent,
+        record: &buck2_data::InvocationRecord,
+    ) -> bep::BuildEvent {
+        let command_name = invocation_command_name(record);
+        self.started_event_from_parts(
+            event,
+            &record.cli_args,
+            &command_name,
+            invocation_metadata(record),
+            record.repo_path.as_deref().filter(|path| !path.is_empty()),
+            target_patterns_from_invocation(record),
+        )
+    }
+
+    fn started_event_from_parts(
+        &self,
+        event: &buck2_data::BuckEvent,
+        cli_args: &[String],
+        command_name: &str,
+        metadata: Option<&HashMap<String, String>>,
+        workspace_directory_fallback: Option<&str>,
+        patterns: Vec<String>,
+    ) -> bep::BuildEvent {
         let options_description = if cli_args.is_empty() {
             BUILD_TOOL_VERSION.to_owned()
         } else {
             cli_args.join(" ")
         };
-        let metadata = command.map(|c| &c.metadata);
         let mut children = vec![
             unstructured_command_line_id(),
             structured_command_line_id(ORIGINAL_COMMAND_LINE_LABEL),
@@ -778,11 +874,8 @@ impl BazelEventConverter {
             workspace_config_id(),
             build_finished_id(),
         ];
-        if let Some(command) = command {
-            let patterns = target_patterns_from_cli(command);
-            if !patterns.is_empty() {
-                children.push(pattern_expanded_id(patterns));
-            }
+        if !patterns.is_empty() {
+            children.push(pattern_expanded_id(patterns));
         }
 
         bep::BuildEvent {
@@ -794,14 +887,13 @@ impl BazelEventConverter {
                 start_time: event.timestamp.clone(),
                 build_tool_version: BUILD_TOOL_VERSION.to_owned(),
                 options_description,
-                command: command
-                    .map(command_name)
-                    .unwrap_or_else(|| "unknown".to_owned()),
+                command: command_name.to_owned(),
                 working_directory: metadata
                     .and_then(|m| first_metadata(m, &["CWD", "PWD", "BUILD_WORKING_DIRECTORY"]))
                     .unwrap_or_default(),
                 workspace_directory: metadata
                     .and_then(|m| first_metadata(m, &["REPO_ROOT", "WORKSPACE_DIRECTORY"]))
+                    .or_else(|| workspace_directory_fallback.map(str::to_owned))
                     .unwrap_or_default(),
                 server_pid: i64::from(std::process::id()),
                 host: metadata
@@ -1152,8 +1244,8 @@ impl BazelEventConverter {
                 run_count: 1,
                 attempt_count: 1,
                 shard_count: 1,
-                passed: test_summary_files(status, test_end.command_report.as_ref(), true),
-                failed: test_summary_files(status, test_end.command_report.as_ref(), false),
+                passed: test_summary_files(status, &cases, test_end.command_report.as_ref(), true),
+                failed: test_summary_files(status, &cases, test_end.command_report.as_ref(), false),
                 total_num_cached: i32::from(test_cached_remotely(test_end.command_report.as_ref())),
                 first_start_time_millis: timestamp_millis(start_time.as_ref()),
                 last_stop_time_millis: timestamp_millis(end_time.as_ref()),
@@ -1460,13 +1552,22 @@ pub(crate) fn encode_bep_event(event: &bep::BuildEvent) -> Any {
 
 fn is_command_start(event: &buck2_data::BuckEvent) -> bool {
     matches!(
-        event.data,
+        event.data.as_ref(),
         Some(buck2_data::buck_event::Data::SpanStart(
             buck2_data::SpanStartEvent {
                 data: Some(buck2_data::span_start_event::Data::Command(_)),
             }
         ))
     )
+}
+
+fn invocation_record(event: &buck2_data::BuckEvent) -> Option<&buck2_data::InvocationRecord> {
+    match event.data.as_ref() {
+        Some(buck2_data::buck_event::Data::Record(buck2_data::RecordEvent {
+            data: Some(buck2_data::record_event::Data::InvocationRecord(record)),
+        })) => Some(record),
+        _ => None,
+    }
 }
 
 fn started_id() -> bep::BuildEventId {
@@ -1768,13 +1869,39 @@ fn command_end_name(command: &buck2_data::CommandEnd) -> &'static str {
     }
 }
 
+fn invocation_command_name(record: &buck2_data::InvocationRecord) -> String {
+    if let Some(command_name) = record.command_name.as_ref()
+        && !command_name.is_empty()
+    {
+        return command_name.clone();
+    }
+    record
+        .command_end
+        .as_ref()
+        .map(command_end_name)
+        .unwrap_or("unknown")
+        .to_owned()
+}
+
+fn invocation_metadata(record: &buck2_data::InvocationRecord) -> Option<&HashMap<String, String>> {
+    record.metadata.as_ref().map(|metadata| &metadata.strings)
+}
+
+fn first_metadata_opt(metadata: Option<&HashMap<String, String>>, keys: &[&str]) -> Option<String> {
+    metadata.and_then(|metadata| first_metadata(metadata, keys))
+}
+
 fn unstructured_command_line_event(command: &buck2_data::CommandStart) -> bep::BuildEvent {
+    unstructured_command_line_event_from_args(&command.cli_args)
+}
+
+fn unstructured_command_line_event_from_args(args: &[String]) -> bep::BuildEvent {
     bep::BuildEvent {
         id: Some(unstructured_command_line_id()),
         children: Vec::new(),
         payload: Some(build_event::Payload::UnstructuredCommandLine(
             bep::UnstructuredCommandLine {
-                args: command.cli_args.clone(),
+                args: args.to_vec(),
             },
         )),
         last_message: false,
@@ -1782,16 +1909,23 @@ fn unstructured_command_line_event(command: &buck2_data::CommandStart) -> bep::B
 }
 
 fn original_structured_command_line_event(command: &buck2_data::CommandStart) -> bep::BuildEvent {
+    original_structured_command_line_event_from_args(&command.cli_args, &command_name(command))
+}
+
+fn original_structured_command_line_event_from_args(
+    args: &[String],
+    command_name: &str,
+) -> bep::BuildEvent {
     let mut sections = Vec::new();
-    if let Some(executable) = command.cli_args.first() {
+    if let Some(executable) = args.first() {
         sections.push(chunk_section(
             "executable",
             vec![display_executable(executable)],
         ));
     }
-    sections.push(chunk_section("command", vec![command_name(command)]));
+    sections.push(chunk_section("command", vec![command_name.to_owned()]));
 
-    let parsed = ParsedCliArgs::new(command);
+    let parsed = ParsedCliArgs::from_args(args, command_name);
     if !parsed.options.is_empty() {
         sections.push(option_section("command options", parsed.options));
     }
@@ -1813,15 +1947,27 @@ fn original_structured_command_line_event(command: &buck2_data::CommandStart) ->
 }
 
 fn canonical_structured_command_line_event(command: &buck2_data::CommandStart) -> bep::BuildEvent {
+    canonical_structured_command_line_event_from_args(
+        &command.cli_args,
+        &command_name(command),
+        client_env_options(command),
+    )
+}
+
+fn canonical_structured_command_line_event_from_args(
+    args: &[String],
+    command_name: &str,
+    client_env_options: Vec<cl::Option>,
+) -> bep::BuildEvent {
     let mut sections = Vec::new();
-    if let Some(executable) = command.cli_args.first() {
+    if let Some(executable) = args.first() {
         sections.push(chunk_section("executable", vec![executable.clone()]));
     }
-    sections.push(chunk_section("command", vec![command_name(command)]));
+    sections.push(chunk_section("command", vec![command_name.to_owned()]));
 
-    let parsed = ParsedCliArgs::new(command);
+    let parsed = ParsedCliArgs::from_args(args, command_name);
     let mut options = parsed.options;
-    options.extend(client_env_options(command));
+    options.extend(client_env_options);
     if !options.is_empty() {
         sections.push(option_section("command options", options));
     }
@@ -1880,9 +2026,7 @@ struct ParsedCliArgs {
 }
 
 impl ParsedCliArgs {
-    fn new(command: &buck2_data::CommandStart) -> Self {
-        let args = command.cli_args.as_slice();
-        let command_name = command_name(command);
+    fn from_args(args: &[String], command_name: &str) -> Self {
         let mut options = Vec::new();
         let mut residue = Vec::new();
         let mut i = 1;
@@ -1900,7 +2044,7 @@ impl ParsedCliArgs {
                 i += 1;
                 continue;
             }
-            if !skipped_command && arg == &command_name {
+            if !skipped_command && arg.as_str() == command_name {
                 skipped_command = true;
                 i += 1;
                 continue;
@@ -1911,7 +2055,7 @@ impl ParsedCliArgs {
                     && should_consume_option_value(
                         &option.option_name,
                         &args[i + 1],
-                        &command_name,
+                        command_name,
                         skipped_command,
                     )
                 {
@@ -1972,6 +2116,7 @@ fn option_takes_value(option_name: &str) -> bool {
             | "num_threads"
             | "streaming_build_report"
             | "target_platforms"
+            | "tool_tag"
             | "unstable_target_platforms"
     )
 }
@@ -2027,24 +2172,22 @@ fn normalize_option_name(name: &str) -> String {
 }
 
 fn client_env_options(command: &buck2_data::CommandStart) -> Vec<cl::Option> {
+    client_env_options_from_metadata(Some(&command.metadata))
+}
+
+fn client_env_options_from_metadata(metadata: Option<&HashMap<String, String>>) -> Vec<cl::Option> {
     let mut values = BTreeMap::new();
     insert_env_option(
         &mut values,
         "USER",
-        first_metadata(
-            &command.metadata,
-            &["USER", "BUILD_USER", "username", "user"],
-        )
-        .or_else(|| env::var("USER").ok()),
+        first_metadata_opt(metadata, &["USER", "BUILD_USER", "username", "user"])
+            .or_else(|| env::var("USER").ok()),
     );
     insert_env_option(
         &mut values,
         "HOST",
-        first_metadata(
-            &command.metadata,
-            &["HOST", "BUILD_HOST", "hostname", "host"],
-        )
-        .or_else(|| env::var("HOSTNAME").ok()),
+        first_metadata_opt(metadata, &["HOST", "BUILD_HOST", "hostname", "host"])
+            .or_else(|| env::var("HOSTNAME").ok()),
     );
     for key in [
         "CI",
@@ -2071,7 +2214,7 @@ fn client_env_options(command: &buck2_data::CommandStart) -> Vec<cl::Option> {
         insert_env_option(
             &mut values,
             key,
-            first_metadata(&command.metadata, &[key]).or_else(|| env::var(key).ok()),
+            first_metadata_opt(metadata, &[key]).or_else(|| env::var(key).ok()),
         );
     }
 
@@ -2097,7 +2240,12 @@ fn insert_env_option(values: &mut BTreeMap<String, String>, key: &str, value: Op
 }
 
 fn options_parsed_event(command: &buck2_data::CommandStart) -> bep::BuildEvent {
-    let parsed = ParsedCliArgs::new(command);
+    options_parsed_event_from_args(&command.cli_args, &command_name(command))
+}
+
+fn options_parsed_event_from_args(args: &[String], command_name: &str) -> bep::BuildEvent {
+    let parsed = ParsedCliArgs::from_args(args, command_name);
+    let tool_tag = tool_tag_from_options(&parsed.options);
     let cmd_line = parsed
         .options
         .iter()
@@ -2113,61 +2261,95 @@ fn options_parsed_event(command: &buck2_data::CommandStart) -> bep::BuildEvent {
             cmd_line: cmd_line.clone(),
             explicit_cmd_line: cmd_line,
             invocation_policy: None,
-            tool_tag: String::new(),
+            tool_tag,
         })),
         last_message: false,
     }
 }
 
-fn workspace_status_event(command: &buck2_data::CommandStart) -> bep::BuildEvent {
+fn tool_tag_from_options(options: &[cl::Option]) -> String {
+    options
+        .iter()
+        .rev()
+        .find(|option| option.option_name == "tool_tag")
+        .map(|option| option.option_value.clone())
+        .unwrap_or_default()
+}
+
+fn workspace_status_event(
+    command: &buck2_data::CommandStart,
+    timestamp: Option<&Timestamp>,
+) -> bep::BuildEvent {
+    workspace_status_event_from_metadata(
+        Some(&command.metadata),
+        target_patterns_from_cli(command),
+        timestamp_millis_u64(timestamp),
+    )
+}
+
+fn workspace_status_event_from_invocation(
+    record: &buck2_data::InvocationRecord,
+    timestamp: Option<&Timestamp>,
+) -> bep::BuildEvent {
+    workspace_status_event_from_metadata(
+        invocation_metadata(record),
+        target_patterns_from_invocation(record),
+        invocation_start_time_millis(record, timestamp),
+    )
+}
+
+fn workspace_status_event_from_metadata(
+    metadata: Option<&HashMap<String, String>>,
+    patterns: Vec<String>,
+    timestamp_millis: Option<u64>,
+) -> bep::BuildEvent {
     let mut items = Vec::new();
     add_workspace_item(
         &mut items,
         "BUILD_USER",
-        first_metadata(
-            &command.metadata,
-            &["USER", "BUILD_USER", "username", "user"],
-        )
-        .or_else(|| env::var("USER").ok()),
+        first_metadata_opt(metadata, &["USER", "BUILD_USER", "username", "user"])
+            .or_else(|| env::var("USER").ok()),
     );
     add_workspace_item(
         &mut items,
         "BUILD_HOST",
-        first_metadata(
-            &command.metadata,
-            &["HOST", "BUILD_HOST", "hostname", "host"],
-        )
-        .or_else(|| env::var("HOSTNAME").ok()),
+        first_metadata_opt(metadata, &["HOST", "BUILD_HOST", "hostname", "host"])
+            .or_else(|| env::var("HOSTNAME").ok()),
     );
+    let timestamp_millis = workspace_status_timestamp_millis(metadata, timestamp_millis);
+    if let Some(timestamp_millis) = timestamp_millis {
+        add_workspace_item(
+            &mut items,
+            "BUILD_TIMESTAMP",
+            Some((timestamp_millis / 1000).to_string()),
+        );
+        add_workspace_item(
+            &mut items,
+            "FORMATTED_DATE",
+            formatted_workspace_status_date(timestamp_millis),
+        );
+    }
     add_workspace_item(
         &mut items,
         "BUILD_WORKING_DIRECTORY",
-        first_metadata(
-            &command.metadata,
-            &["CWD", "PWD", "BUILD_WORKING_DIRECTORY"],
-        ),
+        first_metadata_opt(metadata, &["CWD", "PWD", "BUILD_WORKING_DIRECTORY"]),
     );
-    add_workspace_item(
-        &mut items,
-        "ROLE",
-        first_metadata(&command.metadata, &["ROLE"]),
-    );
+    add_workspace_item(&mut items, "ROLE", first_metadata_opt(metadata, &["ROLE"]));
     add_workspace_item(
         &mut items,
         "REPO_URL",
-        first_metadata(&command.metadata, &["REPO_URL", "GIT_REPOSITORY_URL"]),
+        first_metadata_opt(metadata, &["REPO_URL", "GIT_REPOSITORY_URL"]),
     );
     add_workspace_item(
         &mut items,
         "GIT_BRANCH",
-        first_metadata(&command.metadata, &["BRANCH_NAME", "GIT_BRANCH"]),
+        first_metadata_opt(metadata, &["BRANCH_NAME", "GIT_BRANCH"]),
     );
     add_workspace_item(
         &mut items,
         "COMMIT_SHA",
-        first_metadata(&command.metadata, &["COMMIT_SHA", "GIT_COMMIT"]),
+        first_metadata_opt(metadata, &["COMMIT_SHA", "GIT_COMMIT"]),
     );
-    let patterns = target_patterns_from_cli(command);
     if !patterns.is_empty() {
         add_workspace_item(&mut items, "PATTERN", Some(patterns.join(" ")));
     }
@@ -2180,6 +2362,31 @@ fn workspace_status_event(command: &buck2_data::CommandStart) -> bep::BuildEvent
         )),
         last_message: false,
     }
+}
+
+fn invocation_start_time_millis(
+    record: &buck2_data::InvocationRecord,
+    timestamp: Option<&Timestamp>,
+) -> Option<u64> {
+    record
+        .wrapper_start_time
+        .or_else(|| timestamp_millis_u64(timestamp))
+}
+
+fn workspace_status_timestamp_millis(
+    metadata: Option<&HashMap<String, String>>,
+    fallback: Option<u64>,
+) -> Option<u64> {
+    first_metadata_opt(metadata, &["SOURCE_DATE_EPOCH"])
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .and_then(|seconds| seconds.checked_mul(1000))
+        .or(fallback)
+}
+
+fn formatted_workspace_status_date(timestamp_millis: u64) -> Option<String> {
+    let seconds = i64::try_from(timestamp_millis / 1000).ok()?;
+    let date = DateTime::<Utc>::from_timestamp(seconds, 0)?;
+    Some(date.format("%Y %b %d %H %M %S %a").to_string())
 }
 
 fn add_workspace_item(
@@ -2221,8 +2428,14 @@ fn default_configuration_event() -> bep::BuildEvent {
 }
 
 fn workspace_info_event(command: &buck2_data::CommandStart) -> bep::BuildEvent {
-    let local_exec_root = first_metadata(
-        &command.metadata,
+    workspace_info_event_from_metadata(Some(&command.metadata))
+}
+
+fn workspace_info_event_from_metadata(
+    metadata: Option<&HashMap<String, String>>,
+) -> bep::BuildEvent {
+    let local_exec_root = first_metadata_opt(
+        metadata,
         &["BUCK_OUT", "BUCK2_EXEC_ROOT", "EXEC_ROOT", "REPO_ROOT"],
     )
     .unwrap_or_default();
@@ -2292,6 +2505,13 @@ fn build_metadata_from_invocation(
     record: &buck2_data::InvocationRecord,
 ) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
+    if let Some(record_metadata) = invocation_metadata(record) {
+        metadata.extend(
+            record_metadata
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    }
     if let Some(command_name) = record.command_name.as_ref()
         && !command_name.is_empty()
     {
@@ -2303,13 +2523,84 @@ fn build_metadata_from_invocation(
             record.re_session_id.clone(),
         );
     }
-    if let Some(parsed_target_patterns) = record.parsed_target_patterns.as_ref() {
-        let patterns = target_patterns_from_invocation_record(parsed_target_patterns);
-        if !patterns.is_empty() {
-            metadata.insert("PATTERN".to_owned(), patterns.join(" "));
-        }
+    if let Some(version_control_revision) = record.version_control_revision.as_ref() {
+        add_version_control_metadata(&mut metadata, version_control_revision);
+    }
+    if let Some(revision) = record.hg_revision.as_ref()
+        && !revision.is_empty()
+    {
+        metadata.insert("COMMIT_SHA".to_owned(), revision.clone());
+    }
+    if let Some(has_local_changes) = record.has_local_changes {
+        metadata.insert(
+            "HAS_LOCAL_CHANGES".to_owned(),
+            has_local_changes.to_string(),
+        );
+    }
+    let patterns = target_patterns_from_invocation(record);
+    if !patterns.is_empty() {
+        metadata.insert("PATTERN".to_owned(), patterns.join(" "));
+    }
+    add_metadata_alias(
+        &mut metadata,
+        "USER",
+        first_metadata_opt(
+            invocation_metadata(record),
+            &["USER", "BUILD_USER", "username", "user"],
+        )
+        .or_else(|| env::var("USER").ok()),
+    );
+    add_metadata_alias(
+        &mut metadata,
+        "HOST",
+        first_metadata_opt(
+            invocation_metadata(record),
+            &["HOST", "BUILD_HOST", "hostname", "host"],
+        )
+        .or_else(|| env::var("HOSTNAME").ok()),
+    );
+    add_metadata_alias(
+        &mut metadata,
+        "REPO_URL",
+        first_metadata_opt(
+            invocation_metadata(record),
+            &["REPO_URL", "GIT_REPOSITORY_URL"],
+        ),
+    );
+    add_metadata_alias(
+        &mut metadata,
+        "BRANCH_NAME",
+        first_metadata_opt(invocation_metadata(record), &["BRANCH_NAME", "GIT_BRANCH"]),
+    );
+    add_metadata_alias(
+        &mut metadata,
+        "COMMIT_SHA",
+        first_metadata_opt(invocation_metadata(record), &["COMMIT_SHA", "GIT_COMMIT"]),
+    );
+    if env::var("CI").is_ok_and(|ci| !ci.is_empty()) {
+        metadata.entry("ROLE".to_owned()).or_insert("CI".to_owned());
     }
     metadata
+        .entry(BUILDBUDDY_VISIBILITY_KEY.to_owned())
+        .or_insert_with(|| BUILDBUDDY_PUBLIC_VISIBILITY.to_owned());
+    metadata
+}
+
+fn add_version_control_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    revision: &buck2_data::VersionControlRevision,
+) {
+    if let Some(revision) = revision.hg_revision.as_ref()
+        && !revision.is_empty()
+    {
+        metadata.insert("COMMIT_SHA".to_owned(), revision.clone());
+    }
+    if let Some(has_local_changes) = revision.has_local_changes {
+        metadata.insert(
+            "HAS_LOCAL_CHANGES".to_owned(),
+            has_local_changes.to_string(),
+        );
+    }
 }
 
 fn metadata_map_from_hash_map(metadata: &HashMap<String, String>) -> BTreeMap<String, String> {
@@ -2343,7 +2634,21 @@ fn build_metadata_event(metadata: &BTreeMap<String, String>) -> bep::BuildEvent 
 }
 
 fn target_patterns_from_cli(command: &buck2_data::CommandStart) -> Vec<String> {
-    ParsedCliArgs::new(command)
+    target_patterns_from_args(&command.cli_args, &command_name(command))
+}
+
+fn target_patterns_from_invocation(record: &buck2_data::InvocationRecord) -> Vec<String> {
+    if let Some(patterns) = record.parsed_target_patterns.as_ref() {
+        let patterns = target_patterns_from_invocation_record(patterns);
+        if !patterns.is_empty() {
+            return patterns;
+        }
+    }
+    target_patterns_from_args(&record.cli_args, &invocation_command_name(record))
+}
+
+fn target_patterns_from_args(args: &[String], command_name: &str) -> Vec<String> {
+    ParsedCliArgs::from_args(args, command_name)
         .residue
         .into_iter()
         .filter(|arg| arg.starts_with("//") || arg.starts_with(':') || arg.starts_with('@'))
@@ -2474,6 +2779,7 @@ fn build_metrics_event(
         actions_executed
     };
     let runner_count = [
+        ("total", actions_executed, ""),
         ("local", record.run_local_count, "local"),
         ("remote", record.run_remote_count, "remote"),
         (
@@ -2489,7 +2795,7 @@ fn build_metrics_event(
         ("skipped", record.run_skipped_count, "skipped"),
     ]
     .into_iter()
-    .filter(|(_, count, _)| *count > 0)
+    .filter(|(name, count, _)| *count > 0 || *name == "total")
     .map(
         |(name, count, exec_kind)| bep::build_metrics::action_summary::RunnerCount {
             name: name.to_owned(),
@@ -2511,6 +2817,28 @@ fn build_metrics_event(
     ) {
         (Some(start), Some(end)) if end >= start => i64::try_from(end - start).unwrap_or(i64::MAX),
         _ => 0,
+    };
+    let packages_loaded = if loaded_packages_count > 0 {
+        loaded_packages_count
+    } else {
+        record.load_count.unwrap_or_default()
+    };
+    let output_artifacts_seen = if output_artifacts_seen_count > 0 {
+        bep::build_metrics::artifact_metrics::FilesMetric {
+            size_in_bytes: i64::try_from(output_artifacts_seen_size).unwrap_or(i64::MAX),
+            count: i32_saturating_from_u64(output_artifacts_seen_count),
+        }
+    } else {
+        bep::build_metrics::artifact_metrics::FilesMetric {
+            size_in_bytes: record
+                .materialization_output_size
+                .map(|size| i64::try_from(size).unwrap_or(i64::MAX))
+                .unwrap_or_default(),
+            count: record
+                .materialization_files
+                .map(i32_saturating_from_u64)
+                .unwrap_or_default(),
+        }
     };
 
     bep::BuildEvent {
@@ -2542,11 +2870,9 @@ fn build_metrics_event(
                     targets_configured_not_including_aspects: count,
                 }
             }),
-            package_metrics: (loaded_packages_count > 0).then(|| {
-                bep::build_metrics::PackageMetrics {
-                    packages_loaded: i64::try_from(loaded_packages_count).unwrap_or(i64::MAX),
-                    package_load_metrics: Vec::new(),
-                }
+            package_metrics: (packages_loaded > 0).then(|| bep::build_metrics::PackageMetrics {
+                packages_loaded: i64::try_from(packages_loaded).unwrap_or(i64::MAX),
+                package_load_metrics: Vec::new(),
             }),
             timing_metrics: Some(bep::build_metrics::TimingMetrics {
                 cpu_time_in_ms: cpu_time_millis(record),
@@ -2576,17 +2902,7 @@ fn build_metrics_event(
             }),
             artifact_metrics: Some(bep::build_metrics::ArtifactMetrics {
                 source_artifacts_read: None,
-                output_artifacts_seen: Some(bep::build_metrics::artifact_metrics::FilesMetric {
-                    size_in_bytes: if output_artifacts_seen_count > 0 {
-                        i64::try_from(output_artifacts_seen_size).unwrap_or(i64::MAX)
-                    } else {
-                        record
-                            .materialization_output_size
-                            .map(|size| i64::try_from(size).unwrap_or(i64::MAX))
-                            .unwrap_or_default()
-                    },
-                    count: i32_saturating_from_u64(output_artifacts_seen_count),
-                }),
+                output_artifacts_seen: Some(output_artifacts_seen),
                 output_artifacts_from_action_cache: (output_artifacts_from_action_cache_count > 0)
                     .then(|| bep::build_metrics::artifact_metrics::FilesMetric {
                         size_in_bytes: i64_saturating_from_u64(
@@ -2737,6 +3053,12 @@ fn timestamp_millis(timestamp: Option<&Timestamp>) -> i64 {
     } else {
         i64::MAX
     })
+}
+
+fn timestamp_millis_u64(timestamp: Option<&Timestamp>) -> Option<u64> {
+    let timestamp = timestamp?;
+    let millis = i128::from(timestamp.seconds) * 1_000 + i128::from(timestamp.nanos) / 1_000_000;
+    u64::try_from(millis).ok()
 }
 
 fn target_patterns_from_invocation_record(
@@ -3599,11 +3921,7 @@ fn build_tool_logs_event_from_invocation(
     record: &buck2_data::InvocationRecord,
     profile: &CommandProfileBuilder,
 ) -> bep::BuildEvent {
-    let target_patterns = record
-        .parsed_target_patterns
-        .as_ref()
-        .map(target_patterns_from_invocation_record)
-        .unwrap_or_default();
+    let target_patterns = target_patterns_from_invocation(record);
     let summary = serde_json::json!({
         "tool": BUILD_TOOL_VERSION,
         "command": record.command_name.as_deref().unwrap_or_default(),
@@ -4748,6 +5066,7 @@ fn test_action_outputs(
 
 fn test_summary_files(
     status: i32,
+    cases: &[TestCaseState],
     command: Option<&buck2_data::CommandExecution>,
     passed: bool,
 ) -> Vec<bep::File> {
@@ -4756,7 +5075,7 @@ fn test_summary_files(
     if is_passed != passed {
         return Vec::new();
     }
-    let log = test_log_contents(&[], command);
+    let log = test_log_contents(cases, command);
     if log.is_empty() {
         Vec::new()
     } else {
@@ -5281,6 +5600,25 @@ mod tests {
             build_metadata.metadata.get("HOST").map(String::as_str),
             Some("workstation")
         );
+        let workspace_status = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::WorkspaceStatus(status)) => Some(status),
+                _ => None,
+            })
+            .expect("workspace status");
+        let workspace_item = |key: &str| {
+            workspace_status
+                .item
+                .iter()
+                .find(|item| item.key == key)
+                .map(|item| item.value.as_str())
+        };
+        assert_eq!(workspace_item("BUILD_TIMESTAMP"), Some("1"));
+        assert_eq!(
+            workspace_item("FORMATTED_DATE"),
+            Some("1970 Jan 01 00 00 01 Thu")
+        );
 
         let any = encode_bep_event(&events[0]);
         assert_eq!(any.type_url, BEP_EVENT_TYPE_URL);
@@ -5345,6 +5683,378 @@ mod tests {
                 "--remote-only",
             ]
         );
+    }
+
+    #[test]
+    fn workspace_status_uses_source_date_epoch_metadata() {
+        let event = workspace_status_event_from_metadata(
+            Some(&HashMap::from([(
+                "SOURCE_DATE_EPOCH".to_owned(),
+                "42".to_owned(),
+            )])),
+            Vec::new(),
+            Some(1_000),
+        );
+        let Some(build_event::Payload::WorkspaceStatus(status)) = event.payload.as_ref() else {
+            panic!("expected workspace status");
+        };
+        let workspace_item = |key: &str| {
+            status
+                .item
+                .iter()
+                .find(|item| item.key == key)
+                .map(|item| item.value.as_str())
+        };
+        assert_eq!(workspace_item("BUILD_TIMESTAMP"), Some("42"));
+        assert_eq!(
+            workspace_item("FORMATTED_DATE"),
+            Some("1970 Jan 01 00 00 42 Thu")
+        );
+    }
+
+    #[test]
+    fn options_parsed_reports_tool_tag() {
+        let event = options_parsed_event_from_args(
+            &[
+                "buck2".to_owned(),
+                "build".to_owned(),
+                "--tool-tag".to_owned(),
+                "ci-runner".to_owned(),
+                "//:main".to_owned(),
+            ],
+            "build",
+        );
+        let Some(build_event::Payload::OptionsParsed(options)) = event.payload.as_ref() else {
+            panic!("expected options parsed");
+        };
+
+        assert_eq!(options.tool_tag, "ci-runner");
+        assert_eq!(options.cmd_line, vec!["--tool-tag=ci-runner"]);
+        assert_eq!(options.explicit_cmd_line, vec!["--tool-tag=ci-runner"]);
+    }
+
+    #[test]
+    fn invocation_record_emits_command_context_without_command_start() {
+        let mut converter = BazelEventConverter::default();
+        let first_events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::Instant(
+                buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::ConsoleMessage(
+                        buck2_data::ConsoleMessage {
+                            message: "starting".to_owned(),
+                        },
+                    )),
+                },
+            )),
+        );
+        assert!(matches!(
+            first_events[0].payload,
+            Some(build_event::Payload::Started(_))
+        ));
+
+        let final_events = converter.convert(
+            2,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
+                        buck2_data::InvocationRecord {
+                            cli_args: vec![
+                                "/root/workspace/repo-root/buck-out/buildbuddy-rbe-build/art/gh_facebook_buck2/7703741d4b7244c6/app/buck2/__buck2-bin__/buck2".to_owned(),
+                                "--isolation-dir".to_owned(),
+                                "buildbuddy-rbe-selftest".to_owned(),
+                                "build".to_owned(),
+                                "--config-file".to_owned(),
+                                ".buckconfig.local".to_owned(),
+                                "--remote-only".to_owned(),
+                                "//:buck2".to_owned(),
+                            ],
+                            command_name: Some("build".to_owned()),
+                            metadata: Some(buck2_data::TypedMetadata {
+                                strings: HashMap::from([
+                                    ("username".to_owned(), "alice".to_owned()),
+                                    ("hostname".to_owned(), "workstation".to_owned()),
+                                    ("CWD".to_owned(), "/repo".to_owned()),
+                                    ("REPO_ROOT".to_owned(), "/repo".to_owned()),
+                                    ("GIT_BRANCH".to_owned(), "main".to_owned()),
+                                    ("GIT_COMMIT".to_owned(), "abc123".to_owned()),
+                                ]),
+                                ..Default::default()
+                            }),
+                            parsed_target_patterns: Some(buck2_data::ParsedTargetPatterns {
+                                target_patterns: vec![buck2_data::TargetPattern {
+                                    value: "//:buck2".to_owned(),
+                                }],
+                            }),
+                            outcome: Some(buck2_data::InvocationOutcome::Success as i32),
+                            exit_code: Some(0),
+                            exit_result_name: Some("SUCCESS".to_owned()),
+                            wrapper_start_time: Some(2_000),
+                            ..Default::default()
+                        },
+                    ))),
+                },
+            )),
+        );
+
+        assert!(
+            !final_events
+                .iter()
+                .any(|event| matches!(event.payload, Some(build_event::Payload::Aborted(_))))
+        );
+
+        let unstructured = final_events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::UnstructuredCommandLine(command_line)) => {
+                    Some(command_line)
+                }
+                _ => None,
+            })
+            .expect("unstructured command line");
+        assert_eq!(
+            unstructured.args.last().map(String::as_str),
+            Some("//:buck2")
+        );
+
+        let original = final_events
+            .iter()
+            .find(|event| {
+                event.id.as_ref() == Some(&structured_command_line_id(ORIGINAL_COMMAND_LINE_LABEL))
+            })
+            .map(command_line_from_event)
+            .expect("original command line");
+        assert_eq!(chunk_values(original, "executable"), vec!["buck2"]);
+        assert_eq!(chunk_values(original, "command"), vec!["build"]);
+        assert_eq!(
+            option_values(original, "command options"),
+            vec![
+                "--isolation-dir=buildbuddy-rbe-selftest",
+                "--config-file=.buckconfig.local",
+                "--remote-only",
+            ]
+        );
+        assert_eq!(chunk_values(original, "residual"), vec!["//:buck2"]);
+
+        let canonical = final_events
+            .iter()
+            .find(|event| {
+                event.id.as_ref() == Some(&structured_command_line_id(CANONICAL_COMMAND_LINE_LABEL))
+            })
+            .map(command_line_from_event)
+            .expect("canonical command line");
+        assert_eq!(chunk_values(canonical, "command"), vec!["build"]);
+        assert_eq!(chunk_values(canonical, "residue"), vec!["//:buck2"]);
+        assert!(
+            option_values(canonical, "command options")
+                .contains(&"--client_env=USER=alice".to_owned())
+        );
+
+        let options_parsed = final_events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::OptionsParsed(options)) => Some(options),
+                _ => None,
+            })
+            .expect("options parsed");
+        assert_eq!(
+            options_parsed.explicit_cmd_line,
+            vec![
+                "--isolation-dir=buildbuddy-rbe-selftest",
+                "--config-file=.buckconfig.local",
+                "--remote-only",
+            ]
+        );
+
+        let workspace_status = final_events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::WorkspaceStatus(status)) => Some(status),
+                _ => None,
+            })
+            .expect("workspace status");
+        let workspace_item = |key: &str| {
+            workspace_status
+                .item
+                .iter()
+                .find(|item| item.key == key)
+                .map(|item| item.value.as_str())
+        };
+        assert_eq!(workspace_item("BUILD_USER"), Some("alice"));
+        assert_eq!(workspace_item("BUILD_HOST"), Some("workstation"));
+        assert_eq!(workspace_item("BUILD_TIMESTAMP"), Some("2"));
+        assert_eq!(
+            workspace_item("FORMATTED_DATE"),
+            Some("1970 Jan 01 00 00 02 Thu")
+        );
+        assert_eq!(workspace_item("BUILD_WORKING_DIRECTORY"), Some("/repo"));
+        assert_eq!(workspace_item("PATTERN"), Some("//:buck2"));
+
+        let build_metadata = final_events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::BuildMetadata(metadata)) => Some(metadata),
+                _ => None,
+            })
+            .expect("build metadata");
+        assert_eq!(
+            build_metadata.metadata.get("USER").map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            build_metadata
+                .metadata
+                .get("COMMIT_SHA")
+                .map(String::as_str),
+            Some("abc123")
+        );
+        assert_eq!(
+            build_metadata
+                .metadata
+                .get(BUILDBUDDY_VISIBILITY_KEY)
+                .map(String::as_str),
+            Some(BUILDBUDDY_PUBLIC_VISIBILITY)
+        );
+    }
+
+    #[test]
+    fn invocation_record_first_event_populates_started_context_and_pattern() {
+        let mut converter = BazelEventConverter::default();
+        let events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
+                        buck2_data::InvocationRecord {
+                            cli_args: vec![
+                                "buck2".to_owned(),
+                                "build".to_owned(),
+                                "--config-file".to_owned(),
+                                ".buckconfig.local".to_owned(),
+                                "//:buck2".to_owned(),
+                            ],
+                            command_name: Some("build".to_owned()),
+                            metadata: Some(buck2_data::TypedMetadata {
+                                strings: HashMap::from([
+                                    ("username".to_owned(), "alice".to_owned()),
+                                    ("hostname".to_owned(), "workstation".to_owned()),
+                                    ("CWD".to_owned(), "/repo/subdir".to_owned()),
+                                ]),
+                                ..Default::default()
+                            }),
+                            repo_path: Some("/repo".to_owned()),
+                            parsed_target_patterns: Some(buck2_data::ParsedTargetPatterns {
+                                target_patterns: vec![buck2_data::TargetPattern {
+                                    value: "//:buck2".to_owned(),
+                                }],
+                            }),
+                            outcome: Some(buck2_data::InvocationOutcome::Success as i32),
+                            exit_code: Some(0),
+                            exit_result_name: Some("SUCCESS".to_owned()),
+                            ..Default::default()
+                        },
+                    ))),
+                },
+            )),
+        );
+
+        let started = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::Started(started)) => Some((event, started)),
+                _ => None,
+            })
+            .expect("started event");
+        assert_eq!(started.1.command, "build");
+        assert_eq!(
+            started.1.options_description,
+            "buck2 build --config-file .buckconfig.local //:buck2"
+        );
+        assert_eq!(started.1.working_directory, "/repo/subdir");
+        assert_eq!(started.1.workspace_directory, "/repo");
+        assert_eq!(started.1.host, "workstation");
+        assert_eq!(started.1.user, "alice");
+        assert!(
+            started
+                .0
+                .children
+                .iter()
+                .any(|child| child == &pattern_expanded_id(vec!["//:buck2".to_owned()]))
+        );
+        assert!(events.iter().any(|event| {
+            event.id.as_ref() == Some(&pattern_expanded_id(vec!["//:buck2".to_owned()]))
+                && matches!(
+                    event.payload.as_ref(),
+                    Some(build_event::Payload::Expanded(_))
+                )
+        }));
+        assert!(!events.iter().any(|event| matches!(
+            event.payload.as_ref(),
+            Some(build_event::Payload::Aborted(_))
+        )));
+    }
+
+    #[test]
+    fn invocation_record_does_not_duplicate_command_start_context() {
+        let mut converter = BazelEventConverter::default();
+        let start_events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanStart(
+                buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::Command(
+                        buck2_data::CommandStart {
+                            cli_args: vec![
+                                "buck2".to_owned(),
+                                "build".to_owned(),
+                                "//:main".to_owned(),
+                            ],
+                            data: Some(buck2_data::command_start::Data::Build(
+                                buck2_data::BuildCommandStart {},
+                            )),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )),
+        );
+        assert!(start_events.iter().any(|event| {
+            matches!(
+                event.payload,
+                Some(build_event::Payload::UnstructuredCommandLine(_))
+            )
+        }));
+
+        let final_events = converter.convert(
+            2,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
+                        buck2_data::InvocationRecord {
+                            cli_args: vec![
+                                "buck2".to_owned(),
+                                "build".to_owned(),
+                                "//:main".to_owned(),
+                            ],
+                            command_name: Some("build".to_owned()),
+                            outcome: Some(buck2_data::InvocationOutcome::Success as i32),
+                            exit_code: Some(0),
+                            exit_result_name: Some("SUCCESS".to_owned()),
+                            ..Default::default()
+                        },
+                    ))),
+                },
+            )),
+        );
+
+        assert!(!final_events.iter().any(|event| matches!(
+            event.payload,
+            Some(build_event::Payload::UnstructuredCommandLine(_))
+                | Some(build_event::Payload::StructuredCommandLine(_))
+                | Some(build_event::Payload::OptionsParsed(_))
+                | Some(build_event::Payload::WorkspaceStatus(_))
+                | Some(build_event::Payload::Configuration(_))
+                | Some(build_event::Payload::WorkspaceInfo(_))
+        )));
     }
 
     #[test]
@@ -5851,6 +6561,9 @@ mod tests {
         assert_eq!(action_summary.actions_executed, 17);
         assert_eq!(action_summary.remote_cache_hits, 12);
         assert!(action_summary.runner_count.iter().any(|count| {
+            count.name == "total" && count.count == 17 && count.exec_kind.is_empty()
+        }));
+        assert!(action_summary.runner_count.iter().any(|count| {
             count.name == "remote dep file cache hit"
                 && count.count == 7
                 && count.exec_kind == "remote-cache"
@@ -5986,6 +6699,41 @@ mod tests {
     }
 
     #[test]
+    fn invocation_record_emits_package_metrics_from_load_count() {
+        let mut converter = BazelEventConverter::default();
+        let events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
+                        buck2_data::InvocationRecord {
+                            outcome: Some(buck2_data::InvocationOutcome::Success as i32),
+                            load_count: Some(3),
+                            ..Default::default()
+                        },
+                    ))),
+                },
+            )),
+        );
+
+        let metrics = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::BuildMetrics(metrics)) => Some(metrics),
+                _ => None,
+            })
+            .expect("build metrics event");
+        assert_eq!(
+            metrics
+                .package_metrics
+                .as_ref()
+                .expect("package metrics")
+                .packages_loaded,
+            3
+        );
+    }
+
+    #[test]
     fn invocation_record_emits_action_cache_artifact_metrics() {
         let mut converter = BazelEventConverter::default();
         converter.convert(
@@ -6072,6 +6820,39 @@ mod tests {
             .expect("output artifacts from action cache");
         assert_eq!(output_artifacts_from_action_cache.size_in_bytes, 19);
         assert_eq!(output_artifacts_from_action_cache.count, 2);
+    }
+
+    #[test]
+    fn invocation_record_emits_materialization_file_count() {
+        let mut converter = BazelEventConverter::default();
+        let events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
+                        buck2_data::InvocationRecord {
+                            outcome: Some(buck2_data::InvocationOutcome::Success as i32),
+                            materialization_output_size: Some(4096),
+                            materialization_files: Some(7),
+                            ..Default::default()
+                        },
+                    ))),
+                },
+            )),
+        );
+
+        let output_artifacts_seen = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::BuildMetrics(metrics)) => metrics
+                    .artifact_metrics
+                    .as_ref()
+                    .and_then(|metrics| metrics.output_artifacts_seen.as_ref()),
+                _ => None,
+            })
+            .expect("output artifacts seen");
+        assert_eq!(output_artifacts_seen.size_in_bytes, 4096);
+        assert_eq!(output_artifacts_seen.count, 7);
     }
 
     #[test]
@@ -6696,6 +7477,45 @@ mod tests {
     }
 
     #[test]
+    fn invocation_record_emits_version_control_metadata() {
+        let mut converter = BazelEventConverter::default();
+        let events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
+                        buck2_data::InvocationRecord {
+                            outcome: Some(buck2_data::InvocationOutcome::Success as i32),
+                            hg_revision: Some("abcdef123456".to_owned()),
+                            has_local_changes: Some(true),
+                            ..Default::default()
+                        },
+                    ))),
+                },
+            )),
+        );
+
+        let metadata = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::BuildMetadata(metadata)) => Some(metadata),
+                _ => None,
+            })
+            .expect("build metadata");
+        assert_eq!(
+            metadata.metadata.get("COMMIT_SHA").map(String::as_str),
+            Some("abcdef123456")
+        );
+        assert_eq!(
+            metadata
+                .metadata
+                .get("HAS_LOCAL_CHANGES")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
     fn non_command_event_synthesizes_started() {
         let mut converter = BazelEventConverter::default();
         let event = trace_event(buck2_data::buck_event::Data::Instant(
@@ -7127,6 +7947,84 @@ mod tests {
             })
             .expect("expected TestSummary event");
         assert_eq!(summary.total_num_cached, 1);
+    }
+
+    #[test]
+    fn test_summary_includes_test_case_logs() {
+        let mut converter = BazelEventConverter::default();
+        let target = configured_target();
+        let testcase = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::Instant(
+                buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::TestResult(
+                        buck2_data::TestResult {
+                            name: "test_fails".to_owned(),
+                            status: buck2_data::TestStatus::Fail as i32,
+                            msg: Some(buck2_data::test_result::OptionalMsg {
+                                msg: "expected true".to_owned(),
+                            }),
+                            details: "assertion details".to_owned(),
+                            target_label: Some(target.clone()),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )),
+        );
+        assert!(!testcase.iter().any(|event| matches!(
+            event.payload,
+            Some(build_event::Payload::TestResult(_)) | Some(build_event::Payload::TestSummary(_))
+        )));
+
+        let test_events = converter.convert(
+            2,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::TestRun(
+                        buck2_data::TestRunEnd {
+                            suite: Some(buck2_data::TestSuite {
+                                suite_name: "suite".to_owned(),
+                                test_names: vec!["test_fails".to_owned()],
+                                target_label: Some(target),
+                            }),
+                            command_report: Some(buck2_data::CommandExecution {
+                                details: Some(buck2_data::CommandExecutionDetails {
+                                    signed_exit_code: Some(1),
+                                    ..Default::default()
+                                }),
+                                status: Some(buck2_data::command_execution::Status::Failure(
+                                    buck2_data::command_execution::Failure {},
+                                )),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+        );
+
+        let summary = test_events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::TestSummary(summary)) => Some(summary),
+                _ => None,
+            })
+            .expect("expected TestSummary event");
+        assert!(summary.passed.is_empty());
+        let log = summary
+            .failed
+            .iter()
+            .find(|file| file.name == "test.log")
+            .expect("test summary log");
+        let contents = match log.file.as_ref() {
+            Some(bep::file::File::Contents(contents)) => contents,
+            other => panic!("expected inline test log, got {other:?}"),
+        };
+        let contents = std::str::from_utf8(contents).expect("test log utf8");
+        assert!(contents.contains("test_fails: expected true"));
     }
 
     #[test]
@@ -7651,6 +8549,24 @@ mod tests {
                 .test_action_output
                 .iter()
                 .any(|file| file.name == "test.xml")
+        );
+        let Some(build_event::Payload::TestSummary(summary)) = test_result[1].payload.as_ref()
+        else {
+            panic!("expected TestSummary payload");
+        };
+        let summary_log = summary
+            .passed
+            .iter()
+            .find(|file| file.name == "test.log")
+            .and_then(|file| file.file.as_ref())
+            .expect("test summary log");
+        let bep::file::File::Contents(summary_log) = summary_log else {
+            panic!("expected inline test summary log");
+        };
+        assert!(
+            std::str::from_utf8(summary_log)
+                .expect("test summary log utf8")
+                .contains("test_passes: passed")
         );
 
         let final_events = converter.convert(
