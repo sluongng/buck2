@@ -694,11 +694,24 @@ async fn process_build_result(
             let _guard = lock.lock().await;
             let res = create_unhashed_outputs(provider_artifacts, &artifact_fs, fs);
 
-            let created = match res.as_ref() {
-                Ok(n) => *n,
-                Err(..) => 0,
+            let (created, symlinks) = match res.as_ref() {
+                Ok(result) => (
+                    result.created(),
+                    result
+                        .links
+                        .iter()
+                        .map(|link| buck2_data::OutputSymlink {
+                            path: link.path.clone(),
+                            target: link.target.clone(),
+                        })
+                        .collect(),
+                ),
+                Err(..) => (0, Vec::new()),
             };
-            (res, buck2_data::CreateOutputSymlinksEnd { created })
+            (
+                res,
+                buck2_data::CreateOutputSymlinksEnd { created, symlinks },
+            )
         })
         .await?;
     }
