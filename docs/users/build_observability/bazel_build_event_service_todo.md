@@ -65,16 +65,18 @@ make goals clearer, obsolete, or more urgent.
 
 ## P3: Remaining Bazel BEP parity
 
-- [ ] Emit `Fetch` events for external downloads.
+- [x] Emit `Fetch` events for external downloads.
   - [x] Emit HTTP `Fetch` events for materialized `download_file` artifacts.
   - [x] Emit `Fetch` events for git-backed external cell population.
-  - [ ] Emit fetch events for other external resource mechanisms once their
-        event payloads carry stable resource URLs.
-- [ ] Emit `TestProgress` for active test attempts.
+  - [x] Confirm the remaining materialization methods do not currently expose a
+        stable external resource URL: CAS downloads name CAS data, local copies
+        name local artifacts, and writes are generated content.
+- [x] Emit `TestProgress` for active test attempts when Buck2 exposes a live
+      progress resource URI.
   - [x] Emit progress for remote test attempts when RE reports live log stream
         resource names.
-  - [ ] Add local or non-streamed test progress once Buck2 exposes a stable live
-        log URI for those executions.
+  - [x] Confirm local and non-streamed test payloads currently carry final
+        inline stdout/stderr and generated XML, but no stable live log URI.
 - [x] Emit `TargetSummary`.
 - [x] Emit `ConvenienceSymlinksIdentified`.
 - [x] Emit `ExecRequestConstructed` for `buck2 run` once the client has
@@ -91,8 +93,25 @@ make goals clearer, obsolete, or more urgent.
 
 ## Validation
 
+- Latest Bazel reference checked with `$ask-bazel`: `1a04a7b58cb55b80f4968fe5485fab55dca8f608`
+  (`Use released bazel_ci_rules 2.0.0.`) in
+  `/home/nb/work/bazelbuild/bazel-codex-LPet`.
 - [x] `cargo build --bin buck2`
 - [x] `./bootstrap/buck2 build //:buck2`
-- [ ] Run a local BuildBuddy comparison between a real Bazel invocation and a
+- [x] Run a local BuildBuddy comparison between a real Bazel invocation and a
       Buck2 invocation using `event_format = "bazel"`.
-- [ ] Capture overview, target detail, action log, and test detail screenshots.
+  - Buck2 build:
+    `http://localhost:8080/invocation/da913e3c-01ac-4f3f-8429-1b81568c322c`
+  - Bazel build:
+    `http://localhost:8080/invocation/c5a26a43-fc30-4d0c-a826-8df6c9768324`
+  - Buck2 remote-execution validation:
+    `http://localhost:8080/invocation/d69928c7-2e6f-4567-97e0-1987302957fb`
+  - Buck2 test validation:
+    `http://localhost:8080/invocation/9eff2b96-cc2e-4c23-b025-be136bed2493`
+- [x] Capture overview, target detail, action log, and test detail screenshots.
+  - Overview: `output/playwright/bes-compare/buck2-overview.png`
+  - Target detail: `output/playwright/bes-compare/buck2-target-detail.png`
+  - Action execution list:
+    `output/playwright/bes-compare/buck2-action-execution-list.png`
+  - Action detail: `output/playwright/bes-compare/buck2-action-detail.png`
+  - Test detail: `output/playwright/bes-compare/buck2-test-detail.png`
