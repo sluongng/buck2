@@ -174,7 +174,9 @@ pub(crate) struct BazelEventConverter {
     progress_count: i32,
     completed_targets: BTreeMap<TargetKey, CompletedTargetState>,
     action_children: BTreeMap<TargetKey, BTreeMap<String, bep::BuildEventId>>,
+    test_children: BTreeMap<TargetKey, BTreeMap<String, bep::BuildEventId>>,
     emitted_action_child_counts: BTreeMap<TargetKey, usize>,
+    emitted_test_child_counts: BTreeMap<TargetKey, usize>,
     emitted_configured_targets: BTreeSet<String>,
     target_outputs: BTreeMap<TargetKey, BTreeMap<String, bep::File>>,
     emitted_output_counts: BTreeMap<TargetKey, usize>,
@@ -697,6 +699,8 @@ impl BazelEventConverter {
         for key in keys {
             let children_by_id = self.action_children.get(&key);
             let child_count = children_by_id.map(BTreeMap::len).unwrap_or_default();
+            let test_children_by_id = self.test_children.get(&key);
+            let test_child_count = test_children_by_id.map(BTreeMap::len).unwrap_or_default();
             let output_count = self
                 .target_outputs
                 .get(&key)
@@ -707,11 +711,19 @@ impl BazelEventConverter {
                 .emitted_action_child_counts
                 .get(&key)
                 .is_some_and(|emitted| *emitted == child_count);
+            let test_child_count_unchanged = self
+                .emitted_test_child_counts
+                .get(&key)
+                .is_some_and(|emitted| *emitted == test_child_count);
             let output_count_unchanged = self
                 .emitted_output_counts
                 .get(&key)
                 .is_some_and(|emitted| *emitted == output_count);
-            if !is_first_completion && child_count_unchanged && output_count_unchanged {
+            if !is_first_completion
+                && child_count_unchanged
+                && test_child_count_unchanged
+                && output_count_unchanged
+            {
                 continue;
             }
             let Some(state) = self.completed_targets.get(&key) else {
@@ -721,6 +733,11 @@ impl BazelEventConverter {
                 .into_iter()
                 .flat_map(|children| children.values().cloned())
                 .collect::<Vec<_>>();
+            children.extend(
+                test_children_by_id
+                    .into_iter()
+                    .flat_map(|children| children.values().cloned()),
+            );
             let (named_set_events, output_group) = self.output_group_events(&key, &mut children);
             events.extend(named_set_events);
             events.push(completed_event_with_children_and_outputs(
@@ -732,6 +749,8 @@ impl BazelEventConverter {
             ));
             self.emitted_action_child_counts
                 .insert(key.clone(), child_count);
+            self.emitted_test_child_counts
+                .insert(key.clone(), test_child_count);
             self.emitted_output_counts.insert(key.clone(), output_count);
             self.emitted_completed_targets.insert(key);
         }
@@ -819,6 +838,21 @@ impl BazelEventConverter {
         });
     }
 
+    fn remember_test_children(&mut self, key: &TargetKey) {
+        let children = self.test_children.entry(key.clone()).or_default();
+        children.insert(
+            "test_result".to_owned(),
+            test_result_id(key.label.clone(), key.configuration.clone()),
+        );
+        children.insert(
+            "test_summary".to_owned(),
+            test_summary_id(key.label.clone(), key.configuration.clone()),
+        );
+        self.completed_targets
+            .entry(key.clone())
+            .or_insert(CompletedTargetState { success: true });
+    }
+
     fn test_result_event_from_test_end(
         &mut self,
         event: &buck2_data::BuckEvent,
@@ -837,6 +871,7 @@ impl BazelEventConverter {
         let status = aggregate_test_status(test_end.command_report.as_ref(), &cases);
         let end_time = event.timestamp.clone();
         let outputs = test_action_outputs(&cases, test_end.command_report.as_ref(), status);
+        self.remember_test_children(&key);
 
         Some(bep::BuildEvent {
             id: Some(test_result_id(label, configuration)),
@@ -886,7 +921,7 @@ impl BazelEventConverter {
                 shard_count: 1,
                 passed: test_summary_files(status, test_end.command_report.as_ref(), true),
                 failed: test_summary_files(status, test_end.command_report.as_ref(), false),
-                total_num_cached: 0,
+                total_num_cached: i32::from(test_cached_remotely(test_end.command_report.as_ref())),
                 first_start_time_millis: 0,
                 last_stop_time_millis: 0,
                 total_run_duration_millis: 0,
@@ -4255,7 +4290,7 @@ fn test_execution_info(
             .and_then(|kind| kind.command.as_ref())
             .map(test_strategy)
             .unwrap_or_default(),
-        cached_remotely: false,
+        cached_remotely: test_cached_remotely(command),
         exit_code: details.signed_exit_code.unwrap_or_default(),
         hostname: String::new(),
         timing_breakdown: None,
@@ -4272,6 +4307,17 @@ fn test_strategy(command: &buck2_data::command_execution_kind::Command) -> Strin
         buck2_data::command_execution_kind::Command::OmittedLocalCommand(_) => "local",
     }
     .to_owned()
+}
+
+fn test_cached_remotely(command: Option<&buck2_data::CommandExecution>) -> bool {
+    matches!(
+        command
+            .and_then(|command| command.details.as_ref())
+            .and_then(|details| details.command_kind.as_ref())
+            .and_then(|kind| kind.command.as_ref()),
+        Some(buck2_data::command_execution_kind::Command::RemoteCommand(remote))
+            if remote.cache_hit
+    )
 }
 
 fn action_error_message(action_error: &buck2_data::ActionError) -> String {
@@ -5307,6 +5353,160 @@ mod tests {
             event.payload,
             Some(build_event::Payload::NamedSetOfFiles(_))
         )));
+    }
+
+    #[test]
+    fn final_completed_update_links_tests_to_target() {
+        let mut converter = BazelEventConverter::default();
+        let target = configured_target();
+
+        let test_events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::TestRun(
+                        buck2_data::TestRunEnd {
+                            suite: Some(buck2_data::TestSuite {
+                                suite_name: "suite".to_owned(),
+                                test_names: vec!["test_passes".to_owned()],
+                                target_label: Some(target.clone()),
+                            }),
+                            command_report: Some(buck2_data::CommandExecution {
+                                details: Some(buck2_data::CommandExecutionDetails {
+                                    signed_exit_code: Some(0),
+                                    ..Default::default()
+                                }),
+                                status: Some(buck2_data::command_execution::Status::Success(
+                                    buck2_data::command_execution::Success {},
+                                )),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+        );
+        let test_result_id = test_events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::TestResult(_)) => event.id.clone(),
+                _ => None,
+            })
+            .expect("expected TestResult event");
+        let test_summary_id = test_events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::TestSummary(_)) => event.id.clone(),
+                _ => None,
+            })
+            .expect("expected TestSummary event");
+
+        let final_events = converter.convert(
+            2,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
+                        buck2_data::InvocationRecord {
+                            outcome: Some(buck2_data::InvocationOutcome::Success as i32),
+                            ..Default::default()
+                        },
+                    ))),
+                },
+            )),
+        );
+
+        let completed_update = final_events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event.id.as_ref().and_then(|id| id.id.as_ref()),
+                    Some(build_event_id::Id::TargetCompleted(_))
+                ) && !event.children.is_empty()
+            })
+            .expect("expected TargetComplete update with test children");
+        assert!(
+            completed_update
+                .children
+                .iter()
+                .any(|child| child == &test_result_id)
+        );
+        assert!(
+            completed_update
+                .children
+                .iter()
+                .any(|child| child == &test_summary_id)
+        );
+    }
+
+    #[test]
+    fn remote_cached_tests_report_cache_metadata() {
+        let mut converter = BazelEventConverter::default();
+        let target = configured_target();
+
+        let test_events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::TestRun(
+                        buck2_data::TestRunEnd {
+                            suite: Some(buck2_data::TestSuite {
+                                suite_name: "suite".to_owned(),
+                                test_names: vec!["test_passes".to_owned()],
+                                target_label: Some(target),
+                            }),
+                            command_report: Some(buck2_data::CommandExecution {
+                                details: Some(buck2_data::CommandExecutionDetails {
+                                    signed_exit_code: Some(0),
+                                    command_kind: Some(buck2_data::CommandExecutionKind {
+                                        command: Some(
+                                            buck2_data::command_execution_kind::Command::RemoteCommand(
+                                                buck2_data::RemoteCommand {
+                                                    cache_hit: true,
+                                                    ..Default::default()
+                                                },
+                                            ),
+                                        ),
+                                    }),
+                                    ..Default::default()
+                                }),
+                                status: Some(buck2_data::command_execution::Status::Success(
+                                    buck2_data::command_execution::Success {},
+                                )),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+        );
+
+        let result = test_events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::TestResult(result)) => Some(result),
+                _ => None,
+            })
+            .expect("expected TestResult event");
+        assert!(
+            result
+                .execution_info
+                .as_ref()
+                .expect("test execution info")
+                .cached_remotely
+        );
+
+        let summary = test_events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::TestSummary(summary)) => Some(summary),
+                _ => None,
+            })
+            .expect("expected TestSummary event");
+        assert_eq!(summary.total_num_cached, 1);
     }
 
     #[test]
