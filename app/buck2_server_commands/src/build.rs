@@ -719,7 +719,18 @@ async fn process_build_result(
                     .use_case,
             )
             .await;
-            (res, buck2_data::CreateOutputSymlinksEnd {})
+            let symlinks = match res.as_ref() {
+                Ok(result) => result
+                    .links
+                    .iter()
+                    .map(|link| buck2_data::OutputSymlink {
+                        path: link.path.clone(),
+                        target: link.target.clone(),
+                    })
+                    .collect(),
+                Err(..) => Vec::new(),
+            };
+            (res, buck2_data::CreateOutputSymlinksEnd { symlinks })
         })
         .await?;
     }

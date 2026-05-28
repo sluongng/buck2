@@ -29,6 +29,15 @@ use dupe::Dupe;
 use itertools::Itertools;
 use tracing::info;
 
+pub(crate) struct CreateUnhashedOutputsResult {
+    pub(crate) links: Vec<CreatedUnhashedOutputLink>,
+}
+
+pub(crate) struct CreatedUnhashedOutputLink {
+    pub(crate) path: String,
+    pub(crate) target: String,
+}
+
 type UnhashedOutputLinks =
     IndexMap<ProjectRelativePathBuf, IndexMap<ProjectRelativePathBuf, ArtifactValue>>;
 
@@ -71,7 +80,7 @@ pub(crate) async fn create_unhashed_outputs_via_materializer(
     materializer: &dyn Materializer,
     materializations: Materializations,
     re_use_case: RemoteExecutorUseCase,
-) -> buck2_error::Result<()> {
+) -> buck2_error::Result<CreateUnhashedOutputsResult> {
     create_unhashed_outputs_via_materializer_impl(
         provider_artifacts,
         artifact_fs,
@@ -92,9 +101,10 @@ async fn create_unhashed_outputs_via_materializer_impl(
     materializer: &dyn Materializer,
     materializations: Materializations,
     re_use_case: RemoteExecutorUseCase,
-) -> buck2_error::Result<()> {
+) -> buck2_error::Result<CreateUnhashedOutputsResult> {
     let unhashed_to_hashed = unhashed_output_links(provider_artifacts, artifact_fs)?;
     let mut declarations = Vec::new();
+    let mut links = Vec::new();
 
     for (unhashed, hashed_set) in unhashed_to_hashed {
         if let Ok((hashed, _)) = hashed_set.iter().exactly_one() {
@@ -105,6 +115,12 @@ async fn create_unhashed_outputs_via_materializer_impl(
                 &unhashed,
             )?;
             let symlink_value = builder.build(&unhashed)?;
+            links.push(CreatedUnhashedOutputLink {
+                path: unhashed.to_string(),
+                target: hashed
+                    .strip_prefix(artifact_fs.buck_out_path_resolver().root())?
+                    .to_string(),
+            });
             declarations.push((unhashed, symlink_value));
         } else {
             info!(
@@ -121,7 +137,7 @@ async fn create_unhashed_outputs_via_materializer_impl(
     )
     .await?;
     let required = match materializations {
-        Materializations::Skip => return Ok(()),
+        Materializations::Skip => return Ok(CreateUnhashedOutputsResult { links }),
         Materializations::Default => false,
         Materializations::Materialize => true,
     };
@@ -136,5 +152,5 @@ async fn create_unhashed_outputs_via_materializer_impl(
     // Read after the command returns, so there is no scope to hold the lease over.
     drop(response.ensure_results_ok()?);
 
-    Ok(())
+    Ok(CreateUnhashedOutputsResult { links })
 }

@@ -2166,6 +2166,7 @@ dependencies = [
  "buck2_hash",
  "buck2_util",
  "buck2_wrapper_common",
+ "chrono",
  "console",
  "crossbeam-channel",
  "derive_more 2.1.1",
@@ -2354,6 +2355,7 @@ dependencies = [
  "buck2_build_api",
  "buck2_common",
  "buck2_core",
+ "buck2_data",
  "buck2_directory",
  "buck2_error",
  "buck2_execute",
@@ -3210,6 +3212,7 @@ dependencies = [
  "libc",
  "maplit",
  "pagable",
+ "prost-types",
  "remote_execution",
  "serde",
  "serde_json",
@@ -3531,6 +3534,7 @@ checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
  "num-traits",
+ "serde",
  "windows-link",
 ]
 

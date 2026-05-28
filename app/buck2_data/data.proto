@@ -400,9 +400,17 @@ message InstantEvent {
     // having to thread them through its response.
     TargetRuleTypeName target_rule_type_name = 59;
 
+    // The final request constructed by a successful `buck2 run` build before
+    // the client executes, prints, or writes the requested command line.
+    RunExecRequest run_exec_request = 61;
+
     PageOutSummary page_out_summary = 62;
 
     PagingSummary paging_summary = 63;
+
+    // A non-action external resource fetch, such as a git-backed external
+    // cell population.
+    ExternalResourceFetch external_resource_fetch = 64;
   }
 }
 
@@ -1495,6 +1503,7 @@ message TestSuite {
   string suite_name = 1;
   repeated string test_names = 2;
   ConfiguredTargetLabel target_label = 3;
+  repeated string labels = 4;
 }
 
 // An event that marks the beginning of a command.
@@ -2630,6 +2639,7 @@ message ReLogStreamAvailable {
   string stderr_stream_name = 3;
   optional string action_key = 4;
   string use_case = 5;
+  ActionKey key = 6;
 }
 
 message LocalStage {
@@ -2690,6 +2700,7 @@ message TestDiscoveryStart {
   // Trying to find the test suite(s) associated with this binary.
   string suite_name = 1;
   ConfiguredTargetLabel target_label = 2;
+  repeated string labels = 3;
 }
 
 message TestDiscoveryEnd {
@@ -2699,6 +2710,7 @@ message TestDiscoveryEnd {
   optional buck.host_sharing.HostSharingRequirements
       command_host_sharing_requirements = 4;
   ConfiguredTargetLabel target_label = 5;
+  repeated string labels = 6;
 }
 
 message TestRunStart {
@@ -2710,6 +2722,7 @@ message TestRunEnd {
   CommandExecution command_report = 2;
   optional buck.host_sharing.HostSharingRequirements
       command_host_sharing_requirements = 3;
+  google.protobuf.Duration timeout = 4;
 }
 
 message FileWatcherStart {
@@ -2898,6 +2911,26 @@ message EnvironmentEntry {
   string key = 1;
   // The environment value.
   string value = 2;
+}
+
+message RunExecRequest {
+  string working_directory = 1;
+  repeated string argv = 2;
+  repeated EnvironmentEntry env = 3;
+  repeated string env_to_clear = 4;
+  bool should_exec = 5;
+}
+
+enum ExternalResourceDownloader {
+  UNKNOWN_DOWNLOADER = 0;
+  HTTP_DOWNLOADER = 1;
+  GRPC_DOWNLOADER = 2;
+}
+
+message ExternalResourceFetch {
+  string url = 1;
+  ExternalResourceDownloader downloader = 2;
+  bool success = 3;
 }
 
 /// A representation of a command that we executed locally.
@@ -3569,8 +3602,14 @@ message DepFileUploadEnd {
 
 message CreateOutputSymlinksStart {};
 
+message OutputSymlink {
+  string path = 1;
+  string target = 2;
+}
+
 message CreateOutputSymlinksEnd {
   reserved 1;
+  repeated OutputSymlink symlinks = 2;
 };
 
 message InstallEventInfoStart {
@@ -3612,6 +3651,8 @@ message MaterializationEnd {
 
   // The type of entry that was materialized
   optional MaterializationMethod method = 7;
+  // The URL fetched for HTTP downloads.
+  optional string url = 8;
 };
 
 message ExclusiveCommandWaitStart {

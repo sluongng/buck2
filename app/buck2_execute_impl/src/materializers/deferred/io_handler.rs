@@ -392,6 +392,7 @@ impl IoHandler for DefaultIoHandler {
                         success: error.is_none(),
                         error,
                         method: Some(method.to_proto() as i32),
+                        url: None,
                     },
                 )
             })

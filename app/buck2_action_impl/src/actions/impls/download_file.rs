@@ -356,7 +356,7 @@ impl DownloadFileAction {
             )
             .await?;
 
-        let digest = http_download(
+        let download_result = http_download(
             client,
             ctx.fs().fs(),
             ctx.digest_config(),
@@ -365,21 +365,30 @@ impl DownloadFileAction {
             &self.inner.checksum,
             self.inner.is_executable,
         )
-        .await?;
-
-        // RE knows this file by the digest (checksum, size), where the size came from
-        // `size_bytes` or the HEAD response rather than from the content. A wrong size would leave
-        // every remote consumer unable to find its input, so it is caught here.
-        if let Some(metadata) = metadata
-            && digest.size() != metadata.digest.size()
-        {
-            return Err(buck2_error!(
-                ErrorTag::DownloadSizeMismatch,
-                "Downloaded size ({}) does not match expected size ({})",
-                digest.size(),
-                metadata.digest.size(),
-            ));
-        }
+        .await
+        .and_then(|digest| {
+            // RE knows this file by the digest (checksum, size), where the size came from
+            // `size_bytes` or the HEAD response rather than from the content. A wrong size would leave
+            // every remote consumer unable to find its input, so it is caught here.
+            if let Some(metadata) = metadata
+                && digest.size() != metadata.digest.size()
+            {
+                return Err(buck2_error!(
+                    ErrorTag::DownloadSizeMismatch,
+                    "Downloaded size ({}) does not match expected size ({})",
+                    digest.size(),
+                    metadata.digest.size(),
+                ));
+            }
+            Ok(digest)
+        });
+        ctx.events()
+            .instant_event(buck2_data::ExternalResourceFetch {
+                url: url.to_owned(),
+                downloader: buck2_data::ExternalResourceDownloader::HttpDownloader as i32,
+                success: download_result.is_ok(),
+            });
+        let digest = download_result?;
 
         // The declared metadata, when there is any, is the value: the checksum verified the
         // content and the size was checked above, and a content-based output path was resolved

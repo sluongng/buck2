@@ -31,6 +31,9 @@ pub struct ReActionIdentity<'a> {
     /// Optional action id (usually the action digest hash) used for request metadata.
     pub action_id: Option<String>,
 
+    /// Structured action identity for Buck2 event consumers.
+    pub proto_action_key: buck2_data::ActionKey,
+
     /// Optional action mnemonic, target label and configuration hash used for OSS RE metadata.
     pub action_mnemonic: Option<String>,
     pub target_label: Option<String>,
@@ -53,6 +56,7 @@ impl<'a> ReActionIdentity<'a> {
         }
 
         let trace_id = get_dispatcher().trace_id().to_owned();
+        let proto_action_key = target.as_proto_action_key();
         let action_mnemonic = target.action_mnemonic();
         let target_label = target.target_label();
         let configuration_hash = target.configuration_hash();
@@ -63,6 +67,7 @@ impl<'a> ReActionIdentity<'a> {
             affinity_key: target.re_affinity_key(),
             paths,
             action_id,
+            proto_action_key,
             action_mnemonic,
             target_label,
             configuration_hash,

@@ -40,10 +40,13 @@ use buck2_common::argv::Argv;
 use buck2_common::argv::SanitizedArgv;
 use buck2_error::BuckErrorContext;
 use buck2_error::conversion::from_any_with_tag;
+use buck2_fs::paths::abs_path::AbsPathBuf;
 use buck2_hash::BuckMutSet;
 use buck2_wrapper_common::BUCK_WRAPPER_START_TIME_ENV_VAR;
 use buck2_wrapper_common::BUCK_WRAPPER_UUID_ENV_VAR;
 use buck2_wrapper_common::BUCK2_WRAPPER_ENV_VAR;
+use buck2_wrapper_common::invocation_id::TraceId;
+use dupe::Dupe;
 use serde::Serialize;
 
 use crate::commands::build::print_buck_ui;
@@ -205,6 +208,21 @@ impl StreamingCommand for RunCommand {
         print_buck_ui(&console, ctx, events_ctx.used_superconsole)?;
         print_build_succeeded(&console, ctx, extra)?;
 
+        let chdir = self
+            .chdir
+            .as_ref()
+            .map(|chdir| chdir.resolve(&ctx.working_dir));
+        let should_exec = self.command_args_file.is_none() && !self.emit_shell;
+        emit_run_exec_request_event(
+            events_ctx,
+            ctx.trace_id.dupe(),
+            ctx.working_dir.to_string(),
+            chdir.as_ref(),
+            &run_args,
+            should_exec,
+        )
+        .await?;
+
         if let Some(file_path) = self.command_args_file {
             let mut output = File::create(&file_path).with_buck_error_context(|| {
                 format!("Failed to create/open `{file_path}` to print command")
@@ -241,8 +259,6 @@ impl StreamingCommand for RunCommand {
             }
         }
 
-        let chdir = self.chdir.map(|chdir| chdir.resolve(&ctx.working_dir));
-
         ExitResult::exec(
             run_args[0].clone().into(),
             run_args.into_iter().map(|arg| arg.into()).collect(),
@@ -274,6 +290,38 @@ impl StreamingCommand for RunCommand {
         let to_redact: BuckMutSet<_> = self.extra_run_args.iter().collect();
         argv.redacted(to_redact)
     }
+}
+
+async fn emit_run_exec_request_event(
+    events_ctx: &mut EventsCtx,
+    trace_id: TraceId,
+    default_working_directory: String,
+    chdir: Option<&AbsPathBuf>,
+    argv: &[String],
+    should_exec: bool,
+) -> buck2_error::Result<()> {
+    let working_directory = chdir
+        .map(|path| path.as_path().to_string_lossy().into_owned())
+        .unwrap_or(default_working_directory);
+    events_ctx
+        .handle_client_instant_event(
+            trace_id.dupe(),
+            buck2_data::instant_event::Data::RunExecRequest(buck2_data::RunExecRequest {
+                working_directory,
+                argv: argv.to_vec(),
+                env: vec![buck2_data::EnvironmentEntry {
+                    key: "BUCK_RUN_BUILD_ID".to_owned(),
+                    value: trace_id.to_string(),
+                }],
+                env_to_clear: vec![
+                    BUCK2_WRAPPER_ENV_VAR.to_owned(),
+                    BUCK_WRAPPER_UUID_ENV_VAR.to_owned(),
+                    BUCK_WRAPPER_START_TIME_ENV_VAR.to_owned(),
+                ],
+                should_exec,
+            }),
+        )
+        .await
 }
 
 #[derive(Serialize)]
