@@ -93,3 +93,9 @@ actions:
             --config-file .buckconfig.local \
             --remote-only \
             //:buck2
+
+          BUCK2="$built_buck2" buildbuddy/run_buck2_test_matrix.sh \
+            --mode remote \
+            --remote-config-file .buckconfig.local \
+            --isolation-prefix buildbuddy-rbe-tests \
+            --clean-output
