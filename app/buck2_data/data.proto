@@ -2244,6 +2244,7 @@ message ReLogStreamAvailable {
   string stderr_stream_name = 3;
   optional string action_key = 4;
   string use_case = 5;
+  ActionKey key = 6;
 }
 
 message LocalStage {
