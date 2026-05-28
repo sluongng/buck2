@@ -4,7 +4,9 @@ actions:
     user: root
     resource_requests:
       disk: 64GB
-    triggers: {}
+    triggers:
+      push:
+        branches: ["main"]
     steps:
       - run: |
           set -euo pipefail
