@@ -225,6 +225,7 @@ pub(crate) struct BazelEventConverter {
     emitted_output_counts: BTreeMap<TargetKey, usize>,
     emitted_completed_targets: BTreeSet<TargetKey>,
     test_cases: BTreeMap<TargetKey, Vec<TestCaseState>>,
+    test_progress_counts: BTreeMap<TargetKey, i32>,
     test_timeouts: BTreeMap<TargetKey, prost_types::Duration>,
     announced_event_ids: BTreeMap<Vec<u8>, bep::BuildEventId>,
     posted_event_ids: BTreeSet<Vec<u8>>,
@@ -528,6 +529,11 @@ impl BazelEventConverter {
                     metadata.insert("BUCK2_RE_SESSION_ID".to_owned(), session.session_id.clone());
                 }
                 events.push(self.build_metadata_event(&metadata));
+            }
+            Some(buck2_data::instant_event::Data::ReLogStreamAvailable(streams)) => {
+                if let Some(event) = self.test_progress_event_from_re_log_stream(streams) {
+                    events.push(event);
+                }
             }
             Some(buck2_data::instant_event::Data::TargetPatterns(patterns)) => {
                 self.remember_target_patterns(patterns);
@@ -1317,6 +1323,43 @@ impl BazelEventConverter {
         self.target_tags.get(key).cloned().unwrap_or_default()
     }
 
+    fn test_progress_event_from_re_log_stream(
+        &mut self,
+        streams: &buck2_data::ReLogStreamAvailable,
+    ) -> Option<bep::BuildEvent> {
+        let key = streams.key.as_ref()?;
+        let target = match key.owner.as_ref()? {
+            buck2_data::action_key::Owner::TestTargetLabel(target) => target,
+            _ => return None,
+        };
+        let label = label_for_configured_target(target)?;
+        let configuration = configuration_id_for_target(target);
+        let uri = if !streams.stdout_stream_name.is_empty() {
+            &streams.stdout_stream_name
+        } else {
+            &streams.stderr_stream_name
+        };
+        if uri.is_empty() {
+            return None;
+        }
+        let target_key = TargetKey {
+            label: label.clone(),
+            configuration: configuration.clone(),
+        };
+        let opaque_count = self
+            .test_progress_counts
+            .entry(target_key)
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+
+        Some(test_progress_event(
+            label,
+            configuration,
+            *opaque_count,
+            uri.to_owned(),
+        ))
+    }
+
     fn test_result_event_from_test_end(
         &mut self,
         event: &buck2_data::BuckEvent,
@@ -1929,6 +1972,37 @@ fn test_result_id(label: String, configuration: String) -> bep::BuildEventId {
                 configuration: Some(configuration_id(configuration)),
             },
         )),
+    }
+}
+
+fn test_progress_id(label: String, configuration: String, opaque_count: i32) -> bep::BuildEventId {
+    bep::BuildEventId {
+        id: Some(build_event_id::Id::TestProgress(
+            build_event_id::TestProgressId {
+                label,
+                configuration: Some(configuration_id(configuration)),
+                run: 1,
+                shard: 1,
+                attempt: 1,
+                opaque_count,
+            },
+        )),
+    }
+}
+
+fn test_progress_event(
+    label: String,
+    configuration: String,
+    opaque_count: i32,
+    uri: String,
+) -> bep::BuildEvent {
+    bep::BuildEvent {
+        id: Some(test_progress_id(label, configuration, opaque_count)),
+        children: Vec::new(),
+        payload: Some(build_event::Payload::TestProgress(bep::TestProgress {
+            uri,
+        })),
+        last_message: false,
     }
 }
 
@@ -6313,6 +6387,86 @@ mod tests {
     }
 
     #[test]
+    fn re_log_stream_emits_test_progress_for_tests() {
+        let mut converter = BazelEventConverter::default();
+        let target = configured_target();
+        let events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::Instant(
+                buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::ReLogStreamAvailable(
+                        buck2_data::ReLogStreamAvailable {
+                            action_digest: "action-digest".to_owned(),
+                            stdout_stream_name: "uploads/test/stdout".to_owned(),
+                            stderr_stream_name: "uploads/test/stderr".to_owned(),
+                            action_key: Some("//pkg:main test test_case".to_owned()),
+                            use_case: "buck2_test".to_owned(),
+                            key: Some(buck2_data::ActionKey {
+                                owner: Some(buck2_data::action_key::Owner::TestTargetLabel(
+                                    target.clone(),
+                                )),
+                                ..Default::default()
+                            }),
+                        },
+                    )),
+                },
+            )),
+        );
+
+        let progress = events
+            .iter()
+            .find(|event| matches!(event.payload, Some(build_event::Payload::TestProgress(_))))
+            .expect("TestProgress event");
+        let Some(build_event_id::Id::TestProgress(progress_id)) =
+            progress.id.as_ref().and_then(|id| id.id.as_ref())
+        else {
+            panic!("expected TestProgress id");
+        };
+        assert_eq!(progress_id.label, "//pkg:main");
+        assert_eq!(progress_id.configuration.as_ref().unwrap().id, "cfg");
+        assert_eq!(progress_id.run, 1);
+        assert_eq!(progress_id.shard, 1);
+        assert_eq!(progress_id.attempt, 1);
+        assert_eq!(progress_id.opaque_count, 1);
+        let Some(build_event::Payload::TestProgress(progress)) = progress.payload.as_ref() else {
+            panic!("expected TestProgress payload");
+        };
+        assert_eq!(progress.uri, "uploads/test/stdout");
+    }
+
+    #[test]
+    fn re_log_stream_ignores_non_test_actions() {
+        let mut converter = BazelEventConverter::default();
+        let target = configured_target();
+        let events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::Instant(
+                buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::ReLogStreamAvailable(
+                        buck2_data::ReLogStreamAvailable {
+                            action_digest: "action-digest".to_owned(),
+                            stdout_stream_name: "uploads/action/stdout".to_owned(),
+                            stderr_stream_name: String::new(),
+                            action_key: Some("//pkg:main compile".to_owned()),
+                            use_case: "buck2_build".to_owned(),
+                            key: Some(buck2_data::ActionKey {
+                                owner: Some(buck2_data::action_key::Owner::TargetLabel(target)),
+                                ..Default::default()
+                            }),
+                        },
+                    )),
+                },
+            )),
+        );
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.payload, Some(build_event::Payload::TestProgress(_))))
+        );
+    }
+
+    #[test]
     fn run_exec_request_emits_exec_request_constructed() {
         let mut converter = BazelEventConverter::default();
         let events = converter.convert(
@@ -8722,6 +8876,18 @@ mod tests {
             completed.important_output[0].name,
             "buck-out/main.resources"
         );
+        let named_set = final_events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::NamedSetOfFiles(named_set)) => Some(named_set),
+                _ => None,
+            })
+            .expect("NamedSetOfFiles event");
+        assert_eq!(named_set.files.len(), 1);
+        assert_eq!(named_set.files[0].name, "buck-out/main.resources");
+        assert_eq!(named_set.files[0].digest, "tree-digest:42");
+        assert_eq!(named_set.files[0].length, 42);
+        assert!(named_set.files[0].file.is_none());
     }
 
     #[test]

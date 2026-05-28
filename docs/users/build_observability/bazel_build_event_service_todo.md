@@ -6,12 +6,16 @@ make goals clearer, obsolete, or more urgent.
 
 ## P0/P1: BuildBuddy reuse blockers
 
-- [ ] Emit target artifacts through `TargetComplete.output_group`.
+- [x] Emit target artifacts through `TargetComplete.output_group`.
   - [x] Add named sets for target outputs.
   - [x] Reference the named sets from the target completion event.
   - [x] Prefer URI-backed files when artifact upload is configured.
-  - [ ] Verify local-only target artifacts are present in the configured
-        bytestream or add a dedicated upload path for them.
+  - [x] Upload local file outputs through the configured artifact upload backend
+        when Buck2 can resolve them from the workspace.
+  - [x] Include directory/tree outputs in the default output group and
+        `TargetComplete.directory_output`.
+  - [x] Stream oversized local files through the configured artifact upload
+        backend instead of synthesizing URIs for bytes that were not uploaded.
 - [x] Make action and test logs render in BuildBuddy.
   - [x] Keep inline file contents as a fallback for debugging.
   - [x] Add an optional bytestream upload path for BEP `File.uri`.
@@ -42,11 +46,12 @@ make goals clearer, obsolete, or more urgent.
   - [x] Avoid final target completion on analysis-only events when later build
         or test completion exists.
   - [x] Deduplicate configured and completed events for each target/configuration.
-- [ ] Add structured failures.
+- [x] Add structured failures.
   - [x] Populate `failure_detail` on failed actions, targets, and
         invocations.
-  - [ ] Add test-specific failure details if Bazel BEP grows a direct field
-        for test result or summary payloads.
+  - [x] Confirm latest Bazel BEP still has no direct `failure_detail` field
+        for test result or summary payloads; keep test details in
+        `TestResult.status_details` and generated `test.xml`.
   - [x] Emit `Aborted` for skipped, cancelled, or failed announced children that
         do not receive a normal terminal event.
 - [x] Improve remote execution diagnostics.
@@ -65,8 +70,11 @@ make goals clearer, obsolete, or more urgent.
   - [x] Emit `Fetch` events for git-backed external cell population.
   - [ ] Emit fetch events for other external resource mechanisms once their
         event payloads carry stable resource URLs.
-- [ ] Emit `TestProgress` for active test attempts when Buck2 exposes a stable
-      live log URI.
+- [ ] Emit `TestProgress` for active test attempts.
+  - [x] Emit progress for remote test attempts when RE reports live log stream
+        resource names.
+  - [ ] Add local or non-streamed test progress once Buck2 exposes a stable live
+        log URI for those executions.
 - [x] Emit `TargetSummary`.
 - [x] Emit `ConvenienceSymlinksIdentified`.
 - [x] Emit `ExecRequestConstructed` for `buck2 run` once the client has
@@ -83,8 +91,8 @@ make goals clearer, obsolete, or more urgent.
 
 ## Validation
 
-- [ ] `cargo build --bin buck2`
-- [ ] `./bootstrap/buck2 build //:buck2`
+- [x] `cargo build --bin buck2`
+- [x] `./bootstrap/buck2 build //:buck2`
 - [ ] Run a local BuildBuddy comparison between a real Bazel invocation and a
       Buck2 invocation using `event_format = "bazel"`.
 - [ ] Capture overview, target detail, action log, and test detail screenshots.
