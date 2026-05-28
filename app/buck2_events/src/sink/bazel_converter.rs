@@ -232,6 +232,7 @@ pub(crate) struct BazelEventConverter {
     pattern_expanded_emitted: bool,
     final_progress_emitted: bool,
     emitted_build_tool_logs: bool,
+    emitted_convenience_symlinks: bool,
     last_finished_signature: Option<FinishedEventSignature>,
     last_build_tool_logs_signature: Option<Vec<u8>>,
     declared_actions_count: u64,
@@ -473,6 +474,14 @@ impl BazelEventConverter {
                     events.push(summary);
                 }
             }
+            Some(buck2_data::span_end_event::Data::Materialization(materialization)) => {
+                if let Some(fetch) = fetch_event_from_materialization(materialization) {
+                    events.push(fetch);
+                }
+            }
+            Some(buck2_data::span_end_event::Data::CreateOutputSymlinks(symlinks)) => {
+                self.push_convenience_symlinks_identified(&symlinks.symlinks, events);
+            }
             _ => {}
         }
     }
@@ -599,6 +608,14 @@ impl BazelEventConverter {
             Some(buck2_data::instant_event::Data::TestResult(result)) => {
                 self.remember_test_case(result);
             }
+            Some(buck2_data::instant_event::Data::RunExecRequest(request)) => {
+                events.push(exec_request_constructed_event(request));
+            }
+            Some(buck2_data::instant_event::Data::ExternalResourceFetch(fetch)) => {
+                if let Some(fetch) = fetch_event_from_external_resource(fetch) {
+                    events.push(fetch);
+                }
+            }
             _ => {}
         }
     }
@@ -637,6 +654,7 @@ impl BazelEventConverter {
                 self.emit_pending_pattern_expanded(&[], events);
                 self.emit_completed_updates_for_actions(events);
                 events.push(self.build_metadata_event(&build_metadata_from_invocation(record)));
+                self.push_convenience_symlinks_identified(&[], events);
                 self.push_finished(finished_event_from_invocation_record(event, record), events);
                 self.push_final_progress(events);
                 events.push(build_metrics_event(
@@ -696,6 +714,18 @@ impl BazelEventConverter {
         self.last_build_tool_logs_signature = Some(signature);
         self.emitted_build_tool_logs = true;
         events.push(event);
+    }
+
+    fn push_convenience_symlinks_identified(
+        &mut self,
+        symlinks: &[buck2_data::OutputSymlink],
+        events: &mut Vec<bep::BuildEvent>,
+    ) {
+        if self.emitted_convenience_symlinks {
+            return;
+        }
+        self.emitted_convenience_symlinks = true;
+        events.push(convenience_symlinks_identified_event(symlinks));
     }
 
     fn record_event_graph(&mut self, events: &[bep::BuildEvent]) {
@@ -943,6 +973,7 @@ impl BazelEventConverter {
             build_metadata_id(),
             configuration_event_id(DEFAULT_CONFIGURATION_ID),
             workspace_config_id(),
+            convenience_symlinks_identified_id(),
             build_finished_id(),
         ];
         if !patterns.is_empty() {
@@ -1779,6 +1810,14 @@ fn build_tool_logs_id() -> bep::BuildEventId {
     bep::BuildEventId {
         id: Some(build_event_id::Id::BuildToolLogs(
             build_event_id::BuildToolLogsId {},
+        )),
+    }
+}
+
+fn exec_request_id() -> bep::BuildEventId {
+    bep::BuildEventId {
+        id: Some(build_event_id::Id::ExecRequest(
+            build_event_id::ExecRequestId {},
         )),
     }
 }
@@ -2795,6 +2834,124 @@ fn build_metrics_id() -> bep::BuildEventId {
         id: Some(build_event_id::Id::BuildMetrics(
             build_event_id::BuildMetricsId {},
         )),
+    }
+}
+
+fn convenience_symlinks_identified_id() -> bep::BuildEventId {
+    bep::BuildEventId {
+        id: Some(build_event_id::Id::ConvenienceSymlinksIdentified(
+            build_event_id::ConvenienceSymlinksIdentifiedId {},
+        )),
+    }
+}
+
+fn convenience_symlinks_identified_event(
+    symlinks: &[buck2_data::OutputSymlink],
+) -> bep::BuildEvent {
+    bep::BuildEvent {
+        id: Some(convenience_symlinks_identified_id()),
+        children: Vec::new(),
+        payload: Some(build_event::Payload::ConvenienceSymlinksIdentified(
+            bep::ConvenienceSymlinksIdentified {
+                convenience_symlinks: symlinks
+                    .iter()
+                    .map(|link| bep::ConvenienceSymlink {
+                        path: link.path.clone(),
+                        action: bep::convenience_symlink::Action::Create as i32,
+                        target: link.target.clone(),
+                    })
+                    .collect(),
+            },
+        )),
+        last_message: false,
+    }
+}
+
+fn fetch_event_from_materialization(
+    materialization: &buck2_data::MaterializationEnd,
+) -> Option<bep::BuildEvent> {
+    let method = materialization
+        .method
+        .and_then(|method| buck2_data::MaterializationMethod::try_from(method).ok())?;
+    if method != buck2_data::MaterializationMethod::HttpDownload {
+        return None;
+    }
+    let url = materialization.url.as_ref().filter(|url| !url.is_empty())?;
+    Some(bep::BuildEvent {
+        id: Some(bep::BuildEventId {
+            id: Some(build_event_id::Id::Fetch(build_event_id::FetchId {
+                url: url.clone(),
+                downloader: build_event_id::fetch_id::Downloader::Http as i32,
+            })),
+        }),
+        children: Vec::new(),
+        payload: Some(build_event::Payload::Fetch(bep::Fetch {
+            success: materialization.success,
+        })),
+        last_message: false,
+    })
+}
+
+fn fetch_event_from_external_resource(
+    fetch: &buck2_data::ExternalResourceFetch,
+) -> Option<bep::BuildEvent> {
+    let url = (!fetch.url.is_empty()).then(|| fetch.url.clone())?;
+    let downloader = buck2_data::ExternalResourceDownloader::try_from(fetch.downloader).ok()?;
+    let downloader = match downloader {
+        buck2_data::ExternalResourceDownloader::UnknownDownloader => {
+            build_event_id::fetch_id::Downloader::Unknown
+        }
+        buck2_data::ExternalResourceDownloader::HttpDownloader => {
+            build_event_id::fetch_id::Downloader::Http
+        }
+        buck2_data::ExternalResourceDownloader::GrpcDownloader => {
+            build_event_id::fetch_id::Downloader::Grpc
+        }
+    };
+    Some(bep::BuildEvent {
+        id: Some(bep::BuildEventId {
+            id: Some(build_event_id::Id::Fetch(build_event_id::FetchId {
+                url,
+                downloader: downloader as i32,
+            })),
+        }),
+        children: Vec::new(),
+        payload: Some(build_event::Payload::Fetch(bep::Fetch {
+            success: fetch.success,
+        })),
+        last_message: false,
+    })
+}
+
+fn exec_request_constructed_event(request: &buck2_data::RunExecRequest) -> bep::BuildEvent {
+    bep::BuildEvent {
+        id: Some(exec_request_id()),
+        children: Vec::new(),
+        payload: Some(build_event::Payload::ExecRequest(
+            bep::ExecRequestConstructed {
+                working_directory: request.working_directory.as_bytes().to_vec(),
+                argv: request
+                    .argv
+                    .iter()
+                    .map(|arg| arg.as_bytes().to_vec())
+                    .collect(),
+                environment_variable: request
+                    .env
+                    .iter()
+                    .map(|entry| bep::EnvironmentVariable {
+                        name: entry.key.as_bytes().to_vec(),
+                        value: entry.value.as_bytes().to_vec(),
+                    })
+                    .collect(),
+                environment_variable_to_clear: request
+                    .env_to_clear
+                    .iter()
+                    .map(|name| name.as_bytes().to_vec())
+                    .collect(),
+                should_exec: request.should_exec,
+            },
+        )),
+        last_message: false,
     }
 }
 
@@ -5810,6 +5967,12 @@ mod tests {
                 .iter()
                 .any(|child| { child == &structured_command_line_id(TOOL_COMMAND_LINE_LABEL) })
         );
+        assert!(
+            events[0]
+                .children
+                .iter()
+                .any(|child| { child == &convenience_symlinks_identified_id() })
+        );
         assert!(events.iter().any(|event| matches!(
             event.payload,
             Some(build_event::Payload::StructuredCommandLine(_))
@@ -6041,6 +6204,243 @@ mod tests {
         assert_eq!(options.tool_tag, "ci-runner");
         assert_eq!(options.cmd_line, vec!["--tool-tag=ci-runner"]);
         assert_eq!(options.explicit_cmd_line, vec!["--tool-tag=ci-runner"]);
+    }
+
+    #[test]
+    fn http_materialization_emits_fetch_event() {
+        let mut converter = BazelEventConverter::default();
+        let events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::Materialization(
+                        buck2_data::MaterializationEnd {
+                            success: true,
+                            method: Some(buck2_data::MaterializationMethod::HttpDownload as i32),
+                            url: Some("https://example.test/archive.tar.zst".to_owned()),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+        );
+
+        let fetch_event = events
+            .iter()
+            .find(|event| matches!(event.payload, Some(build_event::Payload::Fetch(_))))
+            .expect("Fetch event");
+        let Some(build_event_id::Id::Fetch(fetch_id)) =
+            fetch_event.id.as_ref().and_then(|id| id.id.as_ref())
+        else {
+            panic!("expected Fetch id");
+        };
+        assert_eq!(fetch_id.url, "https://example.test/archive.tar.zst");
+        assert_eq!(
+            fetch_id.downloader,
+            build_event_id::fetch_id::Downloader::Http as i32
+        );
+        let Some(build_event::Payload::Fetch(fetch)) = fetch_event.payload.as_ref() else {
+            panic!("expected Fetch payload");
+        };
+        assert!(fetch.success);
+    }
+
+    #[test]
+    fn cas_materialization_does_not_emit_fetch_event() {
+        let mut converter = BazelEventConverter::default();
+        let events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::Materialization(
+                        buck2_data::MaterializationEnd {
+                            success: true,
+                            method: Some(buck2_data::MaterializationMethod::CasDownload as i32),
+                            url: Some("https://example.test/archive.tar.zst".to_owned()),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+        );
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.payload, Some(build_event::Payload::Fetch(_))))
+        );
+    }
+
+    #[test]
+    fn external_resource_fetch_emits_fetch_event() {
+        let mut converter = BazelEventConverter::default();
+        let events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::Instant(
+                buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::ExternalResourceFetch(
+                        buck2_data::ExternalResourceFetch {
+                            url: "https://github.com/example/lib.git".to_owned(),
+                            downloader: buck2_data::ExternalResourceDownloader::UnknownDownloader
+                                as i32,
+                            success: false,
+                        },
+                    )),
+                },
+            )),
+        );
+
+        let fetch_event = events
+            .iter()
+            .find(|event| matches!(event.payload, Some(build_event::Payload::Fetch(_))))
+            .expect("Fetch event");
+        let Some(build_event_id::Id::Fetch(fetch_id)) =
+            fetch_event.id.as_ref().and_then(|id| id.id.as_ref())
+        else {
+            panic!("expected Fetch id");
+        };
+        assert_eq!(fetch_id.url, "https://github.com/example/lib.git");
+        assert_eq!(
+            fetch_id.downloader,
+            build_event_id::fetch_id::Downloader::Unknown as i32
+        );
+        let Some(build_event::Payload::Fetch(fetch)) = fetch_event.payload.as_ref() else {
+            panic!("expected Fetch payload");
+        };
+        assert!(!fetch.success);
+    }
+
+    #[test]
+    fn run_exec_request_emits_exec_request_constructed() {
+        let mut converter = BazelEventConverter::default();
+        let events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::Instant(
+                buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::RunExecRequest(
+                        buck2_data::RunExecRequest {
+                            working_directory: "/repo".to_owned(),
+                            argv: vec!["buck-out/bin/app".to_owned(), "--flag".to_owned()],
+                            env: vec![buck2_data::EnvironmentEntry {
+                                key: "BUCK_RUN_BUILD_ID".to_owned(),
+                                value: "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa".to_owned(),
+                            }],
+                            env_to_clear: vec!["BUCK2_WRAPPER".to_owned()],
+                            should_exec: true,
+                        },
+                    )),
+                },
+            )),
+        );
+
+        let exec_event = events
+            .iter()
+            .find(|event| matches!(event.payload, Some(build_event::Payload::ExecRequest(_))))
+            .expect("ExecRequestConstructed event");
+        assert!(matches!(
+            exec_event.id.as_ref().and_then(|id| id.id.as_ref()),
+            Some(build_event_id::Id::ExecRequest(_))
+        ));
+        let Some(build_event::Payload::ExecRequest(exec_request)) = exec_event.payload.as_ref()
+        else {
+            panic!("expected ExecRequestConstructed payload");
+        };
+        assert_eq!(exec_request.working_directory, b"/repo");
+        assert_eq!(
+            exec_request.argv,
+            vec![b"buck-out/bin/app".to_vec(), b"--flag".to_vec()]
+        );
+        assert_eq!(exec_request.environment_variable.len(), 1);
+        assert_eq!(
+            exec_request.environment_variable[0].name,
+            b"BUCK_RUN_BUILD_ID"
+        );
+        assert_eq!(
+            exec_request.environment_variable[0].value,
+            b"aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa"
+        );
+        assert_eq!(
+            exec_request.environment_variable_to_clear,
+            vec![b"BUCK2_WRAPPER".to_vec()]
+        );
+        assert!(exec_request.should_exec);
+    }
+
+    #[test]
+    fn create_output_symlinks_emits_convenience_symlinks() {
+        let mut converter = BazelEventConverter::default();
+        let events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::CreateOutputSymlinks(
+                        buck2_data::CreateOutputSymlinksEnd {
+                            created: 1,
+                            symlinks: vec![buck2_data::OutputSymlink {
+                                path: "buck-out/unhashed/pkg/app".to_owned(),
+                                target: "gen/root/pkg/app".to_owned(),
+                            }],
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+        );
+
+        let event = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event.payload,
+                    Some(build_event::Payload::ConvenienceSymlinksIdentified(_))
+                )
+            })
+            .expect("convenience symlinks event");
+        assert!(matches!(
+            event.id.as_ref().and_then(|id| id.id.as_ref()),
+            Some(build_event_id::Id::ConvenienceSymlinksIdentified(_))
+        ));
+        let Some(build_event::Payload::ConvenienceSymlinksIdentified(symlinks)) =
+            event.payload.as_ref()
+        else {
+            panic!("expected ConvenienceSymlinksIdentified payload");
+        };
+        assert_eq!(symlinks.convenience_symlinks.len(), 1);
+        let symlink = &symlinks.convenience_symlinks[0];
+        assert_eq!(symlink.path, "buck-out/unhashed/pkg/app");
+        assert_eq!(
+            symlink.action,
+            bep::convenience_symlink::Action::Create as i32
+        );
+        assert_eq!(symlink.target, "gen/root/pkg/app");
+
+        let final_events = converter.convert(
+            2,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::Command(
+                        buck2_data::CommandEnd {
+                            data: Some(buck2_data::command_end::Data::Build(
+                                buck2_data::BuildCommandEnd {
+                                    ..Default::default()
+                                },
+                            )),
+                            is_success: true,
+                            build_result: Some(buck2_data::BuildResult {
+                                build_completed: true,
+                            }),
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+        );
+        assert!(!final_events.iter().any(|event| matches!(
+            event.payload,
+            Some(build_event::Payload::ConvenienceSymlinksIdentified(_))
+        )));
     }
 
     #[test]
@@ -7491,6 +7891,22 @@ mod tests {
             .iter()
             .position(is_build_finished_event)
             .expect("build finished event");
+        let convenience_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event.payload.as_ref(),
+                    Some(build_event::Payload::ConvenienceSymlinksIdentified(_))
+                )
+            })
+            .expect("convenience symlinks event");
+        assert!(convenience_index < finished_index);
+        let Some(build_event::Payload::ConvenienceSymlinksIdentified(symlinks)) =
+            events[convenience_index].payload.as_ref()
+        else {
+            panic!("expected ConvenienceSymlinksIdentified payload");
+        };
+        assert!(symlinks.convenience_symlinks.is_empty());
         let finished = match events[finished_index].payload.as_ref() {
             Some(build_event::Payload::Finished(finished)) => finished,
             _ => unreachable!("finished index was matched above"),

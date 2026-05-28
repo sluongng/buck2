@@ -47,7 +47,7 @@ make goals clearer, obsolete, or more urgent.
         invocations.
   - [ ] Add test-specific failure details if Bazel BEP grows a direct field
         for test result or summary payloads.
-  - [ ] Emit `Aborted` for skipped, cancelled, or failed announced children that
+  - [x] Emit `Aborted` for skipped, cancelled, or failed announced children that
         do not receive a normal terminal event.
 - [x] Improve remote execution diagnostics.
   - [x] Populate `ActionExecuted.strategy_details` with Buck2 execution
@@ -61,11 +61,16 @@ make goals clearer, obsolete, or more urgent.
 ## P3: Remaining Bazel BEP parity
 
 - [ ] Emit `Fetch` events for external downloads.
+  - [x] Emit HTTP `Fetch` events for materialized `download_file` artifacts.
+  - [x] Emit `Fetch` events for git-backed external cell population.
+  - [ ] Emit fetch events for other external resource mechanisms once their
+        event payloads carry stable resource URLs.
 - [ ] Emit `TestProgress` for active test attempts when Buck2 exposes a stable
       live log URI.
-- [ ] Emit `TargetSummary`.
-- [ ] Emit `ConvenienceSymlinksIdentified`.
-- [ ] Emit `ExecRequestConstructed` for run-like commands.
+- [x] Emit `TargetSummary`.
+- [x] Emit `ConvenienceSymlinksIdentified`.
+- [x] Emit `ExecRequestConstructed` for `buck2 run` once the client has
+      constructed the post-build argv.
 
 ## BuildBuddy follow-up issues
 
