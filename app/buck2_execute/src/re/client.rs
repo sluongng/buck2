@@ -1225,6 +1225,7 @@ impl RemoteExecutionClientImpl {
         metadata: RemoteExecutionMetadata,
         request: ExecuteRequest,
         action_digest: &ActionDigest,
+        proto_action_key: &buck2_data::ActionKey,
         manager: &mut CommandExecutionManager,
         re_max_queue_time: Option<Duration>,
         platform: &remote_execution::Platform,
@@ -1548,6 +1549,7 @@ impl RemoteExecutionClientImpl {
                             stderr_stream_name: meta.stderr_stream_name.clone(),
                             action_key: action_key.clone(),
                             use_case: re_use_case.clone(),
+                            key: Some(proto_action_key.clone()),
                         });
                     }
                 }
@@ -1782,6 +1784,7 @@ impl RemoteExecutionClientImpl {
                 metadata,
                 request,
                 &action_digest,
+                &identity.proto_action_key,
                 manager,
                 re_max_queue_time,
                 platform,
