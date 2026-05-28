@@ -247,6 +247,7 @@ pub(crate) struct BazelEventConverter {
     output_artifacts_from_action_cache_size: u64,
     output_artifacts_from_action_cache_count: u64,
     command_profile: CommandProfileBuilder,
+    pending_pre_start_events: Vec<bep::BuildEvent>,
 }
 
 impl BazelEventConverter {
@@ -267,12 +268,17 @@ impl BazelEventConverter {
     ) -> Vec<bep::BuildEvent> {
         let mut events = Vec::new();
 
-        if !self.saw_started && !is_command_start(event) {
-            if let Some(record) = invocation_record(event) {
-                events.push(self.started_event_from_invocation(event, record));
-            } else {
-                events.push(self.started_event(event, None));
-            }
+        if !self.saw_started
+            && let Some(record) = invocation_record(event)
+        {
+            events.push(self.started_event_from_invocation(event, record));
+            self.saw_started = true;
+        }
+
+        if !self.saw_started
+            && let Some(command) = command_start(event)
+        {
+            events.push(self.started_event(event, Some(command)));
             self.saw_started = true;
         }
 
@@ -290,6 +296,29 @@ impl BazelEventConverter {
                 self.convert_record(event, record, &mut events);
             }
             None => {}
+        }
+
+        if !self.saw_started {
+            if should_buffer_before_started(event) {
+                self.pending_pre_start_events.extend(events);
+                return Vec::new();
+            }
+            events.splice(
+                0..0,
+                std::iter::once(self.started_event(event, None))
+                    .chain(std::mem::take(&mut self.pending_pre_start_events)),
+            );
+            self.saw_started = true;
+        } else if !self.pending_pre_start_events.is_empty() {
+            let insert_at = usize::from(
+                events
+                    .first()
+                    .is_some_and(|event| event.id.as_ref() == Some(&started_id())),
+            );
+            events.splice(
+                insert_at..insert_at,
+                std::mem::take(&mut self.pending_pre_start_events),
+            );
         }
 
         let finishes_invocation = events.iter().any(is_build_finished_event);
@@ -1605,7 +1634,8 @@ impl CommandProfileBuilder {
             .command_name
             .as_deref()
             .or(self.command_name.as_deref())
-            .unwrap_or("unknown");
+            .map(str::to_owned)
+            .unwrap_or_else(|| invocation_command_name(record));
         let mut args = serde_json::Map::new();
         args.insert(
             "outcome".to_owned(),
@@ -1743,12 +1773,29 @@ pub(crate) fn encode_bep_event(event: &bep::BuildEvent) -> Any {
     }
 }
 
-fn is_command_start(event: &buck2_data::BuckEvent) -> bool {
+fn command_start(event: &buck2_data::BuckEvent) -> Option<&buck2_data::CommandStart> {
+    match event.data.as_ref() {
+        Some(buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+            data: Some(buck2_data::span_start_event::Data::Command(command)),
+        })) => Some(command),
+        _ => None,
+    }
+}
+
+fn should_buffer_before_started(event: &buck2_data::BuckEvent) -> bool {
     matches!(
         event.data.as_ref(),
-        Some(buck2_data::buck_event::Data::SpanStart(
-            buck2_data::SpanStartEvent {
-                data: Some(buck2_data::span_start_event::Data::Command(_)),
+        Some(buck2_data::buck_event::Data::Instant(
+            buck2_data::InstantEvent {
+                data: Some(
+                    buck2_data::instant_event::Data::SystemInfo(_)
+                        | buck2_data::instant_event::Data::Snapshot(_)
+                        | buck2_data::instant_event::Data::RestartConfiguration(_)
+                        | buck2_data::instant_event::Data::TagEvent(_)
+                        | buck2_data::instant_event::Data::IoProviderInfo(_)
+                        | buck2_data::instant_event::Data::StructuredError(_)
+                        | buck2_data::instant_event::Data::VersionControlRevision(_),
+                ),
             }
         ))
     )
@@ -2040,64 +2087,69 @@ fn command_name(command: &buck2_data::CommandStart) -> String {
     use buck2_data::command_start::Data;
 
     match command.data.as_ref() {
-        Some(Data::Build(_)) => "build",
-        Some(Data::Targets(_)) => "targets",
-        Some(Data::Query(_)) => "query",
-        Some(Data::Cquery(_)) => "cquery",
-        Some(Data::Test(_)) => "test",
-        Some(Data::Audit(_)) => "audit",
-        Some(Data::Docs(_)) => "docs",
-        Some(Data::Clean(_)) => "clean",
-        Some(Data::Aquery(_)) => "aquery",
-        Some(Data::Install(_)) => "install",
-        Some(Data::Materialize(_)) => "materialize",
-        Some(Data::Profile(_)) => "profile",
-        Some(Data::Bxl(_)) => "bxl",
-        Some(Data::Lsp(_)) => "lsp",
-        Some(Data::FileStatus(_)) => "file-status",
-        Some(Data::Starlark(_)) => "starlark",
-        Some(Data::Subscribe(_)) => "subscribe",
-        Some(Data::Trace(_)) => "trace",
-        Some(Data::Ctargets(_)) => "ctargets",
-        Some(Data::StarlarkDebugAttach(_)) => "starlark-debug-attach",
-        Some(Data::Explain(_)) => "explain",
-        Some(Data::ExpandExternalCell(_)) => "expand-external-cell",
-        Some(Data::Complete(_)) => "complete",
-        Some(Data::Hydration(_)) => "hydration",
-        None => "unknown",
+        Some(Data::Build(_)) => Some("build"),
+        Some(Data::Targets(_)) => Some("targets"),
+        Some(Data::Query(_)) => Some("query"),
+        Some(Data::Cquery(_)) => Some("cquery"),
+        Some(Data::Test(_)) => Some("test"),
+        Some(Data::Audit(_)) => Some("audit"),
+        Some(Data::Docs(_)) => Some("docs"),
+        Some(Data::Clean(_)) => Some("clean"),
+        Some(Data::Aquery(_)) => Some("aquery"),
+        Some(Data::Install(_)) => Some("install"),
+        Some(Data::Materialize(_)) => Some("materialize"),
+        Some(Data::Profile(_)) => Some("profile"),
+        Some(Data::Bxl(_)) => Some("bxl"),
+        Some(Data::Lsp(_)) => Some("lsp"),
+        Some(Data::FileStatus(_)) => Some("file-status"),
+        Some(Data::Starlark(_)) => Some("starlark"),
+        Some(Data::Subscribe(_)) => Some("subscribe"),
+        Some(Data::Trace(_)) => Some("trace"),
+        Some(Data::Ctargets(_)) => Some("ctargets"),
+        Some(Data::StarlarkDebugAttach(_)) => Some("starlark-debug-attach"),
+        Some(Data::Explain(_)) => Some("explain"),
+        Some(Data::ExpandExternalCell(_)) => Some("expand-external-cell"),
+        Some(Data::Complete(_)) => Some("complete"),
+        Some(Data::Hydration(_)) => Some("hydration"),
+        None => command_name_from_args(&command.cli_args),
     }
+    .unwrap_or("unknown")
     .to_owned()
 }
 
 fn command_end_name(command: &buck2_data::CommandEnd) -> &'static str {
+    command_end_name_opt(command).unwrap_or("unknown")
+}
+
+fn command_end_name_opt(command: &buck2_data::CommandEnd) -> Option<&'static str> {
     use buck2_data::command_end::Data;
 
     match command.data.as_ref() {
-        Some(Data::Build(_)) => "build",
-        Some(Data::Targets(_)) => "targets",
-        Some(Data::Query(_)) => "query",
-        Some(Data::Cquery(_)) => "cquery",
-        Some(Data::Test(_)) => "test",
-        Some(Data::Audit(_)) => "audit",
-        Some(Data::Docs(_)) => "docs",
-        Some(Data::Clean(_)) => "clean",
-        Some(Data::Aquery(_)) => "aquery",
-        Some(Data::Install(_)) => "install",
-        Some(Data::Materialize(_)) => "materialize",
-        Some(Data::Profile(_)) => "profile",
-        Some(Data::Bxl(_)) => "bxl",
-        Some(Data::Lsp(_)) => "lsp",
-        Some(Data::FileStatus(_)) => "file-status",
-        Some(Data::Starlark(_)) => "starlark",
-        Some(Data::Subscribe(_)) => "subscribe",
-        Some(Data::Trace(_)) => "trace",
-        Some(Data::Ctargets(_)) => "ctargets",
-        Some(Data::StarlarkDebugAttach(_)) => "starlark-debug-attach",
-        Some(Data::Explain(_)) => "explain",
-        Some(Data::ExpandExternalCell(_)) => "expand-external-cell",
-        Some(Data::Complete(_)) => "complete",
-        Some(Data::Hydration(_)) => "hydration",
-        None => "unknown",
+        Some(Data::Build(_)) => Some("build"),
+        Some(Data::Targets(_)) => Some("targets"),
+        Some(Data::Query(_)) => Some("query"),
+        Some(Data::Cquery(_)) => Some("cquery"),
+        Some(Data::Test(_)) => Some("test"),
+        Some(Data::Audit(_)) => Some("audit"),
+        Some(Data::Docs(_)) => Some("docs"),
+        Some(Data::Clean(_)) => Some("clean"),
+        Some(Data::Aquery(_)) => Some("aquery"),
+        Some(Data::Install(_)) => Some("install"),
+        Some(Data::Materialize(_)) => Some("materialize"),
+        Some(Data::Profile(_)) => Some("profile"),
+        Some(Data::Bxl(_)) => Some("bxl"),
+        Some(Data::Lsp(_)) => Some("lsp"),
+        Some(Data::FileStatus(_)) => Some("file-status"),
+        Some(Data::Starlark(_)) => Some("starlark"),
+        Some(Data::Subscribe(_)) => Some("subscribe"),
+        Some(Data::Trace(_)) => Some("trace"),
+        Some(Data::Ctargets(_)) => Some("ctargets"),
+        Some(Data::StarlarkDebugAttach(_)) => Some("starlark-debug-attach"),
+        Some(Data::Explain(_)) => Some("explain"),
+        Some(Data::ExpandExternalCell(_)) => Some("expand-external-cell"),
+        Some(Data::Complete(_)) => Some("complete"),
+        Some(Data::Hydration(_)) => Some("hydration"),
+        None => None,
     }
 }
 
@@ -2110,9 +2162,73 @@ fn invocation_command_name(record: &buck2_data::InvocationRecord) -> String {
     record
         .command_end
         .as_ref()
-        .map(command_end_name)
+        .and_then(command_end_name_opt)
+        .or_else(|| command_name_from_args(&record.cli_args))
         .unwrap_or("unknown")
         .to_owned()
+}
+
+fn command_name_from_args(args: &[String]) -> Option<&'static str> {
+    let mut i = if args
+        .first()
+        .is_some_and(|arg| known_command_name(arg).is_some())
+    {
+        0
+    } else {
+        1
+    };
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            break;
+        }
+        if let Some(command_name) = known_command_name(arg) {
+            return Some(command_name);
+        }
+        if let Some(option) = option_from_arg(arg) {
+            i += if option.option_value.is_empty()
+                && i + 1 < args.len()
+                && option_takes_value(&option.option_name)
+            {
+                2
+            } else {
+                1
+            };
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn known_command_name(arg: &str) -> Option<&'static str> {
+    match arg {
+        "build" => Some("build"),
+        "targets" => Some("targets"),
+        "query" => Some("query"),
+        "cquery" => Some("cquery"),
+        "test" => Some("test"),
+        "audit" => Some("audit"),
+        "docs" => Some("docs"),
+        "clean" => Some("clean"),
+        "aquery" => Some("aquery"),
+        "install" => Some("install"),
+        "materialize" => Some("materialize"),
+        "profile" => Some("profile"),
+        "bxl" => Some("bxl"),
+        "lsp" => Some("lsp"),
+        "file-status" => Some("file-status"),
+        "starlark" => Some("starlark"),
+        "subscribe" => Some("subscribe"),
+        "trace" => Some("trace"),
+        "ctargets" => Some("ctargets"),
+        "starlark-debug-attach" => Some("starlark-debug-attach"),
+        "explain" => Some("explain"),
+        "expand-external-cell" => Some("expand-external-cell"),
+        "complete" => Some("complete"),
+        "hydration" => Some("hydration"),
+        _ => None,
+    }
 }
 
 fn invocation_metadata(record: &buck2_data::InvocationRecord) -> Option<&HashMap<String, String>> {
@@ -2760,10 +2876,9 @@ fn build_metadata_from_invocation(
                 .map(|(key, value)| (key.clone(), value.clone())),
         );
     }
-    if let Some(command_name) = record.command_name.as_ref()
-        && !command_name.is_empty()
-    {
-        metadata.insert("BUCK2_COMMAND".to_owned(), command_name.clone());
+    let command_name = invocation_command_name(record);
+    if command_name != "unknown" {
+        metadata.insert("BUCK2_COMMAND".to_owned(), command_name);
     }
     if !record.re_session_id.is_empty() {
         metadata.insert(
@@ -4351,9 +4466,10 @@ fn build_tool_logs_event_from_invocation(
     profile: &CommandProfileBuilder,
 ) -> bep::BuildEvent {
     let target_patterns = target_patterns_from_invocation(record);
+    let command_name = invocation_command_name(record);
     let summary = serde_json::json!({
         "tool": BUILD_TOOL_VERSION,
-        "command": record.command_name.as_deref().unwrap_or_default(),
+        "command": command_name,
         "outcome": invocation_outcome_name(record.outcome),
         "exit_code": record.exit_code,
         "exit_result_name": record.exit_result_name.as_deref(),
@@ -4434,7 +4550,7 @@ fn command_profile_json(record: &buck2_data::InvocationRecord) -> serde_json::Re
         .map(duration_micros)
         .unwrap_or_default()
         .max(1);
-    let command = record.command_name.as_deref().unwrap_or("unknown");
+    let command = invocation_command_name(record);
     let outcome = invocation_outcome_name(record.outcome);
     let total_actions = record
         .run_local_count
@@ -6155,6 +6271,68 @@ mod tests {
     }
 
     #[test]
+    fn pre_command_startup_events_wait_for_command_context() {
+        let mut converter = BazelEventConverter::default();
+        let startup_events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::Instant(
+                buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::StructuredError(
+                        buck2_data::StructuredError {
+                            payload: "early soft error".to_owned(),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )),
+        );
+        assert!(startup_events.is_empty());
+
+        let command_events = converter.convert(
+            2,
+            &trace_event(buck2_data::buck_event::Data::SpanStart(
+                buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::Command(
+                        buck2_data::CommandStart {
+                            cli_args: vec![
+                                "buck2".to_owned(),
+                                "build".to_owned(),
+                                "//:main".to_owned(),
+                            ],
+                            data: Some(buck2_data::command_start::Data::Build(
+                                buck2_data::BuildCommandStart {},
+                            )),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )),
+        );
+
+        let started = command_events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::Started(started)) => Some(started),
+                _ => None,
+            })
+            .expect("started event");
+        assert_eq!(started.command, "build");
+        assert!(command_events.iter().any(|event| matches!(
+            event.payload.as_ref(),
+            Some(build_event::Payload::Progress(progress))
+                if progress.stderr == "early soft error"
+        )));
+        let original = command_events
+            .iter()
+            .find(|event| {
+                event.id.as_ref() == Some(&structured_command_line_id(ORIGINAL_COMMAND_LINE_LABEL))
+            })
+            .map(command_line_from_event)
+            .expect("original command line");
+        assert_eq!(chunk_values(original, "command"), vec!["build"]);
+    }
+
+    #[test]
     fn command_line_events_render_as_buck2_in_buildbuddy() {
         let command = buck2_data::CommandStart {
             cli_args: vec![
@@ -6207,6 +6385,92 @@ mod tests {
                 "--config-file=.buckconfig.local",
                 "--remote-only",
             ]
+        );
+    }
+
+    #[test]
+    fn command_line_events_infer_command_from_argv() {
+        let command = buck2_data::CommandStart {
+            cli_args: vec![
+                "/root/workspace/repo-root/buck-out/buildbuddy-rbe-build/art/gh_facebook_buck2/7703741d4b7244c6/app/buck2/__buck2-bin__/buck2".to_owned(),
+                "--isolation-dir".to_owned(),
+                "buildbuddy-bes-compare".to_owned(),
+                "build".to_owned(),
+                "--config-file".to_owned(),
+                ".buckconfig.local".to_owned(),
+                "--prefer-remote".to_owned(),
+                "--".to_owned(),
+                "//:main".to_owned(),
+            ],
+            data: None,
+            ..Default::default()
+        };
+
+        let mut converter = BazelEventConverter::default();
+        let events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanStart(
+                buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::Command(command.clone())),
+                },
+            )),
+        );
+
+        let started = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::Started(started)) => Some(started),
+                _ => None,
+            })
+            .expect("started event");
+        assert_eq!(started.command, "build");
+        assert_eq!(command_name(&command), "build");
+
+        let original_event = original_structured_command_line_event(&command);
+        let original = command_line_from_event(&original_event);
+        assert_eq!(chunk_values(original, "executable"), vec!["buck2"]);
+        assert_eq!(chunk_values(original, "command"), vec!["build"]);
+        assert_eq!(
+            option_values(original, "command options"),
+            vec![
+                "--isolation-dir=buildbuddy-bes-compare",
+                "--config-file=.buckconfig.local",
+                "--prefer-remote",
+            ]
+        );
+        assert_eq!(chunk_values(original, "residual"), vec!["//:main"]);
+
+        let options_parsed_event = options_parsed_event(&command);
+        let Some(build_event::Payload::OptionsParsed(options_parsed)) =
+            options_parsed_event.payload.as_ref()
+        else {
+            panic!("expected options parsed");
+        };
+        assert_eq!(
+            options_parsed.explicit_cmd_line,
+            vec![
+                "--isolation-dir=buildbuddy-bes-compare",
+                "--config-file=.buckconfig.local",
+                "--prefer-remote",
+            ]
+        );
+    }
+
+    #[test]
+    fn command_name_inference_skips_startup_option_values() {
+        let args = vec![
+            "buck2".to_owned(),
+            "--isolation-dir".to_owned(),
+            "build".to_owned(),
+            "test".to_owned(),
+            "//:main".to_owned(),
+        ];
+        assert_eq!(command_name_from_args(&args), Some("test"));
+
+        let args_without_executable = vec!["build".to_owned(), "//:main".to_owned()];
+        assert_eq!(
+            command_name_from_args(&args_without_executable),
+            Some("build")
         );
     }
 
@@ -6633,7 +6897,7 @@ mod tests {
                                 "--remote-only".to_owned(),
                                 "//:buck2".to_owned(),
                             ],
-                            command_name: Some("build".to_owned()),
+                            command_name: None,
                             metadata: Some(buck2_data::TypedMetadata {
                                 strings: HashMap::from([
                                     ("username".to_owned(), "alice".to_owned()),
@@ -6775,6 +7039,13 @@ mod tests {
         assert_eq!(
             build_metadata
                 .metadata
+                .get("BUCK2_COMMAND")
+                .map(String::as_str),
+            Some("build")
+        );
+        assert_eq!(
+            build_metadata
+                .metadata
                 .get(BUILDBUDDY_VISIBILITY_KEY)
                 .map(String::as_str),
             Some(BUILDBUDDY_PUBLIC_VISIBILITY)
@@ -6797,7 +7068,7 @@ mod tests {
                                 ".buckconfig.local".to_owned(),
                                 "//:buck2".to_owned(),
                             ],
-                            command_name: Some("build".to_owned()),
+                            command_name: None,
                             metadata: Some(buck2_data::TypedMetadata {
                                 strings: HashMap::from([
                                     ("username".to_owned(), "alice".to_owned()),
