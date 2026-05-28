@@ -9,7 +9,12 @@
  */
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::io::Read;
+use std::path::Component;
+use std::path::Path;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
@@ -315,6 +320,29 @@ impl BazelArtifactUploadConfig {
 struct BazelArtifactUploader {
     config: BazelArtifactUploadConfig,
     client: Option<ByteStreamClient<Channel>>,
+    repo_path: Option<PathBuf>,
+    directory_outputs: HashSet<BepFileIdentity>,
+    #[cfg(test)]
+    test_writes: Vec<WriteRequest>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct BepFileIdentity {
+    path_prefix: Vec<String>,
+    name: String,
+    digest: String,
+    length: i64,
+}
+
+impl BepFileIdentity {
+    fn new(file: &bazel_bep_proto::build_event_stream::File) -> Self {
+        Self {
+            path_prefix: file.path_prefix.clone(),
+            name: file.name.clone(),
+            digest: file.digest.clone(),
+            length: file.length,
+        }
+    }
 }
 
 impl BazelArtifactUploader {
@@ -322,6 +350,59 @@ impl BazelArtifactUploader {
         Self {
             config,
             client: None,
+            repo_path: None,
+            directory_outputs: HashSet::new(),
+            #[cfg(test)]
+            test_writes: Vec::new(),
+        }
+    }
+
+    fn observe_buck_event(&mut self, event: &buck2_data::BuckEvent) {
+        match event.data.as_ref() {
+            Some(buck_event::Data::SpanStart(span_start)) => {
+                if let Some(buck2_data::span_start_event::Data::Command(command)) =
+                    span_start.data.as_ref()
+                {
+                    self.observe_workspace_directory(
+                        command
+                            .metadata
+                            .get("REPO_ROOT")
+                            .or_else(|| command.metadata.get("WORKSPACE_DIRECTORY")),
+                    );
+                }
+            }
+            Some(buck_event::Data::Record(record)) => {
+                if let Some(record_event::Data::InvocationRecord(record)) = record.data.as_ref() {
+                    self.observe_workspace_directory(record.repo_path.as_ref());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn observe_workspace_directory(&mut self, path: Option<&String>) {
+        let Some(path) = path else {
+            return;
+        };
+        if path.is_empty() {
+            return;
+        }
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            self.repo_path = Some(path);
+        }
+    }
+
+    fn observe_bazel_events(&mut self, events: &[bazel_bep_proto::build_event_stream::BuildEvent]) {
+        use bazel_bep_proto::build_event_stream::build_event::Payload;
+
+        for event in events {
+            let Some(Payload::Completed(completed)) = event.payload.as_ref() else {
+                continue;
+            };
+            for file in &completed.directory_output {
+                self.directory_outputs.insert(BepFileIdentity::new(file));
+            }
         }
     }
 
@@ -360,11 +441,20 @@ impl BazelArtifactUploader {
             }
             Some(Payload::NamedSetOfFiles(files)) => {
                 for file in &mut files.files {
-                    self.add_uri_for_digest_file(file);
+                    if self.is_directory_output(file) {
+                        continue;
+                    }
+                    if !self.upload_file_if_local(file).await {
+                        self.add_uri_for_digest_file(file);
+                    }
                 }
             }
             _ => {}
         }
+    }
+
+    fn is_directory_output(&self, file: &bazel_bep_proto::build_event_stream::File) -> bool {
+        self.directory_outputs.contains(&BepFileIdentity::new(file))
     }
 
     async fn upload_file_if_inline(
@@ -389,6 +479,63 @@ impl BazelArtifactUploader {
         file.file = Some(bazel_bep_proto::build_event_stream::file::File::Uri(uri));
         file.digest = digest;
         file.length = len;
+    }
+
+    async fn upload_file_if_local(
+        &mut self,
+        file: &mut bazel_bep_proto::build_event_stream::File,
+    ) -> bool {
+        if file.file.is_some() {
+            return false;
+        }
+        let Some(path) = self.local_file_path(file) else {
+            return false;
+        };
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            return false;
+        };
+        if !metadata.is_file() {
+            return false;
+        }
+        let Ok(size) = i64::try_from(metadata.len()) else {
+            return false;
+        };
+        if let Some((_hash, expected_size)) = file_digest_and_size(file)
+            && expected_size != size
+        {
+            return false;
+        }
+        let Some((uri, digest, len)) = self.upload_local_file(&path, size).await else {
+            return false;
+        };
+        file.file = Some(bazel_bep_proto::build_event_stream::file::File::Uri(uri));
+        file.digest = digest;
+        file.length = len;
+        true
+    }
+
+    fn local_file_path(&self, file: &bazel_bep_proto::build_event_stream::File) -> Option<PathBuf> {
+        let repo_path = self.repo_path.as_ref()?;
+        let mut relative = PathBuf::new();
+        for path in file.path_prefix.iter().chain(std::iter::once(&file.name)) {
+            let path = Path::new(path);
+            if path.is_absolute() {
+                return None;
+            }
+            for component in path.components() {
+                match component {
+                    Component::Normal(component) => relative.push(component),
+                    Component::CurDir => {}
+                    Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
+                        return None;
+                    }
+                }
+            }
+        }
+        if relative.as_os_str().is_empty() {
+            return None;
+        }
+        Some(repo_path.join(relative))
     }
 
     fn add_uri_for_digest_file(&self, file: &mut bazel_bep_proto::build_event_stream::File) {
@@ -434,17 +581,53 @@ impl BazelArtifactUploader {
         Some((uri, format!("{hash}:{size}"), size))
     }
 
+    async fn upload_local_file(&mut self, path: &Path, size: i64) -> Option<(String, String, i64)> {
+        let hash = sha256_file(path)?;
+        let resource_name = upload_resource_name(&self.config.instance_name, &hash, size);
+        let response = self
+            .write_file_requests(resource_name, path, size)
+            .await
+            .ok()?;
+        if response.committed_size != size && response.committed_size != -1 {
+            return None;
+        }
+        let uri = bytestream_uri(
+            &self.config.uri_authority,
+            &self.config.instance_name,
+            &hash,
+            size,
+        );
+        Some((uri, format!("{hash}:{size}"), size))
+    }
+
     async fn write_request(
         &mut self,
         request: WriteRequest,
     ) -> Result<google_grpc_proto::google::bytestream::WriteResponse, Status> {
+        self.write_requests(vec![request]).await
+    }
+
+    async fn write_requests(
+        &mut self,
+        requests: Vec<WriteRequest>,
+    ) -> Result<google_grpc_proto::google::bytestream::WriteResponse, Status> {
+        #[cfg(test)]
+        if self.config.endpoint == "test://bytestream" {
+            let committed_size = requests
+                .iter()
+                .map(|request| i64::try_from(request.data.len()).unwrap_or(i64::MAX))
+                .sum();
+            self.test_writes.extend(requests);
+            return Ok(google_grpc_proto::google::bytestream::WriteResponse { committed_size });
+        }
+
         if self.client.is_none() {
             let endpoint = endpoint_for(&self.config.endpoint, self.config.grpc_timeout)?;
             let channel = endpoint.connect().await.map_err(map_transport_error)?;
             self.client = Some(ByteStreamClient::new(channel));
         }
         let client = self.client.as_mut().expect("client was initialized");
-        let outbound = tokio_stream::iter(vec![request]);
+        let outbound = tokio_stream::iter(requests);
         let mut request = tonic::Request::new(outbound);
         for (header_key, header_value) in &self.config.headers {
             let metadata_key = MetadataKey::from_bytes(header_key.as_bytes())
@@ -455,6 +638,152 @@ impl BazelArtifactUploader {
         }
         Ok(client.write(request).await?.into_inner())
     }
+
+    async fn write_file_requests(
+        &mut self,
+        resource_name: String,
+        path: &Path,
+        size: i64,
+    ) -> Result<google_grpc_proto::google::bytestream::WriteResponse, Status> {
+        let chunk_size = self.config.max_bytes.max(1);
+
+        #[cfg(test)]
+        if self.config.endpoint == "test://bytestream" {
+            let requests = write_requests_for_file(resource_name, path, size, chunk_size)?;
+            return self.write_requests(requests).await;
+        }
+
+        if self.client.is_none() {
+            let endpoint = endpoint_for(&self.config.endpoint, self.config.grpc_timeout)?;
+            let channel = endpoint.connect().await.map_err(map_transport_error)?;
+            self.client = Some(ByteStreamClient::new(channel));
+        }
+        let client = self.client.as_mut().expect("client was initialized");
+        let outbound = file_write_stream(resource_name, path, size, chunk_size)?;
+        let mut request = tonic::Request::new(outbound);
+        for (header_key, header_value) in &self.config.headers {
+            let metadata_key = MetadataKey::from_bytes(header_key.as_bytes())
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            let metadata_value = MetadataValue::try_from(header_value.as_str())
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            request.metadata_mut().insert(metadata_key, metadata_value);
+        }
+        Ok(client.write(request).await?.into_inner())
+    }
+}
+
+struct FileWriteState {
+    file: std::fs::File,
+    resource_name: Option<String>,
+    offset: i64,
+    size: i64,
+    chunk_size: usize,
+    finished: bool,
+}
+
+fn sha256_file(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let bytes_read = file.read(&mut buffer).ok()?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+fn file_write_stream(
+    resource_name: String,
+    path: &Path,
+    size: i64,
+    chunk_size: usize,
+) -> Result<impl futures::Stream<Item = WriteRequest> + Send + 'static, Status> {
+    let file = std::fs::File::open(path).map_err(map_io_status)?;
+    Ok(futures::stream::unfold(
+        FileWriteState {
+            file,
+            resource_name: Some(resource_name),
+            offset: 0,
+            size,
+            chunk_size,
+            finished: false,
+        },
+        |mut state| async move {
+            match next_file_write_request(&mut state) {
+                Ok(Some(request)) => Some((request, state)),
+                Ok(None) | Err(_) => None,
+            }
+        },
+    ))
+}
+
+#[cfg(test)]
+fn write_requests_for_file(
+    resource_name: String,
+    path: &Path,
+    size: i64,
+    chunk_size: usize,
+) -> Result<Vec<WriteRequest>, Status> {
+    let mut state = FileWriteState {
+        file: std::fs::File::open(path).map_err(map_io_status)?,
+        resource_name: Some(resource_name),
+        offset: 0,
+        size,
+        chunk_size,
+        finished: false,
+    };
+    let mut requests = Vec::new();
+    while let Some(request) = next_file_write_request(&mut state)? {
+        requests.push(request);
+    }
+    Ok(requests)
+}
+
+fn next_file_write_request(state: &mut FileWriteState) -> Result<Option<WriteRequest>, Status> {
+    if state.finished {
+        return Ok(None);
+    }
+    if state.offset >= state.size {
+        state.finished = true;
+        return Ok(Some(WriteRequest {
+            resource_name: state.resource_name.take().unwrap_or_default(),
+            write_offset: state.offset,
+            finish_write: true,
+            data: Vec::new(),
+        }));
+    }
+
+    let remaining = usize::try_from(state.size - state.offset).unwrap_or(usize::MAX);
+    let mut data = vec![0; state.chunk_size.min(remaining).max(1)];
+    let bytes_read = state.file.read(&mut data).map_err(map_io_status)?;
+    if bytes_read == 0 {
+        state.finished = true;
+        return Ok(Some(WriteRequest {
+            resource_name: state.resource_name.take().unwrap_or_default(),
+            write_offset: state.offset,
+            finish_write: true,
+            data: Vec::new(),
+        }));
+    }
+
+    data.truncate(bytes_read);
+    let write_offset = state.offset;
+    state.offset += i64::try_from(bytes_read).unwrap_or(i64::MAX);
+    let finish_write = state.offset >= state.size;
+    state.finished = finish_write;
+    Ok(Some(WriteRequest {
+        resource_name: state.resource_name.take().unwrap_or_default(),
+        write_offset,
+        finish_write,
+        data,
+    }))
+}
+
+fn map_io_status(error: std::io::Error) -> Status {
+    Status::internal(error.to_string())
 }
 
 async fn upload_named_file(
@@ -1269,9 +1598,15 @@ impl StreamState {
                 })),
             })),
             BesEventFormat::Bazel => {
+                if let Some(uploader) = self.bazel_artifact_uploader.as_mut() {
+                    uploader.observe_buck_event(&parsed.buck_event);
+                }
                 let events = self
                     .bazel_converter
                     .convert(self.next_sequence_number, &parsed.buck_event);
+                if let Some(uploader) = self.bazel_artifact_uploader.as_mut() {
+                    uploader.observe_bazel_events(&events);
+                }
                 let mut last_sequence_number = None;
                 for mut event in events {
                     if let Some(uploader) = self.bazel_artifact_uploader.as_mut() {
@@ -1779,17 +2114,21 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn upload_event_files_adds_named_set_uris_from_digest() {
-        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let mut uploader = BazelArtifactUploader::new(BazelArtifactUploadConfig {
-            endpoint: "http://localhost:1985".to_owned(),
+    fn test_artifact_upload_config() -> BazelArtifactUploadConfig {
+        BazelArtifactUploadConfig {
+            endpoint: "test://bytestream".to_owned(),
             headers: Vec::new(),
             instance_name: "remote/instance".to_owned(),
             uri_authority: "localhost:1985".to_owned(),
             max_bytes: 1024,
             grpc_timeout: Duration::from_secs(1),
-        });
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_event_files_adds_named_set_uris_from_digest() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut uploader = BazelArtifactUploader::new(test_artifact_upload_config());
         let mut event = bazel_bep_proto::build_event_stream::BuildEvent {
             id: None,
             children: Vec::new(),
@@ -1825,6 +2164,252 @@ mod tests {
             uri,
             &format!("bytestream://localhost:1985/remote/instance/blobs/{hash}/3")
         );
+    }
+
+    #[tokio::test]
+    async fn upload_event_files_leaves_directory_named_set_files_without_uri() {
+        let directory = bazel_bep_proto::build_event_stream::File {
+            name: "buck-out/gen/root/tree".to_owned(),
+            path_prefix: Vec::new(),
+            file: None,
+            digest: "tree-digest:42".to_owned(),
+            length: 42,
+        };
+        let mut uploader = BazelArtifactUploader::new(test_artifact_upload_config());
+        uploader.observe_bazel_events(&[bazel_bep_proto::build_event_stream::BuildEvent {
+            id: None,
+            children: Vec::new(),
+            payload: Some(
+                bazel_bep_proto::build_event_stream::build_event::Payload::Completed(
+                    bazel_bep_proto::build_event_stream::TargetComplete {
+                        directory_output: vec![directory.clone()],
+                        ..Default::default()
+                    },
+                ),
+            ),
+            last_message: false,
+        }]);
+        let mut event = bazel_bep_proto::build_event_stream::BuildEvent {
+            id: None,
+            children: Vec::new(),
+            payload: Some(
+                bazel_bep_proto::build_event_stream::build_event::Payload::NamedSetOfFiles(
+                    bazel_bep_proto::build_event_stream::NamedSetOfFiles {
+                        files: vec![directory],
+                        file_sets: Vec::new(),
+                    },
+                ),
+            ),
+            last_message: false,
+        };
+
+        uploader.upload_event_files(&mut event).await;
+
+        assert!(uploader.test_writes.is_empty());
+        let Some(bazel_bep_proto::build_event_stream::build_event::Payload::NamedSetOfFiles(files)) =
+            event.payload
+        else {
+            panic!("expected named set");
+        };
+        assert!(files.files[0].file.is_none());
+        assert_eq!(files.files[0].digest, "tree-digest:42");
+        assert_eq!(files.files[0].length, 42);
+    }
+
+    #[tokio::test]
+    async fn upload_event_files_uploads_named_set_local_files() {
+        let contents = b"abc";
+        let mut hasher = Sha256::new();
+        hasher.update(contents);
+        let hash = format!("{:x}", hasher.finalize());
+        let repo_path =
+            std::env::temp_dir().join(format!("buck2-bes-client-test-{}", uuid::Uuid::new_v4()));
+        let output_path = repo_path.join("buck-out/gen/root/main");
+        std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+        std::fs::write(&output_path, contents).unwrap();
+        let mut uploader = BazelArtifactUploader::new(test_artifact_upload_config());
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "REPO_ROOT".to_owned(),
+            repo_path.to_string_lossy().into_owned(),
+        );
+        uploader.observe_buck_event(&buck2_data::BuckEvent {
+            timestamp: None,
+            trace_id: String::new(),
+            span_id: 0,
+            parent_id: 0,
+            data: Some(buck2_data::buck_event::Data::SpanStart(
+                buck2_data::SpanStartEvent {
+                    data: Some(
+                        buck2_data::CommandStart {
+                            metadata,
+                            ..Default::default()
+                        }
+                        .into(),
+                    ),
+                },
+            )),
+        });
+        let mut event = bazel_bep_proto::build_event_stream::BuildEvent {
+            id: None,
+            children: Vec::new(),
+            payload: Some(
+                bazel_bep_proto::build_event_stream::build_event::Payload::NamedSetOfFiles(
+                    bazel_bep_proto::build_event_stream::NamedSetOfFiles {
+                        files: vec![bazel_bep_proto::build_event_stream::File {
+                            name: "buck-out/gen/root/main".to_owned(),
+                            path_prefix: Vec::new(),
+                            file: None,
+                            digest: "buck-digest:3".to_owned(),
+                            length: 3,
+                        }],
+                        file_sets: Vec::new(),
+                    },
+                ),
+            ),
+            last_message: false,
+        };
+
+        uploader.upload_event_files(&mut event).await;
+
+        assert_eq!(uploader.test_writes.len(), 1);
+        assert_eq!(uploader.test_writes[0].data, contents);
+        assert!(
+            uploader.test_writes[0]
+                .resource_name
+                .contains(&format!("blobs/{hash}/3"))
+        );
+        let Some(bazel_bep_proto::build_event_stream::build_event::Payload::NamedSetOfFiles(files)) =
+            event.payload
+        else {
+            panic!("expected named set");
+        };
+        assert_eq!(files.files[0].digest, format!("{hash}:3"));
+        assert_eq!(files.files[0].length, 3);
+        let uri = match files.files[0].file.as_ref() {
+            Some(bazel_bep_proto::build_event_stream::file::File::Uri(uri)) => uri,
+            other => panic!("expected URI, got {other:?}"),
+        };
+        assert_eq!(
+            uri,
+            &format!("bytestream://localhost:1985/remote/instance/blobs/{hash}/3")
+        );
+        std::fs::remove_dir_all(repo_path).ok();
+    }
+
+    #[tokio::test]
+    async fn upload_event_files_streams_oversized_named_set_local_files() {
+        let contents = b"abcdef";
+        let mut hasher = Sha256::new();
+        hasher.update(contents);
+        let hash = format!("{:x}", hasher.finalize());
+        let repo_path =
+            std::env::temp_dir().join(format!("buck2-bes-client-test-{}", uuid::Uuid::new_v4()));
+        let output_path = repo_path.join("buck-out/gen/root/main");
+        std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+        std::fs::write(&output_path, contents).unwrap();
+        let mut config = test_artifact_upload_config();
+        config.max_bytes = 4;
+        let mut uploader = BazelArtifactUploader::new(config);
+        uploader.repo_path = Some(repo_path.clone());
+        let mut event = bazel_bep_proto::build_event_stream::BuildEvent {
+            id: None,
+            children: Vec::new(),
+            payload: Some(
+                bazel_bep_proto::build_event_stream::build_event::Payload::NamedSetOfFiles(
+                    bazel_bep_proto::build_event_stream::NamedSetOfFiles {
+                        files: vec![bazel_bep_proto::build_event_stream::File {
+                            name: "buck-out/gen/root/main".to_owned(),
+                            path_prefix: Vec::new(),
+                            file: None,
+                            digest: "buck-digest:6".to_owned(),
+                            length: 6,
+                        }],
+                        file_sets: Vec::new(),
+                    },
+                ),
+            ),
+            last_message: false,
+        };
+
+        uploader.upload_event_files(&mut event).await;
+
+        assert_eq!(uploader.test_writes.len(), 2);
+        assert_eq!(uploader.test_writes[0].data, b"abcd");
+        assert_eq!(uploader.test_writes[0].write_offset, 0);
+        assert!(!uploader.test_writes[0].finish_write);
+        assert!(
+            uploader.test_writes[0]
+                .resource_name
+                .contains(&format!("blobs/{hash}/6"))
+        );
+        assert_eq!(uploader.test_writes[1].data, b"ef");
+        assert_eq!(uploader.test_writes[1].write_offset, 4);
+        assert!(uploader.test_writes[1].finish_write);
+        assert!(uploader.test_writes[1].resource_name.is_empty());
+        let Some(bazel_bep_proto::build_event_stream::build_event::Payload::NamedSetOfFiles(files)) =
+            event.payload
+        else {
+            panic!("expected named set");
+        };
+        assert_eq!(files.files[0].digest, format!("{hash}:6"));
+        assert_eq!(files.files[0].length, 6);
+        let uri = match files.files[0].file.as_ref() {
+            Some(bazel_bep_proto::build_event_stream::file::File::Uri(uri)) => uri,
+            other => panic!("expected URI, got {other:?}"),
+        };
+        assert_eq!(
+            uri,
+            &format!("bytestream://localhost:1985/remote/instance/blobs/{hash}/6")
+        );
+        std::fs::remove_dir_all(repo_path).ok();
+    }
+
+    #[tokio::test]
+    async fn upload_event_files_rejects_named_set_path_traversal() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let repo_path =
+            std::env::temp_dir().join(format!("buck2-bes-client-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&repo_path).unwrap();
+        let mut uploader = BazelArtifactUploader::new(test_artifact_upload_config());
+        uploader.repo_path = Some(repo_path.clone());
+        let mut event = bazel_bep_proto::build_event_stream::BuildEvent {
+            id: None,
+            children: Vec::new(),
+            payload: Some(
+                bazel_bep_proto::build_event_stream::build_event::Payload::NamedSetOfFiles(
+                    bazel_bep_proto::build_event_stream::NamedSetOfFiles {
+                        files: vec![bazel_bep_proto::build_event_stream::File {
+                            name: "../secret".to_owned(),
+                            path_prefix: Vec::new(),
+                            file: None,
+                            digest: format!("{hash}:3"),
+                            length: 3,
+                        }],
+                        file_sets: Vec::new(),
+                    },
+                ),
+            ),
+            last_message: false,
+        };
+
+        uploader.upload_event_files(&mut event).await;
+
+        assert!(uploader.test_writes.is_empty());
+        let Some(bazel_bep_proto::build_event_stream::build_event::Payload::NamedSetOfFiles(files)) =
+            event.payload
+        else {
+            panic!("expected named set");
+        };
+        let uri = match files.files[0].file.as_ref() {
+            Some(bazel_bep_proto::build_event_stream::file::File::Uri(uri)) => uri,
+            other => panic!("expected URI, got {other:?}"),
+        };
+        assert_eq!(
+            uri,
+            &format!("bytestream://localhost:1985/remote/instance/blobs/{hash}/3")
+        );
+        std::fs::remove_dir_all(repo_path).ok();
     }
 
     #[test]
