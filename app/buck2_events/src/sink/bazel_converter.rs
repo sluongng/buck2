@@ -168,6 +168,27 @@ struct CommandProfileBuilder {
 }
 
 #[derive(Debug, Default)]
+struct ActionDataState {
+    actions_executed: u64,
+    first_started_ms: Option<i64>,
+    last_ended_ms: Option<i64>,
+}
+
+impl ActionDataState {
+    fn record(&mut self, start_ms: i64, end_ms: i64) {
+        self.actions_executed = self.actions_executed.saturating_add(1);
+        self.first_started_ms = Some(
+            self.first_started_ms
+                .map_or(start_ms, |current| current.min(start_ms)),
+        );
+        self.last_ended_ms = Some(
+            self.last_ended_ms
+                .map_or(end_ms, |current| current.max(end_ms)),
+        );
+    }
+}
+
+#[derive(Debug, Default)]
 pub(crate) struct BazelEventConverter {
     build_metadata: BTreeMap<String, String>,
     saw_started: bool,
@@ -180,6 +201,7 @@ pub(crate) struct BazelEventConverter {
     emitted_test_child_counts: BTreeMap<TargetKey, usize>,
     emitted_configured_targets: BTreeSet<String>,
     target_outputs: BTreeMap<TargetKey, BTreeMap<String, bep::File>>,
+    target_directory_outputs: BTreeMap<TargetKey, BTreeMap<String, bep::File>>,
     target_test_statuses: BTreeMap<TargetKey, i32>,
     emitted_output_counts: BTreeMap<TargetKey, usize>,
     emitted_completed_targets: BTreeSet<TargetKey>,
@@ -188,7 +210,17 @@ pub(crate) struct BazelEventConverter {
     posted_event_ids: BTreeSet<Vec<u8>>,
     pending_patterns: Option<Vec<String>>,
     pattern_expanded_emitted: bool,
+    final_progress_emitted: bool,
     emitted_build_tool_logs: bool,
+    declared_actions_count: u64,
+    declared_artifacts_count: u64,
+    action_data: BTreeMap<String, ActionDataState>,
+    top_level_targets: BTreeSet<TargetKey>,
+    loaded_packages: BTreeSet<String>,
+    output_artifacts_seen_size: u64,
+    output_artifacts_seen_count: u64,
+    output_artifacts_from_action_cache_size: u64,
+    output_artifacts_from_action_cache_count: u64,
     command_profile: CommandProfileBuilder,
 }
 
@@ -304,6 +336,7 @@ impl BazelEventConverter {
                 self.emit_pending_pattern_expanded(&[], events);
                 self.push_convenience_symlinks_identified(&[], events);
                 self.push_finished(finished_event_from_command_end(event, command), events);
+                self.push_final_progress(events);
                 self.push_build_tool_logs(
                     build_tool_logs_event_from_command_end(
                         event,
@@ -315,11 +348,43 @@ impl BazelEventConverter {
                 );
             }
             Some(buck2_data::span_end_event::Data::Analysis(analysis)) => {
+                if let Some(declared_actions) = analysis.declared_actions {
+                    self.declared_actions_count =
+                        self.declared_actions_count.saturating_add(declared_actions);
+                }
+                if let Some(declared_artifacts) = analysis.declared_artifacts {
+                    self.declared_artifacts_count = self
+                        .declared_artifacts_count
+                        .saturating_add(declared_artifacts);
+                }
                 if let Some(completed) = completed_event_from_analysis_end(analysis) {
                     self.remember_completed(&completed);
                 }
             }
+            Some(buck2_data::span_end_event::Data::LoadPackage(load)) => {
+                if !load.path.is_empty() {
+                    self.loaded_packages.insert(load.path.clone());
+                }
+            }
             Some(buck2_data::span_end_event::Data::ActionExecution(action)) => {
+                self.record_action_data(event, span_end, action);
+                let output_size = action
+                    .outputs
+                    .iter()
+                    .fold(0u64, |total, output| total.saturating_add(output.size));
+                self.output_artifacts_seen_size =
+                    self.output_artifacts_seen_size.saturating_add(output_size);
+                self.output_artifacts_seen_count = self
+                    .output_artifacts_seen_count
+                    .saturating_add(action.outputs.len() as u64);
+                if action_outputs_from_local_action_cache(action) {
+                    self.output_artifacts_from_action_cache_size = self
+                        .output_artifacts_from_action_cache_size
+                        .saturating_add(output_size);
+                    self.output_artifacts_from_action_cache_count = self
+                        .output_artifacts_from_action_cache_count
+                        .saturating_add(action.outputs.len() as u64);
+                }
                 if let Some(action_event) = action_event(event, span_end, action) {
                     self.remember_action(&action_event);
                     self.remember_target_outputs(action);
@@ -487,6 +552,27 @@ impl BazelEventConverter {
         }
     }
 
+    fn record_action_data(
+        &mut self,
+        event: &buck2_data::BuckEvent,
+        span_end: &buck2_data::SpanEndEvent,
+        action: &buck2_data::ActionExecutionEnd,
+    ) {
+        if !action_counts_as_executed(action) {
+            return;
+        }
+        let mnemonic = action_mnemonic(action);
+        let end_ms = timestamp_millis(event.timestamp.as_ref());
+        let start_ms = start_time_from_span_end(span_end, event.timestamp.as_ref())
+            .as_ref()
+            .map(|timestamp| timestamp_millis(Some(timestamp)))
+            .unwrap_or(end_ms);
+        self.action_data
+            .entry(mnemonic)
+            .or_default()
+            .record(start_ms, end_ms);
+    }
+
     fn convert_record(
         &mut self,
         event: &buck2_data::BuckEvent,
@@ -497,9 +583,21 @@ impl BazelEventConverter {
             Some(buck2_data::record_event::Data::InvocationRecord(record)) => {
                 self.emit_pending_pattern_expanded(&[], events);
                 self.emit_completed_updates_for_actions(events);
-                events.push(build_metrics_event(record));
                 events.push(self.build_metadata_event(&build_metadata_from_invocation(record)));
                 self.push_finished(finished_event_from_invocation_record(event, record), events);
+                self.push_final_progress(events);
+                events.push(build_metrics_event(
+                    record,
+                    self.declared_actions_count,
+                    self.declared_artifacts_count,
+                    &self.action_data,
+                    self.loaded_packages.len() as u64,
+                    self.output_artifacts_seen_size,
+                    self.output_artifacts_seen_count,
+                    self.output_artifacts_from_action_cache_size,
+                    self.output_artifacts_from_action_cache_count,
+                    top_level_artifact_metrics(&self.top_level_targets, &self.target_outputs),
+                ));
                 self.push_build_tool_logs(
                     build_tool_logs_event_from_invocation(record, &self.command_profile),
                     events,
@@ -508,6 +606,9 @@ impl BazelEventConverter {
             Some(buck2_data::record_event::Data::BuildGraphStats(stats)) => {
                 self.emit_pending_pattern_expanded(&stats.build_targets, events);
                 for target in &stats.build_targets {
+                    if let Some(key) = target_key_from_build_target(target) {
+                        self.top_level_targets.insert(key);
+                    }
                     self.push_configured_event(configured_event_from_build_target(target), events);
                     if let Some(completed) = completed_event_from_build_target(target) {
                         self.remember_completed(&completed);
@@ -675,7 +776,6 @@ impl BazelEventConverter {
             build_metadata_id(),
             configuration_event_id(DEFAULT_CONFIGURATION_ID),
             workspace_config_id(),
-            build_tool_logs_id(),
             build_finished_id(),
         ];
         if let Some(command) = command {
@@ -738,6 +838,15 @@ impl BazelEventConverter {
             })),
             last_message: false,
         }
+    }
+
+    fn push_final_progress(&mut self, events: &mut Vec<bep::BuildEvent>) {
+        if self.final_progress_emitted {
+            return;
+        }
+        self.final_progress_emitted = true;
+        events.push(final_progress_event(self.progress_count));
+        self.progress_count = self.progress_count.saturating_add(1);
     }
 
     fn remember_completed(&mut self, event: &bep::BuildEvent) {
@@ -834,6 +943,7 @@ impl BazelEventConverter {
                 key.configuration.clone(),
             ));
             let (named_set_events, output_group) = self.output_group_events(&key, &mut children);
+            let directory_output = self.directory_outputs_for_target(&key);
             events.extend(named_set_events);
             events.push(completed_event_with_children_and_outputs(
                 key.label.clone(),
@@ -841,6 +951,7 @@ impl BazelEventConverter {
                 state.success,
                 children,
                 output_group,
+                directory_output,
             ));
             events.push(target_summary_event(
                 &key,
@@ -870,11 +981,18 @@ impl BazelEventConverter {
             label,
             configuration: configuration_id_for_target(target),
         };
-        let outputs = self.target_outputs.entry(key).or_default();
+        let outputs = self.target_outputs.entry(key.clone()).or_default();
         for output in &action.outputs {
             let Some(file) = bep_file_from_action_output(output) else {
                 continue;
             };
+            if output.is_directory {
+                self.target_directory_outputs
+                    .entry(key.clone())
+                    .or_default()
+                    .entry(file.name.clone())
+                    .or_insert_with(|| file.clone());
+            }
             outputs.entry(file.name.clone()).or_insert(file);
         }
     }
@@ -916,6 +1034,14 @@ impl BazelEventConverter {
                 inline_files: Vec::new(),
             }],
         )
+    }
+
+    fn directory_outputs_for_target(&self, key: &TargetKey) -> Vec<bep::File> {
+        self.target_directory_outputs
+            .get(key)
+            .into_iter()
+            .flat_map(|outputs| outputs.values().cloned())
+            .collect()
     }
 
     fn remember_test_case(&mut self, result: &buck2_data::TestResult) {
@@ -1377,6 +1503,18 @@ fn progress_id(opaque_count: i32) -> bep::BuildEventId {
     }
 }
 
+fn final_progress_event(opaque_count: i32) -> bep::BuildEvent {
+    bep::BuildEvent {
+        id: Some(progress_id(opaque_count)),
+        children: Vec::new(),
+        payload: Some(build_event::Payload::Progress(bep::Progress {
+            stdout: String::new(),
+            stderr: String::new(),
+        })),
+        last_message: false,
+    }
+}
+
 fn options_parsed_id() -> bep::BuildEventId {
     bep::BuildEventId {
         id: Some(build_event_id::Id::OptionsParsed(
@@ -1463,6 +1601,13 @@ fn target_key_from_action_id(id: &build_event_id::ActionCompletedId) -> Option<T
     Some(TargetKey {
         label: id.label.clone(),
         configuration: configuration_id_from_bep(id.configuration.as_ref()),
+    })
+}
+
+fn target_key_from_build_target(target: &buck2_data::BuildTarget) -> Option<TargetKey> {
+    Some(TargetKey {
+        label: normalize_buck_label(&target.target)?,
+        configuration: configuration_id_for_build_target(target),
     })
 }
 
@@ -2248,15 +2393,97 @@ fn i32_saturating_from_u64(count: u64) -> i32 {
     i32::try_from(count).unwrap_or(i32::MAX)
 }
 
-fn build_metrics_event(record: &buck2_data::InvocationRecord) -> bep::BuildEvent {
-    let actions_executed =
-        record.run_local_count + record.run_remote_count + record.run_action_cache_count;
+fn i64_saturating_from_u64(count: u64) -> i64 {
+    i64::try_from(count).unwrap_or(i64::MAX)
+}
+
+const MAX_ACTION_DATA: usize = 20;
+
+fn action_data_events(
+    action_data: &BTreeMap<String, ActionDataState>,
+) -> Vec<bep::build_metrics::action_summary::ActionData> {
+    let mut entries = action_data.iter().collect::<Vec<_>>();
+    entries.sort_by(|(left_mnemonic, left), (right_mnemonic, right)| {
+        right
+            .actions_executed
+            .cmp(&left.actions_executed)
+            .then_with(|| left_mnemonic.cmp(right_mnemonic))
+    });
+    entries
+        .into_iter()
+        .take(MAX_ACTION_DATA)
+        .map(
+            |(mnemonic, data)| bep::build_metrics::action_summary::ActionData {
+                mnemonic: mnemonic.clone(),
+                actions_executed: i64_saturating_from_u64(data.actions_executed),
+                first_started_ms: data.first_started_ms.unwrap_or_default(),
+                last_ended_ms: data.last_ended_ms.unwrap_or_default(),
+                system_time: None,
+                user_time: None,
+                actions_created: 0,
+            },
+        )
+        .collect()
+}
+
+fn top_level_artifact_metrics(
+    top_level_targets: &BTreeSet<TargetKey>,
+    target_outputs: &BTreeMap<TargetKey, BTreeMap<String, bep::File>>,
+) -> Option<bep::build_metrics::artifact_metrics::FilesMetric> {
+    let mut size_in_bytes = 0u64;
+    let mut count = 0u64;
+    for target in top_level_targets {
+        let Some(outputs) = target_outputs.get(target) else {
+            continue;
+        };
+        count = count.saturating_add(outputs.len() as u64);
+        for output in outputs.values() {
+            if let Ok(length) = u64::try_from(output.length) {
+                size_in_bytes = size_in_bytes.saturating_add(length);
+            }
+        }
+    }
+    (count > 0).then(|| bep::build_metrics::artifact_metrics::FilesMetric {
+        size_in_bytes: i64_saturating_from_u64(size_in_bytes),
+        count: i32_saturating_from_u64(count),
+    })
+}
+
+fn build_metrics_event(
+    record: &buck2_data::InvocationRecord,
+    declared_actions_count: u64,
+    declared_artifacts_count: u64,
+    action_data: &BTreeMap<String, ActionDataState>,
+    loaded_packages_count: u64,
+    output_artifacts_seen_size: u64,
+    output_artifacts_seen_count: u64,
+    output_artifacts_from_action_cache_size: u64,
+    output_artifacts_from_action_cache_count: u64,
+    top_level_artifacts: Option<bep::build_metrics::artifact_metrics::FilesMetric>,
+) -> bep::BuildEvent {
+    let remote_cache_hits = record
+        .run_action_cache_count
+        .saturating_add(record.run_remote_dep_file_cache_count);
+    let actions_executed = record
+        .run_local_count
+        .saturating_add(record.run_remote_count)
+        .saturating_add(remote_cache_hits);
+    let actions_created = if declared_actions_count > 0 {
+        declared_actions_count
+    } else {
+        actions_executed
+    };
     let runner_count = [
         ("local", record.run_local_count, "local"),
         ("remote", record.run_remote_count, "remote"),
         (
             "remote cache hit",
             record.run_action_cache_count,
+            "remote-cache",
+        ),
+        (
+            "remote dep file cache hit",
+            record.run_remote_dep_file_cache_count,
             "remote-cache",
         ),
         ("skipped", record.run_skipped_count, "skipped"),
@@ -2291,12 +2518,11 @@ fn build_metrics_event(record: &buck2_data::InvocationRecord) -> bep::BuildEvent
         children: Vec::new(),
         payload: Some(build_event::Payload::BuildMetrics(bep::BuildMetrics {
             action_summary: Some(bep::build_metrics::ActionSummary {
-                actions_created: i64::try_from(actions_executed).unwrap_or(i64::MAX),
-                actions_created_not_including_aspects: i64::try_from(actions_executed)
-                    .unwrap_or(i64::MAX),
-                actions_executed: i64::try_from(actions_executed).unwrap_or(i64::MAX),
-                action_data: Vec::new(),
-                remote_cache_hits: i64::try_from(record.run_action_cache_count).unwrap_or(i64::MAX),
+                actions_created: i64_saturating_from_u64(actions_created),
+                actions_created_not_including_aspects: i64_saturating_from_u64(actions_created),
+                actions_executed: i64_saturating_from_u64(actions_executed),
+                action_data: action_data_events(action_data),
+                remote_cache_hits: i64_saturating_from_u64(remote_cache_hits),
                 runner_count,
                 action_cache_statistics: action_cache_statistics(record),
             }),
@@ -2316,7 +2542,12 @@ fn build_metrics_event(record: &buck2_data::InvocationRecord) -> bep::BuildEvent
                     targets_configured_not_including_aspects: count,
                 }
             }),
-            package_metrics: None,
+            package_metrics: (loaded_packages_count > 0).then(|| {
+                bep::build_metrics::PackageMetrics {
+                    packages_loaded: i64::try_from(loaded_packages_count).unwrap_or(i64::MAX),
+                    package_load_metrics: Vec::new(),
+                }
+            }),
             timing_metrics: Some(bep::build_metrics::TimingMetrics {
                 cpu_time_in_ms: cpu_time_millis(record),
                 wall_time_in_ms,
@@ -2346,18 +2577,31 @@ fn build_metrics_event(record: &buck2_data::InvocationRecord) -> bep::BuildEvent
             artifact_metrics: Some(bep::build_metrics::ArtifactMetrics {
                 source_artifacts_read: None,
                 output_artifacts_seen: Some(bep::build_metrics::artifact_metrics::FilesMetric {
-                    size_in_bytes: record
-                        .materialization_output_size
-                        .map(|size| i64::try_from(size).unwrap_or(i64::MAX))
-                        .unwrap_or_default(),
-                    count: 0,
+                    size_in_bytes: if output_artifacts_seen_count > 0 {
+                        i64::try_from(output_artifacts_seen_size).unwrap_or(i64::MAX)
+                    } else {
+                        record
+                            .materialization_output_size
+                            .map(|size| i64::try_from(size).unwrap_or(i64::MAX))
+                            .unwrap_or_default()
+                    },
+                    count: i32_saturating_from_u64(output_artifacts_seen_count),
                 }),
-                output_artifacts_from_action_cache: None,
-                top_level_artifacts: None,
+                output_artifacts_from_action_cache: (output_artifacts_from_action_cache_count > 0)
+                    .then(|| bep::build_metrics::artifact_metrics::FilesMetric {
+                        size_in_bytes: i64_saturating_from_u64(
+                            output_artifacts_from_action_cache_size,
+                        ),
+                        count: i32_saturating_from_u64(output_artifacts_from_action_cache_count),
+                    }),
+                top_level_artifacts,
             }),
-            build_graph_metrics: None,
+            build_graph_metrics: build_graph_metrics(
+                declared_actions_count,
+                declared_artifacts_count,
+            ),
             worker_metrics: Vec::new(),
-            network_metrics: None,
+            network_metrics: network_metrics(record),
             worker_pool_metrics: None,
             dynamic_execution_metrics: None,
             remote_analysis_cache_statistics: None,
@@ -2382,6 +2626,75 @@ fn snapshot_cpu_time_us(snapshot: &buck2_data::Snapshot) -> u64 {
     snapshot
         .buck2_user_cpu_us
         .saturating_add(snapshot.buck2_system_cpu_us)
+}
+
+fn build_graph_metrics(
+    declared_actions_count: u64,
+    declared_artifacts_count: u64,
+) -> Option<bep::build_metrics::BuildGraphMetrics> {
+    if declared_actions_count == 0 && declared_artifacts_count == 0 {
+        return None;
+    }
+    let action_count = i32_saturating_from_u64(declared_actions_count);
+    Some(bep::build_metrics::BuildGraphMetrics {
+        action_lookup_value_count: 0,
+        action_lookup_value_count_not_including_aspects: 0,
+        action_count,
+        action_count_not_including_aspects: action_count,
+        input_file_configured_target_count: 0,
+        output_file_configured_target_count: 0,
+        other_configured_target_count: 0,
+        output_artifact_count: i32_saturating_from_u64(declared_artifacts_count),
+        post_invocation_skyframe_node_count: 0,
+        dirtied_values: Vec::new(),
+        changed_values: Vec::new(),
+        built_values: Vec::new(),
+        cleaned_values: Vec::new(),
+        evaluated_values: Vec::new(),
+        rule_class: Vec::new(),
+        aspect: Vec::new(),
+    })
+}
+
+fn network_metrics(
+    record: &buck2_data::InvocationRecord,
+) -> Option<bep::build_metrics::NetworkMetrics> {
+    let first = record.first_snapshot.as_ref()?;
+    let last = record.last_snapshot.as_ref()?;
+    let mut bytes_sent = 0u64;
+    let mut bytes_recv = 0u64;
+    for (interface, first_stats) in &first.network_interface_stats {
+        let Some(last_stats) = last.network_interface_stats.get(interface) else {
+            continue;
+        };
+        bytes_sent = bytes_sent.saturating_add(network_counter_delta(
+            first_stats.tx_bytes,
+            last_stats.tx_bytes,
+        ));
+        bytes_recv = bytes_recv.saturating_add(network_counter_delta(
+            first_stats.rx_bytes,
+            last_stats.rx_bytes,
+        ));
+    }
+    if bytes_sent == 0 || bytes_recv == 0 {
+        return None;
+    }
+    Some(bep::build_metrics::NetworkMetrics {
+        system_network_stats: Some(bep::build_metrics::network_metrics::SystemNetworkStats {
+            bytes_sent,
+            bytes_recv,
+            packets_sent: 0,
+            packets_recv: 0,
+            peak_bytes_sent_per_sec: 0,
+            peak_bytes_recv_per_sec: 0,
+            peak_packets_sent_per_sec: 0,
+            peak_packets_recv_per_sec: 0,
+        }),
+    })
+}
+
+fn network_counter_delta(first: u64, last: u64) -> u64 {
+    if last < first { last } else { last - first }
 }
 
 fn duration_millis(duration: &prost_types::Duration) -> i64 {
@@ -3599,7 +3912,14 @@ fn completed_event_with_children(
     success: bool,
     children: Vec<bep::BuildEventId>,
 ) -> bep::BuildEvent {
-    completed_event_with_children_and_outputs(label, configuration, success, children, Vec::new())
+    completed_event_with_children_and_outputs(
+        label,
+        configuration,
+        success,
+        children,
+        Vec::new(),
+        Vec::new(),
+    )
 }
 
 fn completed_event_with_children_and_outputs(
@@ -3608,6 +3928,7 @@ fn completed_event_with_children_and_outputs(
     success: bool,
     children: Vec<bep::BuildEventId>,
     output_group: Vec<bep::OutputGroup>,
+    directory_output: Vec<bep::File>,
 ) -> bep::BuildEvent {
     bep::BuildEvent {
         id: Some(target_completed_id(label.clone(), configuration)),
@@ -3620,7 +3941,7 @@ fn completed_event_with_children_and_outputs(
             important_output: Vec::new(),
             tag: Vec::new(),
             test_timeout_seconds: 0,
-            directory_output: Vec::new(),
+            directory_output,
             failure_detail: (!success)
                 .then(|| execution_failure_detail(format!("Target failed: {label}"))),
             test_timeout: None,
@@ -3768,7 +4089,12 @@ fn finished_event_from_invocation_record(
         exit_name = record_exit_name.clone();
     }
 
-    finished_event(event.timestamp.clone(), exit_code, exit_name)
+    finished_event(
+        event.timestamp.clone(),
+        exit_code,
+        exit_name,
+        vec![build_tool_logs_id(), build_metrics_id()],
+    )
 }
 
 fn finished_event_from_command_end(
@@ -3781,19 +4107,25 @@ fn finished_event_from_command_end(
         (1, "FAILED")
     };
 
-    finished_event(event.timestamp.clone(), exit_code, exit_name)
+    finished_event(
+        event.timestamp.clone(),
+        exit_code,
+        exit_name,
+        vec![build_tool_logs_id()],
+    )
 }
 
 fn finished_event(
     timestamp: Option<Timestamp>,
     exit_code: i32,
     exit_name: impl Into<String>,
+    children: Vec<bep::BuildEventId>,
 ) -> bep::BuildEvent {
     let exit_name = exit_name.into();
     let finish_time_millis = timestamp_millis(timestamp.as_ref());
     bep::BuildEvent {
         id: Some(build_finished_id()),
-        children: Vec::new(),
+        children,
         payload: Some(build_event::Payload::Finished(bep::BuildFinished {
             overall_success: exit_code == 0,
             finish_time_millis,
@@ -4268,6 +4600,21 @@ fn action_mnemonic(action: &buck2_data::ActionExecutionEnd) -> String {
         .ok()
         .map(|kind| format!("{kind:?}"))
         .unwrap_or_else(|| "Action".to_owned())
+}
+
+fn action_counts_as_executed(action: &buck2_data::ActionExecutionEnd) -> bool {
+    !matches!(
+        buck2_data::ActionExecutionKind::try_from(action.execution_kind),
+        Ok(buck2_data::ActionExecutionKind::LocalActionCache)
+            | Ok(buck2_data::ActionExecutionKind::LocalDepFile)
+    )
+}
+
+fn action_outputs_from_local_action_cache(action: &buck2_data::ActionExecutionEnd) -> bool {
+    matches!(
+        buck2_data::ActionExecutionKind::try_from(action.execution_kind),
+        Ok(buck2_data::ActionExecutionKind::LocalActionCache)
+    )
 }
 
 fn start_time_from_span_end(
@@ -5367,6 +5714,60 @@ mod tests {
     #[test]
     fn invocation_record_emits_build_metrics() {
         let mut converter = BazelEventConverter::default();
+        converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::Analysis(
+                        buck2_data::AnalysisEnd {
+                            target: Some(buck2_data::analysis_end::Target::StandardTarget(
+                                configured_target(),
+                            )),
+                            declared_actions: Some(23),
+                            declared_artifacts: Some(31),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+        );
+        converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::ActionExecution(Box::new(
+                        buck2_data::ActionExecutionEnd {
+                            key: Some(buck2_data::ActionKey {
+                                owner: Some(buck2_data::action_key::Owner::TargetLabel(
+                                    configured_target(),
+                                )),
+                                key: "action-key".to_owned(),
+                                ..Default::default()
+                            }),
+                            outputs: vec![
+                                buck2_data::ActionOutput {
+                                    tiny_digest: "buck-out/main.o".to_owned(),
+                                    path: "buck-out/main.o".to_owned(),
+                                    digest: "abcd:10".to_owned(),
+                                    size: 10,
+                                    is_directory: false,
+                                },
+                                buck2_data::ActionOutput {
+                                    tiny_digest: "buck-out/main.d".to_owned(),
+                                    path: "buck-out/main.d".to_owned(),
+                                    digest: "efgh:9".to_owned(),
+                                    size: 9,
+                                    is_directory: false,
+                                },
+                            ],
+                            ..Default::default()
+                        },
+                    ))),
+                    ..Default::default()
+                },
+            )),
+        );
         let event = trace_event(buck2_data::buck_event::Data::Record(
             buck2_data::RecordEvent {
                 data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
@@ -5375,6 +5776,7 @@ mod tests {
                         run_local_count: 2,
                         run_remote_count: 3,
                         run_action_cache_count: 5,
+                        run_remote_dep_file_cache_count: 7,
                         client_walltime: Some(prost_types::Duration {
                             seconds: 1,
                             nanos: 500_000_000,
@@ -5386,11 +5788,31 @@ mod tests {
                         first_snapshot: Some(buck2_data::Snapshot {
                             buck2_user_cpu_us: 10_000,
                             buck2_system_cpu_us: 20_000,
+                            network_interface_stats: [(
+                                "eth0".to_owned(),
+                                buck2_data::NetworkInterfaceStats {
+                                    tx_bytes: 1_000,
+                                    rx_bytes: 2_000,
+                                    network_kind: buck2_data::NetworkKind::Ethernet as i32,
+                                },
+                            )]
+                            .into_iter()
+                            .collect(),
                             ..Default::default()
                         }),
                         last_snapshot: Some(buck2_data::Snapshot {
                             buck2_user_cpu_us: 1_210_000,
                             buck2_system_cpu_us: 820_000,
+                            network_interface_stats: [(
+                                "eth0".to_owned(),
+                                buck2_data::NetworkInterfaceStats {
+                                    tx_bytes: 7_000,
+                                    rx_bytes: 11_000,
+                                    network_kind: buck2_data::NetworkKind::Ethernet as i32,
+                                },
+                            )]
+                            .into_iter()
+                            .collect(),
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -5400,6 +5822,22 @@ mod tests {
         ));
 
         let events = converter.convert(1, &event);
+        let finished_index = events
+            .iter()
+            .position(is_build_finished_event)
+            .expect("build finished event");
+        assert!(
+            events[finished_index]
+                .children
+                .iter()
+                .any(|child| child == &build_tool_logs_id())
+        );
+        assert!(
+            events[finished_index]
+                .children
+                .iter()
+                .any(|child| child == &build_metrics_id())
+        );
         let metrics = events
             .iter()
             .find_map(|event| match event.payload.as_ref() {
@@ -5408,8 +5846,15 @@ mod tests {
             })
             .expect("build metrics event");
         let action_summary = metrics.action_summary.as_ref().unwrap();
-        assert_eq!(action_summary.actions_executed, 10);
-        assert_eq!(action_summary.remote_cache_hits, 5);
+        assert_eq!(action_summary.actions_created, 23);
+        assert_eq!(action_summary.actions_created_not_including_aspects, 23);
+        assert_eq!(action_summary.actions_executed, 17);
+        assert_eq!(action_summary.remote_cache_hits, 12);
+        assert!(action_summary.runner_count.iter().any(|count| {
+            count.name == "remote dep file cache hit"
+                && count.count == 7
+                && count.exec_kind == "remote-cache"
+        }));
         let action_cache_statistics = action_summary.action_cache_statistics.as_ref().unwrap();
         assert_eq!(action_cache_statistics.hits, 5);
         assert_eq!(action_cache_statistics.misses, 5);
@@ -5427,10 +5872,33 @@ mod tests {
             metrics.timing_metrics.as_ref().unwrap().cpu_time_in_ms,
             2000
         );
+        let network_stats = metrics
+            .network_metrics
+            .as_ref()
+            .and_then(|metrics| metrics.system_network_stats.as_ref())
+            .expect("system network stats");
+        assert_eq!(network_stats.bytes_sent, 6_000);
+        assert_eq!(network_stats.bytes_recv, 9_000);
+        assert_eq!(network_stats.packets_sent, 0);
+        assert_eq!(network_stats.packets_recv, 0);
         assert_eq!(
             metrics.target_metrics.as_ref().unwrap().targets_configured,
             7
         );
+        let graph_metrics = metrics
+            .build_graph_metrics
+            .as_ref()
+            .expect("build graph metrics");
+        assert_eq!(graph_metrics.action_count, 23);
+        assert_eq!(graph_metrics.action_count_not_including_aspects, 23);
+        assert_eq!(graph_metrics.output_artifact_count, 31);
+        let output_artifacts_seen = metrics
+            .artifact_metrics
+            .as_ref()
+            .and_then(|metrics| metrics.output_artifacts_seen.as_ref())
+            .expect("output artifacts seen metric");
+        assert_eq!(output_artifacts_seen.size_in_bytes, 19);
+        assert_eq!(output_artifacts_seen.count, 2);
         let logs = events
             .iter()
             .find_map(|event| match event.payload.as_ref() {
@@ -5450,6 +5918,7 @@ mod tests {
         assert_eq!(summary["outcome"], "success");
         assert_eq!(summary["re_session_id"], "re-session");
         assert_eq!(summary["actions"]["remote_cache"], 5);
+        assert_eq!(summary["actions"]["remote_dep_file_cache"], 7);
         let profile_contents = match logs.log[1].file.as_ref() {
             Some(bep::file::File::Contents(contents)) => contents,
             other => panic!("expected inline command profile, got {other:?}"),
@@ -5469,6 +5938,330 @@ mod tests {
                 .iter()
                 .any(|event| event["name"] == "buck2 build")
         );
+    }
+
+    #[test]
+    fn invocation_record_emits_package_metrics() {
+        let mut converter = BazelEventConverter::default();
+        for (sequence_number, path) in [(1, "pkg"), (2, "pkg/dep"), (3, "pkg")] {
+            converter.convert(
+                sequence_number,
+                &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                    buck2_data::SpanEndEvent {
+                        data: Some(buck2_data::span_end_event::Data::LoadPackage(
+                            buck2_data::LoadPackageEnd {
+                                path: path.to_owned(),
+                            },
+                        )),
+                        ..Default::default()
+                    },
+                )),
+            );
+        }
+
+        let events = converter.convert(
+            4,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
+                        buck2_data::InvocationRecord {
+                            outcome: Some(buck2_data::InvocationOutcome::Success as i32),
+                            ..Default::default()
+                        },
+                    ))),
+                },
+            )),
+        );
+
+        let metrics = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::BuildMetrics(metrics)) => Some(metrics),
+                _ => None,
+            })
+            .expect("build metrics event");
+        let package_metrics = metrics.package_metrics.as_ref().expect("package metrics");
+        assert_eq!(package_metrics.packages_loaded, 2);
+        assert!(package_metrics.package_load_metrics.is_empty());
+    }
+
+    #[test]
+    fn invocation_record_emits_action_cache_artifact_metrics() {
+        let mut converter = BazelEventConverter::default();
+        converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::ActionExecution(Box::new(
+                        buck2_data::ActionExecutionEnd {
+                            execution_kind: buck2_data::ActionExecutionKind::LocalActionCache
+                                as i32,
+                            outputs: vec![
+                                buck2_data::ActionOutput {
+                                    tiny_digest: "buck-out/local.o".to_owned(),
+                                    path: "buck-out/local.o".to_owned(),
+                                    digest: "abcd:10".to_owned(),
+                                    size: 10,
+                                    is_directory: false,
+                                },
+                                buck2_data::ActionOutput {
+                                    tiny_digest: "buck-out/local.d".to_owned(),
+                                    path: "buck-out/local.d".to_owned(),
+                                    digest: "efgh:9".to_owned(),
+                                    size: 9,
+                                    is_directory: false,
+                                },
+                            ],
+                            ..Default::default()
+                        },
+                    ))),
+                    ..Default::default()
+                },
+            )),
+        );
+        converter.convert(
+            2,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::ActionExecution(Box::new(
+                        buck2_data::ActionExecutionEnd {
+                            execution_kind: buck2_data::ActionExecutionKind::ActionCache as i32,
+                            outputs: vec![buck2_data::ActionOutput {
+                                tiny_digest: "buck-out/remote.o".to_owned(),
+                                path: "buck-out/remote.o".to_owned(),
+                                digest: "ijkl:4".to_owned(),
+                                size: 4,
+                                is_directory: false,
+                            }],
+                            ..Default::default()
+                        },
+                    ))),
+                    ..Default::default()
+                },
+            )),
+        );
+
+        let events = converter.convert(
+            3,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
+                        buck2_data::InvocationRecord {
+                            outcome: Some(buck2_data::InvocationOutcome::Success as i32),
+                            ..Default::default()
+                        },
+                    ))),
+                },
+            )),
+        );
+
+        let metrics = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::BuildMetrics(metrics)) => Some(metrics),
+                _ => None,
+            })
+            .expect("build metrics event");
+        let artifact_metrics = metrics.artifact_metrics.as_ref().unwrap();
+        let output_artifacts_seen = artifact_metrics.output_artifacts_seen.as_ref().unwrap();
+        assert_eq!(output_artifacts_seen.size_in_bytes, 23);
+        assert_eq!(output_artifacts_seen.count, 3);
+        let output_artifacts_from_action_cache = artifact_metrics
+            .output_artifacts_from_action_cache
+            .as_ref()
+            .expect("output artifacts from action cache");
+        assert_eq!(output_artifacts_from_action_cache.size_in_bytes, 19);
+        assert_eq!(output_artifacts_from_action_cache.count, 2);
+    }
+
+    #[test]
+    fn invocation_record_emits_top_level_artifact_metrics() {
+        let mut converter = BazelEventConverter::default();
+        converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::BuildGraphStats(
+                        buck2_data::BuildGraphStats {
+                            build_targets: vec![
+                                buck2_data::BuildTarget {
+                                    target: "//:main".to_owned(),
+                                    configuration: "cfg".to_owned(),
+                                    configured_graph_size: None,
+                                },
+                                buck2_data::BuildTarget {
+                                    target: "//:other".to_owned(),
+                                    configuration: "cfg".to_owned(),
+                                    configured_graph_size: None,
+                                },
+                            ],
+                        },
+                    )),
+                },
+            )),
+        );
+
+        let main = configured_target_with_package("", "main", "cfg");
+        let other = configured_target_with_package("", "other", "cfg");
+        let dep = configured_target_with_package("", "dep", "cfg");
+        for (sequence_number, target, action_key, output_path, size) in [
+            (2, main, "main-action", "buck-out/shared.o", 10),
+            (3, other, "other-action", "buck-out/shared.o", 10),
+            (4, dep, "dep-action", "buck-out/dep.o", 5),
+        ] {
+            converter.convert(
+                sequence_number,
+                &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                    buck2_data::SpanEndEvent {
+                        data: Some(buck2_data::span_end_event::Data::ActionExecution(Box::new(
+                            buck2_data::ActionExecutionEnd {
+                                key: Some(buck2_data::ActionKey {
+                                    key: action_key.to_owned(),
+                                    owner: Some(buck2_data::action_key::Owner::TargetLabel(target)),
+                                    ..Default::default()
+                                }),
+                                outputs: vec![buck2_data::ActionOutput {
+                                    tiny_digest: output_path.to_owned(),
+                                    path: output_path.to_owned(),
+                                    digest: format!("{action_key}:{size}"),
+                                    size,
+                                    is_directory: false,
+                                }],
+                                ..Default::default()
+                            },
+                        ))),
+                        ..Default::default()
+                    },
+                )),
+            );
+        }
+
+        let events = converter.convert(
+            5,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
+                        buck2_data::InvocationRecord {
+                            outcome: Some(buck2_data::InvocationOutcome::Success as i32),
+                            ..Default::default()
+                        },
+                    ))),
+                },
+            )),
+        );
+
+        let metrics = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::BuildMetrics(metrics)) => Some(metrics),
+                _ => None,
+            })
+            .expect("build metrics event");
+        let artifact_metrics = metrics.artifact_metrics.as_ref().unwrap();
+        let output_artifacts_seen = artifact_metrics.output_artifacts_seen.as_ref().unwrap();
+        assert_eq!(output_artifacts_seen.size_in_bytes, 25);
+        assert_eq!(output_artifacts_seen.count, 3);
+        let top_level_artifacts = artifact_metrics
+            .top_level_artifacts
+            .as_ref()
+            .expect("top level artifacts");
+        assert_eq!(top_level_artifacts.size_in_bytes, 20);
+        assert_eq!(top_level_artifacts.count, 2);
+    }
+
+    #[test]
+    fn invocation_record_emits_action_data() {
+        let mut converter = BazelEventConverter::default();
+
+        for (sequence_number, category, execution_kind, end_micros, duration_ms) in [
+            (
+                1,
+                "cxx_compile",
+                buck2_data::ActionExecutionKind::Local,
+                20_000,
+                10,
+            ),
+            (
+                2,
+                "genrule",
+                buck2_data::ActionExecutionKind::Remote,
+                40_000,
+                5,
+            ),
+            (
+                3,
+                "cxx_compile",
+                buck2_data::ActionExecutionKind::ActionCache,
+                50_000,
+                15,
+            ),
+            (
+                4,
+                "local_cache",
+                buck2_data::ActionExecutionKind::LocalActionCache,
+                60_000,
+                5,
+            ),
+        ] {
+            converter.convert(
+                sequence_number,
+                &trace_event_at(
+                    sequence_number as u64,
+                    1,
+                    end_micros,
+                    buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+                        data: Some(buck2_data::span_end_event::Data::ActionExecution(Box::new(
+                            buck2_data::ActionExecutionEnd {
+                                name: Some(buck2_data::ActionName {
+                                    category: category.to_owned(),
+                                    identifier: "main".to_owned(),
+                                }),
+                                execution_kind: execution_kind as i32,
+                                ..Default::default()
+                            },
+                        ))),
+                        duration: Some(prost_types::Duration {
+                            seconds: 0,
+                            nanos: duration_ms * 1_000_000,
+                        }),
+                        ..Default::default()
+                    }),
+                ),
+            );
+        }
+
+        let events = converter.convert(
+            5,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
+                        buck2_data::InvocationRecord {
+                            outcome: Some(buck2_data::InvocationOutcome::Success as i32),
+                            ..Default::default()
+                        },
+                    ))),
+                },
+            )),
+        );
+
+        let metrics = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::BuildMetrics(metrics)) => Some(metrics),
+                _ => None,
+            })
+            .expect("build metrics event");
+        let action_data = &metrics.action_summary.as_ref().unwrap().action_data;
+        assert_eq!(action_data.len(), 2);
+        assert_eq!(action_data[0].mnemonic, "cxx_compile");
+        assert_eq!(action_data[0].actions_executed, 2);
+        assert_eq!(action_data[0].actions_created, 0);
+        assert_eq!(action_data[0].first_started_ms, 1010);
+        assert_eq!(action_data[0].last_ended_ms, 1050);
+        assert_eq!(action_data[1].mnemonic, "genrule");
+        assert_eq!(action_data[1].actions_executed, 1);
+        assert_eq!(action_data[1].first_started_ms, 1035);
+        assert_eq!(action_data[1].last_ended_ms, 1040);
     }
 
     #[test]
@@ -5506,6 +6299,7 @@ mod tests {
             Some(build_event::Payload::Finished(finished)) => finished,
             _ => unreachable!("finished index was matched above"),
         };
+        assert_eq!(events[finished_index].children, vec![build_tool_logs_id()]);
         assert!(!finished.overall_success);
         assert_eq!(finished.finish_time_millis, 1_000);
         let exit_code = finished.exit_code.as_ref().expect("exit code");
@@ -5529,6 +6323,18 @@ mod tests {
         assert_eq!(logs_index, events.len() - 1);
         assert!(!events[finished_index].last_message);
         assert!(events[logs_index].last_message);
+        let final_progress_index = events
+            .iter()
+            .position(|event| {
+                event.id.as_ref() == Some(&progress_id(0))
+                    && matches!(
+                        event.payload.as_ref(),
+                        Some(build_event::Payload::Progress(_))
+                    )
+            })
+            .expect("final progress event");
+        assert!(finished_index < final_progress_index);
+        assert!(final_progress_index < logs_index);
         assert_eq!(logs.log[1].name, COMMAND_PROFILE_NAME);
         let profile_contents = match logs.log[1].file.as_ref() {
             Some(bep::file::File::Contents(contents)) => contents,
@@ -5616,6 +6422,20 @@ mod tests {
         assert_eq!(logs_index, final_events.len() - 1);
         assert!(!final_events[finished_index].last_message);
         assert!(final_events[logs_index].last_message);
+        assert!(final_events.iter().any(|event| {
+            event.id.as_ref() == Some(&progress_id(1))
+                && matches!(
+                    event.payload.as_ref(),
+                    Some(build_event::Payload::Progress(_))
+                )
+        }));
+        assert!(!final_events.iter().any(|event| {
+            event.id.as_ref() == Some(&progress_id(1))
+                && matches!(
+                    event.payload.as_ref(),
+                    Some(build_event::Payload::Aborted(_))
+                )
+        }));
     }
 
     #[test]
@@ -6061,6 +6881,86 @@ mod tests {
             event.payload,
             Some(build_event::Payload::NamedSetOfFiles(_))
         )));
+    }
+
+    #[test]
+    fn final_completed_update_reports_directory_outputs() {
+        let mut converter = BazelEventConverter::default();
+        let target = configured_target_with_package("root//", "main", "cfg");
+
+        converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::Analysis(
+                        buck2_data::AnalysisEnd {
+                            target: Some(buck2_data::analysis_end::Target::StandardTarget(
+                                target.clone(),
+                            )),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+        );
+        converter.convert(
+            2,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::ActionExecution(Box::new(
+                        buck2_data::ActionExecutionEnd {
+                            key: Some(buck2_data::ActionKey {
+                                key: "directory-action".to_owned(),
+                                owner: Some(buck2_data::action_key::Owner::TargetLabel(target)),
+                                ..Default::default()
+                            }),
+                            outputs: vec![buck2_data::ActionOutput {
+                                tiny_digest: "buck-out/main.resources".to_owned(),
+                                path: "buck-out/main.resources".to_owned(),
+                                digest: "tree-digest:42".to_owned(),
+                                size: 42,
+                                is_directory: true,
+                            }],
+                            ..Default::default()
+                        },
+                    ))),
+                    ..Default::default()
+                },
+            )),
+        );
+        let final_events = converter.convert(
+            3,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
+                        buck2_data::InvocationRecord {
+                            outcome: Some(buck2_data::InvocationOutcome::Success as i32),
+                            ..Default::default()
+                        },
+                    ))),
+                },
+            )),
+        );
+
+        let completed = final_events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::Completed(completed))
+                    if !completed.directory_output.is_empty() =>
+                {
+                    Some(completed)
+                }
+                _ => None,
+            })
+            .expect("TargetComplete with directory output");
+        assert_eq!(completed.directory_output.len(), 1);
+        let directory = &completed.directory_output[0];
+        assert_eq!(directory.name, "buck-out/main.resources");
+        assert_eq!(directory.digest, "tree-digest:42");
+        assert_eq!(directory.length, 42);
+        assert!(directory.file.is_none());
+        assert_eq!(completed.output_group.len(), 1);
     }
 
     #[test]
