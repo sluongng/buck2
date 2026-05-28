@@ -179,9 +179,12 @@ pub(crate) struct BazelEventConverter {
     emitted_test_child_counts: BTreeMap<TargetKey, usize>,
     emitted_configured_targets: BTreeSet<String>,
     target_outputs: BTreeMap<TargetKey, BTreeMap<String, bep::File>>,
+    target_test_statuses: BTreeMap<TargetKey, i32>,
     emitted_output_counts: BTreeMap<TargetKey, usize>,
     emitted_completed_targets: BTreeSet<TargetKey>,
     test_cases: BTreeMap<TargetKey, Vec<TestCaseState>>,
+    announced_event_ids: BTreeMap<Vec<u8>, bep::BuildEventId>,
+    posted_event_ids: BTreeSet<Vec<u8>>,
     pending_patterns: Option<Vec<String>>,
     pattern_expanded_emitted: bool,
     emitted_build_tool_logs: bool,
@@ -225,6 +228,12 @@ impl BazelEventConverter {
                 self.convert_record(event, record, &mut events);
             }
             None => {}
+        }
+
+        let finishes_invocation = events.iter().any(is_build_finished_event);
+        self.record_event_graph(&events);
+        if finishes_invocation {
+            self.emit_aborted_events_for_missing_ids(&mut events);
         }
 
         events
@@ -289,7 +298,6 @@ impl BazelEventConverter {
         match span_end.data.as_ref() {
             Some(buck2_data::span_end_event::Data::Command(command)) => {
                 self.emit_completed_updates_for_actions(events);
-                self.push_finished(finished_event_from_command_end(event, command), events);
                 self.push_build_tool_logs(
                     build_tool_logs_event_from_command_end(
                         event,
@@ -299,6 +307,7 @@ impl BazelEventConverter {
                     ),
                     events,
                 );
+                self.push_finished(finished_event_from_command_end(event, command), events);
             }
             Some(buck2_data::span_end_event::Data::Analysis(analysis)) => {
                 if let Some(completed) = completed_event_from_analysis_end(analysis) {
@@ -485,11 +494,11 @@ impl BazelEventConverter {
                 self.emit_completed_updates_for_actions(events);
                 events.push(build_metrics_event(record));
                 events.push(self.build_metadata_event(&build_metadata_from_invocation(record)));
-                self.push_finished(finished_event_from_invocation_record(event, record), events);
                 self.push_build_tool_logs(
                     build_tool_logs_event_from_invocation(record, &self.command_profile),
                     events,
                 );
+                self.push_finished(finished_event_from_invocation_record(event, record), events);
             }
             Some(buck2_data::record_event::Data::BuildGraphStats(stats)) => {
                 self.emit_pending_pattern_expanded(&stats.build_targets, events);
@@ -518,6 +527,47 @@ impl BazelEventConverter {
         }
         self.emitted_build_tool_logs = true;
         events.push(event);
+    }
+
+    fn record_event_graph(&mut self, events: &[bep::BuildEvent]) {
+        for event in events {
+            for child in &event.children {
+                self.announced_event_ids
+                    .entry(event_id_key(child))
+                    .or_insert_with(|| child.clone());
+            }
+        }
+        for event in events {
+            if let Some(id) = event.id.as_ref() {
+                self.posted_event_ids.insert(event_id_key(id));
+            }
+        }
+    }
+
+    fn emit_aborted_events_for_missing_ids(&mut self, events: &mut Vec<bep::BuildEvent>) {
+        let reason = abort_reason_from_finished_events(events);
+        let missing = self
+            .announced_event_ids
+            .iter()
+            .filter(|(key, _)| !self.posted_event_ids.contains(*key))
+            .map(|(key, id)| (key.clone(), id.clone()))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return;
+        }
+
+        let aborted = missing
+            .into_iter()
+            .map(|(key, id)| {
+                self.posted_event_ids.insert(key);
+                aborted_event(id, reason)
+            })
+            .collect::<Vec<_>>();
+        let insert_at = events
+            .iter()
+            .position(|event| event.last_message)
+            .unwrap_or(events.len());
+        events.splice(insert_at..insert_at, aborted);
     }
 
     fn build_metadata_event(&self, metadata: &BTreeMap<String, String>) -> bep::BuildEvent {
@@ -738,6 +788,10 @@ impl BazelEventConverter {
                     .into_iter()
                     .flat_map(|children| children.values().cloned()),
             );
+            children.push(target_summary_id(
+                key.label.clone(),
+                key.configuration.clone(),
+            ));
             let (named_set_events, output_group) = self.output_group_events(&key, &mut children);
             events.extend(named_set_events);
             events.push(completed_event_with_children_and_outputs(
@@ -746,6 +800,11 @@ impl BazelEventConverter {
                 state.success,
                 children,
                 output_group,
+            ));
+            events.push(target_summary_event(
+                &key,
+                state.success,
+                self.target_test_statuses.get(&key).copied(),
             ));
             self.emitted_action_child_counts
                 .insert(key.clone(), child_count);
@@ -870,8 +929,12 @@ impl BazelEventConverter {
         let cases = self.test_cases.get(&key).cloned().unwrap_or_default();
         let status = aggregate_test_status(test_end.command_report.as_ref(), &cases);
         let end_time = event.timestamp.clone();
+        let start_time = start_time_from_span_end(span_end, end_time.as_ref());
+        let duration =
+            test_duration(test_end.command_report.as_ref()).or_else(|| span_end.duration.clone());
         let outputs = test_action_outputs(&cases, test_end.command_report.as_ref(), status);
         self.remember_test_children(&key);
+        self.target_test_statuses.insert(key.clone(), status);
 
         Some(bep::BuildEvent {
             id: Some(test_result_id(label, configuration)),
@@ -879,15 +942,15 @@ impl BazelEventConverter {
             payload: Some(build_event::Payload::TestResult(bep::TestResult {
                 status,
                 cached_locally: false,
-                test_attempt_start_millis_epoch: 0,
-                test_attempt_duration_millis: 0,
+                test_attempt_start_millis_epoch: timestamp_millis(start_time.as_ref()),
+                test_attempt_duration_millis: optional_duration_millis(duration.as_ref())
+                    .unwrap_or_default(),
                 test_action_output: outputs,
                 warning: Vec::new(),
                 execution_info: test_execution_info(test_end.command_report.as_ref()),
                 status_details: test_status_details(&cases, test_end.command_report.as_ref()),
-                test_attempt_start: start_time_from_span_end(span_end, end_time.as_ref()),
-                test_attempt_duration: test_duration(test_end.command_report.as_ref())
-                    .or_else(|| span_end.duration.clone()),
+                test_attempt_start: start_time,
+                test_attempt_duration: duration,
             })),
             last_message: false,
         })
@@ -910,6 +973,9 @@ impl BazelEventConverter {
         let cases = self.test_cases.remove(&key).unwrap_or_default();
         let status = aggregate_test_status(test_end.command_report.as_ref(), &cases);
         let end_time = event.timestamp.clone();
+        let start_time = start_time_from_span_end(span_end, end_time.as_ref());
+        let duration =
+            test_duration(test_end.command_report.as_ref()).or_else(|| span_end.duration.clone());
         Some(bep::BuildEvent {
             id: Some(test_summary_id(label, configuration)),
             children: Vec::new(),
@@ -922,12 +988,13 @@ impl BazelEventConverter {
                 passed: test_summary_files(status, test_end.command_report.as_ref(), true),
                 failed: test_summary_files(status, test_end.command_report.as_ref(), false),
                 total_num_cached: i32::from(test_cached_remotely(test_end.command_report.as_ref())),
-                first_start_time_millis: 0,
-                last_stop_time_millis: 0,
-                total_run_duration_millis: 0,
-                first_start_time: start_time_from_span_end(span_end, end_time.as_ref()),
+                first_start_time_millis: timestamp_millis(start_time.as_ref()),
+                last_stop_time_millis: timestamp_millis(end_time.as_ref()),
+                total_run_duration_millis: optional_duration_millis(duration.as_ref())
+                    .unwrap_or_default(),
+                first_start_time: start_time,
                 last_stop_time: end_time,
-                total_run_duration: test_duration(test_end.command_report.as_ref()),
+                total_run_duration: duration,
             })),
             last_message: false,
         })
@@ -1309,6 +1376,10 @@ fn build_tool_logs_id() -> bep::BuildEventId {
     }
 }
 
+fn event_id_key(id: &bep::BuildEventId) -> Vec<u8> {
+    id.encode_to_vec()
+}
+
 fn configuration_id(id: impl Into<String>) -> build_event_id::ConfigurationId {
     build_event_id::ConfigurationId { id: id.into() }
 }
@@ -1383,6 +1454,17 @@ fn target_completed_id(label: String, configuration: String) -> bep::BuildEventI
     }
 }
 
+fn target_summary_id(label: String, configuration: String) -> bep::BuildEventId {
+    bep::BuildEventId {
+        id: Some(build_event_id::Id::TargetSummary(
+            build_event_id::TargetSummaryId {
+                label,
+                configuration: Some(configuration_id(configuration)),
+            },
+        )),
+    }
+}
+
 fn test_result_id(label: String, configuration: String) -> bep::BuildEventId {
     bep::BuildEventId {
         id: Some(build_event_id::Id::TestResult(
@@ -1405,6 +1487,25 @@ fn test_summary_id(label: String, configuration: String) -> bep::BuildEventId {
                 configuration: Some(configuration_id(configuration)),
             },
         )),
+    }
+}
+
+fn target_summary_event(
+    key: &TargetKey,
+    overall_build_success: bool,
+    overall_test_status: Option<i32>,
+) -> bep::BuildEvent {
+    bep::BuildEvent {
+        id: Some(target_summary_id(
+            key.label.clone(),
+            key.configuration.clone(),
+        )),
+        children: Vec::new(),
+        payload: Some(build_event::Payload::TargetSummary(bep::TargetSummary {
+            overall_build_success,
+            overall_test_status: overall_test_status.unwrap_or(bep::TestStatus::NoStatus as i32),
+        })),
+        last_message: false,
     }
 }
 
@@ -2230,6 +2331,18 @@ fn timestamp_micros(timestamp: Option<&Timestamp>) -> Option<i64> {
     } else {
         i64::MAX
     }))
+}
+
+fn timestamp_millis(timestamp: Option<&Timestamp>) -> i64 {
+    let Some(timestamp) = timestamp else {
+        return 0;
+    };
+    let millis = i128::from(timestamp.seconds) * 1_000 + i128::from(timestamp.nanos) / 1_000_000;
+    i64::try_from(millis).unwrap_or(if millis.is_negative() {
+        i64::MIN
+    } else {
+        i64::MAX
+    })
 }
 
 fn target_patterns_from_invocation_record(
@@ -3327,7 +3440,11 @@ fn configured_event_from_analysis_start(
     } else if !target_kind.ends_with(" rule") {
         target_kind.push_str(" rule");
     }
-    Some(configured_event(label, target_kind))
+    Some(configured_event(
+        label,
+        configuration_id_for_target(target),
+        target_kind,
+    ))
 }
 
 fn completed_event_from_analysis_end(
@@ -3345,32 +3462,41 @@ fn configured_event_from_test_label(
 ) -> Option<bep::BuildEvent> {
     Some(configured_event(
         label_for_configured_target(label?)?,
+        configuration_id_for_target(label?),
         target_kind.to_owned(),
     ))
 }
 
 fn configured_event_from_build_target(target: &buck2_data::BuildTarget) -> Option<bep::BuildEvent> {
     let label = normalize_buck_label(&target.target)?;
-    Some(configured_event(label, GENERIC_TARGET_KIND.to_owned()))
+    Some(configured_event(
+        label,
+        configuration_id_for_build_target(target),
+        GENERIC_TARGET_KIND.to_owned(),
+    ))
 }
 
 fn completed_event_from_build_target(target: &buck2_data::BuildTarget) -> Option<bep::BuildEvent> {
     let label = normalize_buck_label(&target.target)?;
     Some(completed_event(
         label,
-        if target.configuration.is_empty() {
-            DEFAULT_CONFIGURATION_ID.to_owned()
-        } else {
-            target.configuration.clone()
-        },
+        configuration_id_for_build_target(target),
         true,
     ))
 }
 
-fn configured_event(label: String, target_kind: String) -> bep::BuildEvent {
+fn configuration_id_for_build_target(target: &buck2_data::BuildTarget) -> String {
+    if target.configuration.is_empty() {
+        DEFAULT_CONFIGURATION_ID.to_owned()
+    } else {
+        target.configuration.clone()
+    }
+}
+
+fn configured_event(label: String, configuration: String, target_kind: String) -> bep::BuildEvent {
     bep::BuildEvent {
-        id: Some(target_configured_id(label)),
-        children: Vec::new(),
+        id: Some(target_configured_id(label.clone())),
+        children: vec![target_completed_id(label, configuration)],
         payload: Some(build_event::Payload::Configured(bep::TargetConfigured {
             target_kind,
             test_size: bep::TestSize::Unknown as i32,
@@ -3462,6 +3588,9 @@ fn action_event(
             action, &label, &stderr, exit_code,
         ))
     });
+    let primary_output_file = (!action.failed)
+        .then(|| action.outputs.first().and_then(bep_file_from_action_output))
+        .flatten();
 
     Some(bep::BuildEvent {
         id: Some(bep::BuildEventId {
@@ -3480,7 +3609,7 @@ fn action_event(
             stdout: Some(file_with_contents("stdout", stdout)),
             stderr: Some(file_with_contents("stderr", stderr)),
             label,
-            primary_output: Some(file_with_contents("primary_output", primary_output)),
+            primary_output: primary_output_file,
             configuration: Some(configuration_id(configuration)),
             r#type: mnemonic,
             command_line,
@@ -3597,6 +3726,52 @@ fn finished_event(
             }),
         })),
         last_message: true,
+    }
+}
+
+fn is_build_finished_event(event: &bep::BuildEvent) -> bool {
+    matches!(event.payload, Some(build_event::Payload::Finished(_)))
+}
+
+fn abort_reason_from_finished_events(events: &[bep::BuildEvent]) -> i32 {
+    events
+        .iter()
+        .find_map(|event| match event.payload.as_ref() {
+            Some(build_event::Payload::Finished(finished)) => {
+                Some(abort_reason_from_finished(finished))
+            }
+            _ => None,
+        })
+        .unwrap_or(bep::aborted::AbortReason::Unknown as i32)
+}
+
+fn abort_reason_from_finished(finished: &bep::BuildFinished) -> i32 {
+    let exit_code = finished.exit_code.as_ref();
+    let exit_name = exit_code.map(|exit| exit.name.as_str()).unwrap_or_default();
+    let exit_code = exit_code.map(|exit| exit.code).unwrap_or_default();
+
+    if exit_name == "INTERRUPTED" || exit_code == INTERRUPTED_EXIT_CODE {
+        bep::aborted::AbortReason::UserInterrupted as i32
+    } else if exit_name == "CRASHED" {
+        bep::aborted::AbortReason::Internal as i32
+    } else if finished.overall_success {
+        bep::aborted::AbortReason::Unknown as i32
+    } else {
+        bep::aborted::AbortReason::Incomplete as i32
+    }
+}
+
+fn aborted_event(id: bep::BuildEventId, reason: i32) -> bep::BuildEvent {
+    bep::BuildEvent {
+        id: Some(id),
+        children: Vec::new(),
+        payload: Some(build_event::Payload::Aborted(bep::Aborted {
+            reason,
+            description:
+                "Event was announced by Buck2 but did not occur before the invocation finished."
+                    .to_owned(),
+        })),
+        last_message: false,
     }
 }
 
@@ -4945,6 +5120,67 @@ mod tests {
                 .iter()
                 .any(|event| event["name"] == "buck2 query" && event["dur"] == 2_500_000)
         );
+        assert!(matches!(
+            events.last().and_then(|event| event.payload.as_ref()),
+            Some(build_event::Payload::Finished(_))
+        ));
+    }
+
+    #[test]
+    fn finished_aborts_announced_events_without_payloads() {
+        let mut converter = BazelEventConverter::default();
+        let first_events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::Instant(
+                buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::ConsoleMessage(
+                        buck2_data::ConsoleMessage {
+                            message: "starting".to_owned(),
+                        },
+                    )),
+                },
+            )),
+        );
+        assert!(matches!(
+            first_events[0].payload,
+            Some(build_event::Payload::Started(_))
+        ));
+
+        let final_events = converter.convert(
+            2,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::InvocationRecord(Box::new(
+                        buck2_data::InvocationRecord {
+                            outcome: Some(buck2_data::InvocationOutcome::Failed as i32),
+                            exit_code: Some(1),
+                            exit_result_name: Some("FAILED".to_owned()),
+                            ..Default::default()
+                        },
+                    ))),
+                },
+            )),
+        );
+
+        let aborted_index = final_events
+            .iter()
+            .position(|event| event.id.as_ref() == Some(&unstructured_command_line_id()))
+            .expect("aborted unstructured command line event");
+        let Some(build_event::Payload::Aborted(aborted)) =
+            final_events[aborted_index].payload.as_ref()
+        else {
+            panic!("expected Aborted payload");
+        };
+        assert_eq!(aborted.reason, bep::aborted::AbortReason::Incomplete as i32);
+        assert!(aborted.description.contains("announced by Buck2"));
+
+        let finished_index = final_events
+            .iter()
+            .position(is_build_finished_event)
+            .expect("build finished event");
+        assert!(aborted_index < finished_index);
+        assert_eq!(finished_index, final_events.len() - 1);
+        assert!(final_events[finished_index].last_message);
     }
 
     #[test]
@@ -5322,6 +5558,17 @@ mod tests {
             panic!("expected ActionCompleted id");
         };
         assert_eq!(action_id.label, "//:main");
+        let Some(build_event::Payload::Action(action_payload)) = action[0].payload.as_ref() else {
+            panic!("expected ActionExecuted payload");
+        };
+        let primary_output = action_payload
+            .primary_output
+            .as_ref()
+            .expect("successful action primary output");
+        assert_eq!(primary_output.name, "buck-out/main.o");
+        assert_eq!(primary_output.digest, "abcd:10");
+        assert_eq!(primary_output.length, 10);
+        assert!(primary_output.file.is_none());
 
         let completed_update = final_events
             .iter()
@@ -5344,11 +5591,29 @@ mod tests {
                 .iter()
                 .any(|child| child == &action[0].id.clone().unwrap())
         );
+        assert!(
+            completed_update
+                .children
+                .iter()
+                .any(|child| matches!(child.id, Some(build_event_id::Id::TargetSummary(_))))
+        );
         let Some(build_event::Payload::Completed(completed)) = completed_update.payload.as_ref()
         else {
             panic!("expected TargetComplete payload");
         };
         assert_eq!(completed.output_group.len(), 1);
+        let target_summary = final_events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::TargetSummary(summary)) => Some(summary),
+                _ => None,
+            })
+            .expect("target summary event");
+        assert!(target_summary.overall_build_success);
+        assert_eq!(
+            target_summary.overall_test_status,
+            bep::TestStatus::NoStatus as i32
+        );
         assert!(final_events.iter().any(|event| matches!(
             event.payload,
             Some(build_event::Payload::NamedSetOfFiles(_))
@@ -5438,6 +5703,18 @@ mod tests {
                 .iter()
                 .any(|child| child == &test_summary_id)
         );
+        let target_summary = final_events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::TargetSummary(summary)) => Some(summary),
+                _ => None,
+            })
+            .expect("target summary event");
+        assert!(target_summary.overall_build_success);
+        assert_eq!(
+            target_summary.overall_test_status,
+            bep::TestStatus::Passed as i32
+        );
     }
 
     #[test]
@@ -5510,6 +5787,69 @@ mod tests {
     }
 
     #[test]
+    fn test_events_include_legacy_timing_millis() {
+        let mut converter = BazelEventConverter::default();
+        let target = configured_target();
+
+        let test_events = converter.convert(
+            1,
+            &trace_event_at(
+                1,
+                0,
+                5_000_000,
+                buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::TestRun(
+                        buck2_data::TestRunEnd {
+                            suite: Some(buck2_data::TestSuite {
+                                suite_name: "suite".to_owned(),
+                                test_names: vec!["test_passes".to_owned()],
+                                target_label: Some(target),
+                            }),
+                            command_report: Some(buck2_data::CommandExecution {
+                                details: Some(buck2_data::CommandExecutionDetails {
+                                    signed_exit_code: Some(0),
+                                    ..Default::default()
+                                }),
+                                status: Some(buck2_data::command_execution::Status::Success(
+                                    buck2_data::command_execution::Success {},
+                                )),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                    duration: Some(prost_types::Duration {
+                        seconds: 2,
+                        nanos: 500_000_000,
+                    }),
+                    ..Default::default()
+                }),
+            ),
+        );
+
+        let result = test_events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::TestResult(result)) => Some(result),
+                _ => None,
+            })
+            .expect("expected TestResult event");
+        assert_eq!(result.test_attempt_start_millis_epoch, 3_500);
+        assert_eq!(result.test_attempt_duration_millis, 2_500);
+
+        let summary = test_events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::TestSummary(summary)) => Some(summary),
+                _ => None,
+            })
+            .expect("expected TestSummary event");
+        assert_eq!(summary.first_start_time_millis, 3_500);
+        assert_eq!(summary.last_stop_time_millis, 6_000);
+        assert_eq!(summary.total_run_duration_millis, 2_500);
+    }
+
+    #[test]
     fn analysis_only_target_completes_at_invocation_end() {
         let mut converter = BazelEventConverter::default();
         let target = configured_target_with_package("root//", "main", "cfg");
@@ -5575,11 +5915,17 @@ mod tests {
         ));
 
         let first = converter.convert(1, &event);
-        assert!(
-            first
-                .iter()
-                .any(|event| matches!(event.payload, Some(build_event::Payload::Configured(_))))
-        );
+        let configured = first
+            .iter()
+            .find(|event| matches!(event.payload, Some(build_event::Payload::Configured(_))))
+            .expect("configured target event");
+        let Some(build_event_id::Id::TargetCompleted(completed_id)) =
+            configured.children[0].id.as_ref()
+        else {
+            panic!("expected configured target to announce completion");
+        };
+        assert_eq!(completed_id.label, "//:main");
+        assert_eq!(completed_id.configuration.as_ref().unwrap().id, "cfg");
 
         let second = converter.convert(2, &event);
         assert!(
@@ -5783,6 +6129,7 @@ mod tests {
         let Some(build_event::Payload::Action(action_payload)) = action[0].payload.as_ref() else {
             panic!("expected ActionExecuted payload");
         };
+        assert!(action_payload.primary_output.is_none());
         let action_stdout = match action_payload
             .stdout
             .as_ref()
