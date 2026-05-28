@@ -161,6 +161,10 @@ fn main() -> io::Result<()> {
             "#[serde(rename = \"duration_us\", with = \"crate::serialize_duration_as_micros\")]",
         )
         .field_attribute(
+            "TestRunEnd.timeout",
+            "#[serde(default, rename = \"timeout_us\", with = \"crate::serialize_duration_as_micros\")]",
+        )
+        .field_attribute(
             "command_duration",
             "#[serde(rename = \"command_duration_us\", with = \"crate::serialize_duration_as_micros\")]",
         )
