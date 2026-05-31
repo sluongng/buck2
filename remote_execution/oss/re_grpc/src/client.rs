@@ -2798,7 +2798,7 @@ impl GRPCClients {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 enum DigestRemoteState {
     ExistsOnRemote,
     Missing,
@@ -3119,6 +3119,7 @@ impl REClient {
         batch_update_compressor: Option<Compressor>,
         local_chunk_cache: Option<LocalChunkCache>,
     ) -> Self {
+        let find_missing_cache_ttl = Duration::from_secs(runtime_opts.cas_ttl_secs.max(0) as u64);
         REClient {
             runtime_opts,
             grpc_clients: Arc::new(grpc_clients),
@@ -3126,7 +3127,7 @@ impl REClient {
             instance_name,
             find_missing_cache: Mutex::new(FindMissingCache {
                 cache: LruCache::new(NonZeroUsize::new(500_000).unwrap()),
-                ttl: Duration::from_hours(12), // 12 hours TODO: Tune this parameter
+                ttl: find_missing_cache_ttl,
                 last_check: Instant::now(),
             }),
             bystream_compressor,
@@ -3239,8 +3240,8 @@ impl REClient {
         .await?;
 
         Ok(ActionResultResponse {
-            action_result: convert_action_result(res.into_inner())?,
-            ttl: 0,
+            action_result: convert_action_result(res.into_inner(), self.runtime_opts.cas_ttl_secs)?,
+            ttl: self.runtime_opts.cas_ttl_secs,
         })
     }
 
@@ -3289,10 +3290,12 @@ impl REClient {
         )
         .await?;
 
-            Ok(WriteActionResultResponse {
-                actual_action_result: convert_action_result(res.into_inner())?,
-                ttl_seconds: 0,
-            })
+        Ok(WriteActionResultResponse {
+            actual_action_result: convert_action_result(
+                res.into_inner(),
+                self.runtime_opts.cas_ttl_secs,
+            )?,
+            ttl_seconds: self.runtime_opts.cas_ttl_secs,
         })
     }
 
@@ -3351,6 +3354,7 @@ impl REClient {
         let use_fbcode_metadata = self.runtime_opts.use_fbcode_metadata;
         let retries = self.runtime_opts.retries;
         let retry_max_delay = Duration::from_millis(self.runtime_opts.retry_max_delay_ms);
+        let cas_ttl_secs = self.runtime_opts.cas_ttl_secs;
 
         let stream = futures::stream::try_unfold(
             (stream, None::<String>, 0usize),
@@ -3542,12 +3546,13 @@ impl REClient {
                                         .result
                                         .with_context(|| "The action result is not defined.")?;
 
-                                    let action_result = convert_action_result(action_result)?;
+                                    let action_result =
+                                        convert_action_result(action_result, cas_ttl_secs)?;
 
                                     let execute_response = ExecuteResponse {
                                         action_result,
                                         action_result_digest: TDigest::default(),
-                                        action_result_ttl: 0,
+                                        action_result_ttl: cas_ttl_secs,
                                         status: TStatus {
                                             code: TCode::OK,
                                             message: execute_response_grpc.message,
@@ -4662,19 +4667,13 @@ impl REClient {
                 let resp: FindMissingBlobsResponse = missing_blobs.into_inner();
                 validate_find_missing_blobs_response_digests(&requested_digests, &resp)?;
 
-                // Update the results and the cache
                 let mut find_missing_cache = self.find_missing_cache.lock().unwrap();
-                for digest in &digests_to_check {
-                    remote_results.insert(digest.clone(), DigestRemoteState::ExistsOnRemote);
-                    find_missing_cache.put(digest.clone(), DigestRemoteState::ExistsOnRemote);
-                }
-
-                for digest in &resp.missing_blob_digests.map(|d| tdigest_from(d.clone())) {
-                    // If it's present in the MissingBlobsResponse, it's expired on the remote and
-                    // needs to be refetched.
-                    remote_results.insert(digest.clone(), DigestRemoteState::Missing);
-                    find_missing_cache.put(digest.clone(), DigestRemoteState::Missing);
-                }
+                record_find_missing_results(
+                    &digests_to_check,
+                    &resp,
+                    &mut remote_results,
+                    &mut find_missing_cache,
+                );
                 digests_to_check.clear();
             }
         }
@@ -4868,6 +4867,28 @@ fn digests_with_ttl_for_requested_digests(
             })
         })
         .collect()
+}
+
+fn record_find_missing_results(
+    digests_to_check: &[TDigest],
+    resp: &FindMissingBlobsResponse,
+    remote_results: &mut HashMap<TDigest, DigestRemoteState>,
+    find_missing_cache: &mut FindMissingCache,
+) {
+    let missing = resp
+        .missing_blob_digests
+        .iter()
+        .map(|digest| tdigest_from(digest.clone()))
+        .collect::<HashSet<_>>();
+
+    for digest in digests_to_check {
+        if missing.contains(digest) {
+            remote_results.insert(digest.clone(), DigestRemoteState::Missing);
+        } else {
+            remote_results.insert(digest.clone(), DigestRemoteState::ExistsOnRemote);
+            find_missing_cache.put(digest.clone(), DigestRemoteState::ExistsOnRemote);
+        }
+    }
 }
 
 fn validate_extend_digests_ttl_response(
@@ -5101,7 +5122,10 @@ fn validate_chunk_digests_reconstruct_blob(
     Ok(())
 }
 
-fn convert_action_result(action_result: ActionResult) -> anyhow::Result<TActionResult2> {
+fn convert_action_result(
+    action_result: ActionResult,
+    cas_ttl_secs: i64,
+) -> anyhow::Result<TActionResult2> {
     let execution_metadata = action_result
         .execution_metadata
         .with_context(|| "The execution metadata are not defined.")?;
@@ -5118,7 +5142,7 @@ fn convert_action_result(action_result: ActionResult) -> anyhow::Result<TActionR
             name: output_file.path,
             existed: false,
             executable: output_file.is_executable,
-            ttl: 0,
+            ttl: cas_ttl_secs,
             _dot_dot_default: (),
         })
     })?;
@@ -7429,6 +7453,59 @@ mod tests {
         assert_eq!(digests_with_ttl[2].digest, digest1);
         assert_eq!(digests_with_ttl[2].ttl, 17);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_find_missing_results_does_not_cache_missing() {
+        let present = test_digest("aa", 1);
+        let missing = test_digest("bb", 2);
+        let mut remote_results = HashMap::new();
+        let mut cache = FindMissingCache {
+            cache: LruCache::new(std::num::NonZeroUsize::new(10).unwrap()),
+            ttl: std::time::Duration::from_secs(60),
+            last_check: std::time::Instant::now(),
+        };
+
+        record_find_missing_results(
+            &[present.clone(), missing.clone()],
+            &FindMissingBlobsResponse {
+                missing_blob_digests: vec![tdigest_to(missing.clone())],
+            },
+            &mut remote_results,
+            &mut cache,
+        );
+
+        assert_eq!(
+            remote_results.get(&present),
+            Some(&DigestRemoteState::ExistsOnRemote)
+        );
+        assert_eq!(
+            remote_results.get(&missing),
+            Some(&DigestRemoteState::Missing)
+        );
+        assert_eq!(cache.get(&present), Some(DigestRemoteState::ExistsOnRemote));
+        assert_eq!(cache.get(&missing), None);
+    }
+
+    #[test]
+    fn test_convert_action_result_sets_output_file_ttl() -> anyhow::Result<()> {
+        let digest = test_digest("aa", 1);
+        let action_result = ActionResult {
+            execution_metadata: Some(ExecutedActionMetadata::default()),
+            output_files: vec![OutputFile {
+                path: "out".to_owned(),
+                digest: Some(tdigest_to(digest.clone())),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let converted = convert_action_result(action_result, 42)?;
+
+        assert_eq!(converted.output_files.len(), 1);
+        assert_eq!(converted.output_files[0].digest.digest, digest);
+        assert_eq!(converted.output_files[0].ttl, 42);
         Ok(())
     }
 
