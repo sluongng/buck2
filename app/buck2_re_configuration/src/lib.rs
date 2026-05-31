@@ -478,6 +478,8 @@ pub struct Buck2OssReConfiguration {
     pub remote_cache_compression_threshold: Option<usize>,
     /// Maximum number of concurrent upload requests for each action.
     pub max_concurrent_uploads_per_action: Option<usize>,
+    /// Maximum number of digests to ask about in a single FindMissingBlobs RPC.
+    pub find_missing_blobs_batch_size: Option<usize>,
     /// Time that digests are assumed to live in CAS after being touched.
     pub cas_ttl_secs: Option<i64>,
     /// Whether to chunk large remote-cache blobs using FastCDC 2020 and SpliceBlob.
@@ -616,6 +618,10 @@ impl Buck2OssReConfiguration {
             max_concurrent_uploads_per_action: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
                 property: "max_concurrent_uploads_per_action",
+            })?,
+            find_missing_blobs_batch_size: legacy_config.parse(BuckconfigKeyRef {
+                section: BUCK2_RE_CLIENT_CFG_SECTION,
+                property: "find_missing_blobs_batch_size",
             })?,
             cas_ttl_secs: legacy_config.parse(BuckconfigKeyRef {
                 section: BUCK2_RE_CLIENT_CFG_SECTION,
