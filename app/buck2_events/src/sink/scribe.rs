@@ -134,6 +134,25 @@ impl RemoteEventSink {
         }
     }
 
+    #[cfg(not(fbcode_build))]
+    fn send_now_without_waiting_for_acks(&self, event: &BuckEvent) -> buck2_error::Result<()> {
+        let message_key = event.trace_id()?.hash();
+        let message = crate::sink::bes_client::Message {
+            category: self.category.clone(),
+            message: Self::encode_message(event.clone(), self.preserve_bazel_logs),
+            message_key: Some(message_key),
+        };
+        futures::executor::block_on(
+            self.client
+                .send_messages_without_waiting_for_acks(vec![message]),
+        )
+    }
+
+    #[cfg(not(fbcode_build))]
+    fn should_send_before_client_output(&self, event: &BuckEvent) -> bool {
+        self.preserve_bazel_logs && is_command_start_event(event)
+    }
+
     // Send this event by placing it on the internal message queue.
     pub fn offer(&self, event: BuckEvent) {
         let message_key = event.trace_id().unwrap().hash();
@@ -377,6 +396,18 @@ impl EventSink for RemoteEventSink {
         match event {
             Event::Buck(event) => {
                 if self.should_send_event(event.data()) {
+                    #[cfg(not(fbcode_build))]
+                    if self.should_send_before_client_output(&event) {
+                        // BuildBuddy creates the invocation row from the BEP
+                        // Started/OptionsParsed batch generated from
+                        // CommandStart. Send that batch before the local client
+                        // sees CommandStart and prints the BuildBuddy URL. This
+                        // waits for local send, not for a BuildBuddy ACK.
+                        if self.send_now_without_waiting_for_acks(&event).is_err() {
+                            self.offer(event);
+                        }
+                        return;
+                    }
                     self.offer(event);
                 }
             }
@@ -396,6 +427,18 @@ impl EventSink for RemoteEventSink {
             Event::PartialResult(..) => {}
         }
     }
+}
+
+#[cfg(not(fbcode_build))]
+fn is_command_start_event(event: &BuckEvent) -> bool {
+    matches!(
+        event.data(),
+        buck2_data::buck_event::Data::SpanStart(span)
+            if matches!(
+                span.data.as_ref(),
+                Some(buck2_data::span_start_event::Data::Command(_))
+            )
+    )
 }
 
 #[cfg(not(fbcode_build))]
@@ -561,6 +604,37 @@ mod tests {
             ..Default::default()
         };
         assert!(!get_is_cache_hit(&details_no_cache_hit));
+    }
+
+    #[cfg(not(fbcode_build))]
+    #[test]
+    fn command_start_events_are_sent_before_client_output() {
+        let command_start = BuckEvent::new(
+            SystemTime::now(),
+            TraceId::new(),
+            None,
+            None,
+            buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                data: Some(buck2_data::CommandStart::default().into()),
+            }),
+        );
+        assert!(is_command_start_event(&command_start));
+
+        let console_message = BuckEvent::new(
+            SystemTime::now(),
+            TraceId::new(),
+            None,
+            None,
+            buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
+                data: Some(
+                    buck2_data::ConsoleMessage {
+                        message: "hello".to_owned(),
+                    }
+                    .into(),
+                ),
+            }),
+        );
+        assert!(!is_command_start_event(&console_message));
     }
 
     #[test]

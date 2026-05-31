@@ -35,6 +35,13 @@ impl SessionInfo {
         }
         Some(format!("{base_url}/{trace_id}"))
     }
+
+    pub fn streaming_results_line(&self) -> Option<String> {
+        Some(format!(
+            "Streaming build results to: {}",
+            self.invocation_url()?
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -68,5 +75,27 @@ mod tests {
             info.invocation_url().as_deref(),
             Some("https://buildbuddy.example.com/invocation/00000000-0000-4000-8000-000000000123")
         );
+    }
+
+    #[test]
+    fn streaming_results_line_uses_invocation_url() {
+        let info = session_info_with_url("https://buildbuddy.example.com/invocation/");
+        assert_eq!(
+            info.streaming_results_line().as_deref(),
+            Some(
+                "Streaming build results to: https://buildbuddy.example.com/invocation/00000000-0000-4000-8000-000000000123"
+            )
+        );
+    }
+
+    #[test]
+    fn streaming_results_line_is_absent_without_invocation_url() {
+        let info = SessionInfo {
+            trace_id: TraceId::from_str("00000000-0000-4000-8000-000000000123").unwrap(),
+            bes_results_url: None,
+            test_session: None,
+            legacy_dice: false,
+        };
+        assert_eq!(info.streaming_results_line().as_deref(), None);
     }
 }
