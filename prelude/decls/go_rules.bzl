@@ -71,6 +71,7 @@ go_binary = prelude_rule(
     attrs = (
         # @unsorted-dict-items
         go_common.package_name_arg()
+        | go_common.import_path_arg()
         | go_common.srcs_arg()
         | go_common.deps_arg()
         | go_common.link_style_arg()
@@ -175,6 +176,7 @@ go_exported_library = prelude_rule(
     attrs = (
         # @unsorted-dict-items
         go_common.package_name_arg()
+        | go_common.import_path_arg()
         | go_common.srcs_arg()
         | go_common.deps_arg()
         | {
@@ -247,6 +249,7 @@ go_library = prelude_rule(
         # @unsorted-dict-items
         go_common.srcs_arg()
         | go_common.package_name_arg()
+        | go_common.import_path_arg()
         | go_common.deps_arg()
         | go_common.compiler_flags_arg()
         | go_common.assembler_flags_arg()
@@ -347,6 +350,14 @@ go_test = prelude_rule(
 
                  Note: if you want to test packages internally (i.e. same package name), use the `target_under_test`
                  parameter instead of setting `package_name` to include the tested source files.
+            """,
+            ),
+            "import_path": attrs.option(
+                attrs.string(),
+                default = None,
+                doc = """
+                Sets the Go import path of the test package being compiled. Prefer this over
+                 package_name for new targets. If both are set, they must be equal.
             """,
             ),
             "target_under_test": attrs.option(
