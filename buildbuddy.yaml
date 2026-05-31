@@ -1,6 +1,7 @@
 actions:
   - name: Buck2 Stack Test
     container_image: ubuntu-24.04
+    visibility: "PUBLIC"
     user: root
     resource_requests:
       disk: 64GB
@@ -72,10 +73,10 @@ actions:
 
           [bes]
           header = x-buildbuddy-api-key=$BUILDBUDDY_API_KEY
-          build_metadata = PARENT_RUN_ID=$BUILDBUDDY_RUN_ID,PARENT_INVOCATION_ID=$BUILDBUDDY_INVOCATION_ID,COMMIT_SHA=$GIT_COMMIT,REPO_URL=https://github.com/sluongng/buck2,BRANCH_NAME=$GIT_BRANCH,ROLE=CI,DISABLE_COMMIT_STATUS_REPORTING=true,DISABLE_TARGET_TRACKING=true
+          build_metadata = PARENT_RUN_ID=$BUILDBUDDY_RUN_ID,PARENT_INVOCATION_ID=$BUILDBUDDY_INVOCATION_ID,COMMIT_SHA=$GIT_COMMIT,REPO_URL=https://github.com/sluongng/buck2,BRANCH_NAME=$GIT_BRANCH,ROLE=CI,VISIBILITY=PUBLIC,DISABLE_COMMIT_STATUS_REPORTING=true,DISABLE_TARGET_TRACKING=true
 
           [scuba]
-          defaults = {\"normals\":{\"PARENT_RUN_ID\":\"$BUILDBUDDY_RUN_ID\",\"PARENT_INVOCATION_ID\":\"$BUILDBUDDY_INVOCATION_ID\",\"COMMIT_SHA\":\"$GIT_COMMIT\",\"REPO_URL\":\"https://github.com/sluongng/buck2\",\"BRANCH_NAME\":\"$GIT_BRANCH\",\"ROLE\":\"CI\",\"DISABLE_COMMIT_STATUS_REPORTING\":\"true\",\"DISABLE_TARGET_TRACKING\":\"true\"}}
+          defaults = {\"normals\":{\"PARENT_RUN_ID\":\"$BUILDBUDDY_RUN_ID\",\"PARENT_INVOCATION_ID\":\"$BUILDBUDDY_INVOCATION_ID\",\"COMMIT_SHA\":\"$GIT_COMMIT\",\"REPO_URL\":\"https://github.com/sluongng/buck2\",\"BRANCH_NAME\":\"$GIT_BRANCH\",\"ROLE\":\"CI\",\"VISIBILITY\":\"PUBLIC\",\"DISABLE_COMMIT_STATUS_REPORTING\":\"true\",\"DISABLE_TARGET_TRACKING\":\"true\"}}
           EOF
 
           built_buck2_json="$("$buck2_bootstrap" \
