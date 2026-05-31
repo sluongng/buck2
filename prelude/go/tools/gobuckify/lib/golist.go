@@ -26,8 +26,11 @@ import (
 
 // Module represents a Go module from go list output
 type Module struct {
-	Path    string `json:"Path"`
-	Version string `json:"Version"`
+	Path    string  `json:"Path"`
+	Version string  `json:"Version"`
+	Dir     string  `json:"Dir"`
+	Sum     string  `json:"Sum"`
+	Replace *Module `json:"Replace"`
 }
 
 // Package is a subset of the fields of the golist output
