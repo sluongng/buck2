@@ -2323,7 +2323,10 @@ impl REClientBuilder {
                 // NOTE: This is an arbitrary number because RBE does not return information
                 // on the TTL of the remote blob.
                 cas_ttl_secs: opts.cas_ttl_secs.unwrap_or(3 * 60 * 60),
-                find_missing_blobs_batch_size: opts.find_missing_blobs_batch_size.unwrap_or(100),
+                find_missing_blobs_batch_size: opts
+                    .find_missing_blobs_batch_size
+                    .unwrap_or(100)
+                    .max(1),
                 remote_cache_chunking: opts.remote_cache_chunking,
                 remote_cache_compression_threshold,
                 retries,
@@ -6920,6 +6923,7 @@ mod tests {
             request_metadata_tool_name: DEFAULT_REQUEST_METADATA_TOOL_NAME.to_owned(),
             max_concurrent_uploads_per_action: None,
             cas_ttl_secs: 0,
+            find_missing_blobs_batch_size: 100,
             remote_cache_chunking: false,
             remote_cache_compression_threshold: DEFAULT_REMOTE_CACHE_COMPRESSION_THRESHOLD,
             retries: 0,
