@@ -138,6 +138,7 @@ def unarchive(
         patches: list[Artifact],
         exec_deps: HttpArchiveExecDeps,
         prefer_local: bool,
+        resolve_static_crates: bool,
         sub_targets: list[str] | dict[str, list[str]],
         has_content_based_path: bool = False):
     exec_is_windows = exec_deps.exec_os_type[OsLookup].os == Os("windows")
@@ -216,13 +217,22 @@ def unarchive(
     script_output = ctx.actions.declare_output(output_name + "_tmp", dir = True, has_content_based_path = False) if needs_strip_prefix else output
     download = []
     if remote_download:
+        static_crates_resolve = "static.crates.io:443:151.101.2.137,151.101.66.137,151.101.130.137,151.101.194.137"
         download = [
             "archive=\"{}\"".format(archive_path),
             "downloaded=\"\"",
+            "curl_common=\"-fsSL --retry 5 --retry-all-errors --retry-delay 1 --connect-timeout 20\"",
+            "static_crates_resolve=\"{}\"".format(static_crates_resolve if resolve_static_crates else ""),
             "for url in \"$@\"; do",
-            "  if curl -fsSL \"$url\" -o \"$archive\"; then",
+            "  if curl $curl_common \"$url\" -o \"$archive\"; then",
             "    downloaded=1",
             "    break",
+            "  fi",
+            "  if [ -n \"$static_crates_resolve\" ] && [ \"${url#https://static.crates.io/}\" != \"$url\" ]; then",
+            "    if curl $curl_common --resolve \"$static_crates_resolve\" \"$url\" -o \"$archive\"; then",
+            "      downloaded=1",
+            "      break",
+            "    fi",
             "  fi",
             "done",
             "if [ -z \"$downloaded\" ]; then",
