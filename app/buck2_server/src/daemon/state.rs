@@ -955,8 +955,20 @@ impl DaemonState {
     fn parse_bes_headers(
         raw_headers: Option<Vec<String>>,
     ) -> buck2_error::Result<Vec<(String, String)>> {
+        Self::parse_bes_headers_with_env(raw_headers, |name| std::env::var(name).ok())
+    }
+
+    #[cfg(not(fbcode_build))]
+    fn parse_bes_headers_with_env<F>(
+        raw_headers: Option<Vec<String>>,
+        mut env: F,
+    ) -> buck2_error::Result<Vec<(String, String)>>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
         let mut headers = Vec::new();
         for raw_header in raw_headers.unwrap_or_default() {
+            let raw_header = remote::expand_bes_config_env_vars_with(&raw_header, &mut env);
             let (key, value) = raw_header.split_once('=').ok_or_else(|| {
                 buck2_error!(
                     ErrorTag::Input,
@@ -981,8 +993,20 @@ impl DaemonState {
     fn parse_bes_build_metadata(
         raw_entries: Option<Vec<String>>,
     ) -> buck2_error::Result<Vec<(String, String)>> {
+        Self::parse_bes_build_metadata_with_env(raw_entries, |name| std::env::var(name).ok())
+    }
+
+    #[cfg(not(fbcode_build))]
+    fn parse_bes_build_metadata_with_env<F>(
+        raw_entries: Option<Vec<String>>,
+        mut env: F,
+    ) -> buck2_error::Result<Vec<(String, String)>>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
         let mut metadata = Vec::new();
         for raw_entry in raw_entries.unwrap_or_default() {
+            let raw_entry = remote::expand_bes_config_env_vars_with(&raw_entry, &mut env);
             let (key, value) = raw_entry.split_once('=').ok_or_else(|| {
                 buck2_error!(
                     ErrorTag::Input,
@@ -1314,5 +1338,46 @@ mod tests {
         assert_eq!(None, builder.write_timeout());
 
         Ok(())
+    }
+
+    #[cfg(not(fbcode_build))]
+    #[test]
+    fn expands_env_vars_in_bes_headers_and_metadata() {
+        let headers = DaemonState::parse_bes_headers_with_env(
+            Some(vec!["x-buildbuddy-api-key=$BUILDBUDDY_API_KEY".to_owned()]),
+            test_env,
+        )
+        .unwrap();
+        assert_eq!(
+            headers,
+            vec![("x-buildbuddy-api-key".to_owned(), "secret".to_owned())]
+        );
+
+        let metadata = DaemonState::parse_bes_build_metadata_with_env(
+            Some(vec![
+                "PARENT_RUN_ID=${BUILDBUDDY_RUN_ID}".to_owned(),
+                "MISSING=$MISSING".to_owned(),
+                "LITERAL=$9".to_owned(),
+            ]),
+            test_env,
+        )
+        .unwrap();
+        assert_eq!(
+            metadata,
+            vec![
+                ("PARENT_RUN_ID".to_owned(), "run-id".to_owned()),
+                ("MISSING".to_owned(), "".to_owned()),
+                ("LITERAL".to_owned(), "$9".to_owned()),
+            ]
+        );
+    }
+
+    #[cfg(not(fbcode_build))]
+    fn test_env(name: &str) -> Option<String> {
+        match name {
+            "BUILDBUDDY_API_KEY" => Some("secret".to_owned()),
+            "BUILDBUDDY_RUN_ID" => Some("run-id".to_owned()),
+            _ => None,
+        }
     }
 }
