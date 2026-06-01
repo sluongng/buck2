@@ -206,9 +206,660 @@ struct PackageLoadMetricState {
     computation_steps: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BesProgressSpanState {
+    Started,
+    Running,
+    Finished,
+}
+
+#[derive(Debug, Default)]
+struct BesProgressSpanMap<T> {
+    spans: BTreeMap<u64, (BesProgressSpanState, T)>,
+    running: u64,
+    finished: u64,
+    cancelled: u64,
+    min_started: u64,
+    min_finished: u64,
+}
+
+impl<T> BesProgressSpanMap<T> {
+    fn started(&mut self, span_id: u64, data: T) {
+        self.spans
+            .insert(span_id, (BesProgressSpanState::Started, data));
+        self.cancelled = self.cancelled.saturating_sub(1);
+    }
+
+    fn running(&mut self, span_id: u64) -> Option<&mut T> {
+        if let Some((state, data)) = self.spans.get_mut(&span_id) {
+            if *state == BesProgressSpanState::Started {
+                *state = BesProgressSpanState::Running;
+                self.running = self.running.saturating_add(1);
+            }
+            Some(data)
+        } else {
+            None
+        }
+    }
+
+    fn finished(&mut self, span_id: u64) -> Option<&mut T> {
+        match self.spans.get_mut(&span_id) {
+            Some((state, data)) => {
+                match state {
+                    BesProgressSpanState::Started => {
+                        self.finished = self.finished.saturating_add(1);
+                    }
+                    BesProgressSpanState::Running => {
+                        self.running = self.running.saturating_sub(1);
+                        self.finished = self.finished.saturating_add(1);
+                    }
+                    BesProgressSpanState::Finished => {}
+                }
+                *state = BesProgressSpanState::Finished;
+                Some(data)
+            }
+            None => None,
+        }
+    }
+
+    fn cancelled(&mut self, span_id: u64) -> Option<T> {
+        self.spans.remove(&span_id).map(|(state, data)| {
+            match state {
+                BesProgressSpanState::Started => {}
+                BesProgressSpanState::Running => {
+                    self.running = self.running.saturating_sub(1);
+                }
+                BesProgressSpanState::Finished => {
+                    self.finished = self.finished.saturating_sub(1);
+                }
+            }
+            self.cancelled = self.cancelled.saturating_add(1);
+            data
+        })
+    }
+
+    fn stats(&self) -> BesProgressPhaseStats {
+        BesProgressPhaseStats {
+            started: std::cmp::max(self.min_started, self.spans.len() as u64 + self.cancelled),
+            finished: std::cmp::max(self.finished, self.min_finished),
+            running: self.running,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct BesProgressPhaseStats {
+    started: u64,
+    finished: u64,
+    running: u64,
+}
+
+impl BesProgressPhaseStats {
+    fn pending(&self) -> u64 {
+        self.started.saturating_sub(self.finished)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BesProgressPhase {
+    Loading,
+    Analysis,
+    Actions,
+    Validations,
+    Command,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BesTrackedActionSpan {
+    running_local: bool,
+    running_remote: bool,
+}
+
+#[derive(Debug, Default)]
+struct BesProgressCounters {
+    dirs_read: u64,
+    targets: u64,
+    actions_declared: u64,
+    artifacts_declared: u64,
+    running_local: u64,
+    running_remote: u64,
+    exec_time_ms: u64,
+    cached_exec_time_ms: u64,
+    local_actions: u64,
+    remote_actions: u64,
+    cached_actions: u64,
+    remote_dep_file_cached_actions: u64,
+}
+
+impl BesProgressCounters {
+    fn total_cached_actions(&self) -> u64 {
+        self.cached_actions
+            .saturating_add(self.remote_dep_file_cached_actions)
+    }
+
+    fn total_actions(&self) -> u64 {
+        self.local_actions
+            .saturating_add(self.remote_actions)
+            .saturating_add(self.total_cached_actions())
+    }
+
+    fn total_cache_hit_percentage(&self) -> u8 {
+        let total = self.total_actions();
+        if total == 0 {
+            return 0;
+        }
+        let rate = self.total_cached_actions() as f64 * 100.0 / total as f64;
+        if rate == 0.0 || rate == 100.0 {
+            rate as u8
+        } else {
+            rate.round().clamp(1.0, 99.0) as u8
+        }
+    }
+}
+
+const BES_PROGRESS_MIN_INTERVAL_US: i64 = 1_000_000;
+
+#[derive(Debug, Default)]
+struct BesProgressState {
+    command_name: Option<String>,
+    loads: BesProgressSpanMap<()>,
+    analyses: BesProgressSpanMap<()>,
+    actions: BesProgressSpanMap<BesTrackedActionSpan>,
+    validations: BesProgressSpanMap<()>,
+    counters: BesProgressCounters,
+    last_emitted_at_us: Option<i64>,
+    last_rendered: Option<String>,
+}
+
+impl BesProgressState {
+    fn handle_event(&mut self, event: &buck2_data::BuckEvent) -> Option<String> {
+        let before_phase = self.current_phase();
+        let before_pending = self.pending_work();
+        let allow_periodic = progress_event_can_render(event);
+        let mut force = false;
+
+        match event.data.as_ref() {
+            Some(buck2_data::buck_event::Data::SpanStart(span_start)) => {
+                self.handle_span_start(event, span_start, &mut force);
+            }
+            Some(buck2_data::buck_event::Data::SpanEnd(span_end)) => {
+                self.handle_span_end(event, span_end, &mut force);
+            }
+            Some(buck2_data::buck_event::Data::Instant(instant)) => {
+                self.handle_instant(instant);
+            }
+            Some(buck2_data::buck_event::Data::Record(record)) => {
+                self.handle_record(record, &mut force);
+            }
+            None => {}
+        }
+
+        let after_phase = self.current_phase();
+        let after_pending = self.pending_work();
+        force |= before_phase != after_phase;
+        force |= before_pending > 0 && after_pending == 0;
+
+        self.maybe_render(event, force, allow_periodic)
+    }
+
+    fn handle_span_start(
+        &mut self,
+        event: &buck2_data::BuckEvent,
+        span_start: &buck2_data::SpanStartEvent,
+        force: &mut bool,
+    ) {
+        match span_start.data.as_ref() {
+            Some(buck2_data::span_start_event::Data::Command(command)) => {
+                self.command_name = Some(command_name(command));
+                *force = true;
+            }
+            Some(buck2_data::span_start_event::Data::Load(_)) => {
+                self.loads.started(event.span_id, ());
+                self.loads.running(event.span_id);
+            }
+            Some(buck2_data::span_start_event::Data::Analysis(_)) => {
+                self.analyses.started(event.span_id, ());
+            }
+            Some(buck2_data::span_start_event::Data::AnalysisStage(stage)) => {
+                if matches!(
+                    stage.stage.as_ref(),
+                    Some(buck2_data::analysis_stage_start::Stage::EvaluateRule(_))
+                ) {
+                    self.analyses.running(event.parent_id);
+                }
+            }
+            Some(buck2_data::span_start_event::Data::ActionExecution(_)) => {
+                self.actions
+                    .started(event.span_id, BesTrackedActionSpan::default());
+            }
+            Some(buck2_data::span_start_event::Data::ExecutorStage(stage)) => {
+                self.handle_executor_stage_start(event.parent_id, stage);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_span_end(
+        &mut self,
+        event: &buck2_data::BuckEvent,
+        span_end: &buck2_data::SpanEndEvent,
+        force: &mut bool,
+    ) {
+        match span_end.data.as_ref() {
+            Some(buck2_data::span_end_event::Data::Command(command)) => {
+                if self.command_name.is_none() {
+                    self.command_name = Some(command_end_name(command).to_owned());
+                }
+                *force = true;
+            }
+            Some(buck2_data::span_end_event::Data::Load(load)) => {
+                self.loads.finished(event.span_id);
+                if let Some(target_count) = load.target_count {
+                    self.counters.targets = self.counters.targets.saturating_add(target_count);
+                }
+            }
+            Some(buck2_data::span_end_event::Data::Analysis(analysis)) => {
+                self.counters.actions_declared = self
+                    .counters
+                    .actions_declared
+                    .saturating_add(analysis.declared_actions.unwrap_or_default());
+                self.counters.artifacts_declared = self
+                    .counters
+                    .artifacts_declared
+                    .saturating_add(analysis.declared_artifacts.unwrap_or_default());
+                self.analyses.finished(event.span_id);
+            }
+            Some(buck2_data::span_end_event::Data::ActionExecution(action)) => {
+                if let Some(data) = self.actions.finished(event.span_id) {
+                    let data = *data;
+                    self.action_finished(data);
+                }
+                self.record_completed_action(action);
+            }
+            Some(buck2_data::span_end_event::Data::SpanCancelled(_)) => {
+                self.loads.cancelled(event.span_id);
+                self.analyses.cancelled(event.span_id);
+                if let Some(data) = self.actions.cancelled(event.span_id) {
+                    self.action_finished(data);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_instant(&mut self, instant: &buck2_data::InstantEvent) {
+        if let Some(buck2_data::instant_event::Data::DiceStateSnapshot(snapshot)) =
+            instant.data.as_ref()
+        {
+            self.handle_dice_state_snapshot(snapshot);
+        }
+    }
+
+    fn handle_record(&mut self, record: &buck2_data::RecordEvent, force: &mut bool) {
+        if let Some(buck2_data::record_event::Data::InvocationRecord(record)) = record.data.as_ref()
+        {
+            self.command_name = Some(invocation_command_name(record));
+            let remote_cache_hits = record
+                .run_action_cache_count
+                .saturating_add(record.run_remote_dep_file_cache_count);
+            let actions = record
+                .run_local_count
+                .saturating_add(record.run_remote_count)
+                .saturating_add(remote_cache_hits)
+                .saturating_add(record.run_skipped_count);
+            self.actions.min_started = self.actions.min_started.max(actions);
+            self.actions.min_finished = self.actions.min_finished.max(actions);
+            self.counters.local_actions = self.counters.local_actions.max(record.run_local_count);
+            self.counters.remote_actions =
+                self.counters.remote_actions.max(record.run_remote_count);
+            self.counters.cached_actions = self
+                .counters
+                .cached_actions
+                .max(record.run_action_cache_count);
+            self.counters.remote_dep_file_cached_actions = self
+                .counters
+                .remote_dep_file_cached_actions
+                .max(record.run_remote_dep_file_cache_count);
+            *force = true;
+        }
+    }
+
+    fn handle_executor_stage_start(
+        &mut self,
+        action_span_id: u64,
+        stage: &buck2_data::ExecutorStageStart,
+    ) {
+        let Some(action) = self.actions.running(action_span_id) else {
+            return;
+        };
+        match stage.stage.as_ref() {
+            Some(buck2_data::executor_stage_start::Stage::Re(re_stage))
+                if matches!(
+                    re_stage.stage.as_ref(),
+                    Some(buck2_data::re_stage::Stage::Execute(_))
+                ) =>
+            {
+                if !action.running_remote {
+                    action.running_remote = true;
+                    self.counters.running_remote = self.counters.running_remote.saturating_add(1);
+                }
+            }
+            Some(buck2_data::executor_stage_start::Stage::Local(local_stage))
+                if matches!(
+                    local_stage.stage.as_ref(),
+                    Some(buck2_data::local_stage::Stage::Execute(_))
+                ) =>
+            {
+                if !action.running_local {
+                    action.running_local = true;
+                    self.counters.running_local = self.counters.running_local.saturating_add(1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_dice_state_snapshot(&mut self, snapshot: &buck2_data::DiceStateSnapshot) {
+        if let Some(read_dir_states) = snapshot.key_states.get("ReadDirKey") {
+            self.counters.dirs_read = read_dir_states.finished as u64;
+        }
+
+        let mut analysis_min_started = 0;
+        let mut analysis_min_finished = 0;
+        for key in ["AnalysisKey", "AnonTargetKey", "DeferredCompute"] {
+            if let Some(states) = snapshot.key_states.get(key) {
+                analysis_min_started += states.started as u64;
+                analysis_min_finished += states.finished as u64;
+            }
+        }
+        self.analyses.min_started = analysis_min_started;
+        self.analyses.min_finished = analysis_min_finished;
+
+        if let Some(states) = snapshot.key_states.get("BuildKey") {
+            self.actions.min_started = states.started as u64;
+            self.actions.min_finished = states.finished as u64;
+        }
+
+        if let Some(states) = snapshot.key_states.get("SingleValidationKey") {
+            self.validations.min_started = states.started as u64;
+            self.validations.min_finished = states.finished as u64;
+        }
+    }
+
+    fn action_finished(&mut self, action: BesTrackedActionSpan) {
+        if action.running_local {
+            self.counters.running_local = self.counters.running_local.saturating_sub(1);
+        }
+        if action.running_remote {
+            self.counters.running_remote = self.counters.running_remote.saturating_sub(1);
+        }
+    }
+
+    fn record_completed_action(&mut self, action: &buck2_data::ActionExecutionEnd) {
+        let exec_time_ms = last_command_execution_time_ms(action);
+        self.counters.exec_time_ms = self.counters.exec_time_ms.saturating_add(exec_time_ms);
+
+        if action.kind != buck2_data::ActionKind::Run as i32 {
+            return;
+        }
+
+        match buck2_data::ActionExecutionKind::try_from(action.execution_kind) {
+            Ok(buck2_data::ActionExecutionKind::Local)
+            | Ok(buck2_data::ActionExecutionKind::LocalWorker) => {
+                self.counters.local_actions = self.counters.local_actions.saturating_add(1);
+            }
+            Ok(buck2_data::ActionExecutionKind::Remote)
+            | Ok(buck2_data::ActionExecutionKind::RemoteWorker) => {
+                self.counters.remote_actions = self.counters.remote_actions.saturating_add(1);
+            }
+            Ok(buck2_data::ActionExecutionKind::ActionCache) => {
+                self.counters.cached_actions = self.counters.cached_actions.saturating_add(1);
+                self.counters.cached_exec_time_ms = self
+                    .counters
+                    .cached_exec_time_ms
+                    .saturating_add(exec_time_ms);
+            }
+            Ok(buck2_data::ActionExecutionKind::RemoteDepFileCache) => {
+                self.counters.remote_dep_file_cached_actions = self
+                    .counters
+                    .remote_dep_file_cached_actions
+                    .saturating_add(1);
+                self.counters.cached_exec_time_ms = self
+                    .counters
+                    .cached_exec_time_ms
+                    .saturating_add(exec_time_ms);
+            }
+            _ => {}
+        }
+    }
+
+    fn maybe_render(
+        &mut self,
+        event: &buck2_data::BuckEvent,
+        force: bool,
+        allow_periodic: bool,
+    ) -> Option<String> {
+        let now_us = timestamp_micros(event.timestamp.as_ref());
+        let due = self
+            .last_emitted_at_us
+            .zip(now_us)
+            .is_none_or(|(last, now)| now.saturating_sub(last) >= BES_PROGRESS_MIN_INTERVAL_US);
+        if !force && (!allow_periodic || !due) {
+            return None;
+        }
+        if self.command_name.is_none() && !self.has_progress() {
+            return None;
+        }
+
+        let mut rendered = self.render();
+        if rendered.is_empty() || self.last_rendered.as_ref() == Some(&rendered) {
+            return None;
+        }
+        rendered.push('\n');
+        self.last_rendered = Some(rendered.clone());
+        self.last_emitted_at_us = now_us;
+        Some(rendered)
+    }
+
+    fn has_progress(&self) -> bool {
+        self.loads.stats().started > 0
+            || self.analyses.stats().started > 0
+            || self.actions.stats().started > 0
+            || self.validations.stats().started > 0
+    }
+
+    fn render(&self) -> String {
+        let mut lines = Vec::new();
+        let loads = self.loads.stats();
+        let analyses = self.analyses.stats();
+        let actions = self.actions.stats();
+        let validations = self.validations.stats();
+
+        if loads.started > 0 {
+            let mut line = render_progress_phase("Loading targets.    ", &loads, loads.running);
+            let extra = self.render_loads_extra();
+            if !extra.is_empty() {
+                line.push_str("  ");
+                line.push_str(&extra);
+            }
+            lines.push(line);
+        }
+        if analyses.started > 0 {
+            let mut line =
+                render_progress_phase("Analyzing targets.  ", &analyses, analyses.running);
+            let extra = self.render_analyses_extra();
+            if !extra.is_empty() {
+                line.push_str("  ");
+                line.push_str(&extra);
+            }
+            lines.push(line);
+        }
+        if actions.started == 0 {
+            lines.push(self.command_header());
+        } else {
+            let mut line = self.render_actions(&actions);
+            let extra = self.render_actions_extra();
+            if !extra.is_empty() {
+                line.push_str("  ");
+                line.push_str(&extra);
+            }
+            lines.push(line);
+            if validations.started > 0 {
+                lines.push(render_progress_phase(
+                    "Running validations.",
+                    &validations,
+                    validations.running,
+                ));
+            }
+            lines.push(
+                format!(
+                    "{:<18} {}",
+                    self.command_header(),
+                    self.render_action_stats()
+                )
+                .trim_end()
+                .to_owned(),
+            );
+        }
+
+        lines.join("\n")
+    }
+
+    fn render_actions(&self, actions: &BesProgressPhaseStats) -> String {
+        let mut running = Vec::new();
+        if self.counters.running_local > 0 || self.counters.local_actions > 0 {
+            running.push(format!("{} local", self.counters.running_local));
+        }
+        if self.counters.running_remote > 0 || self.counters.remote_actions > 0 {
+            running.push(format!("{} remote", self.counters.running_remote));
+        }
+        let running = if running.is_empty() {
+            "0".to_owned()
+        } else {
+            running.join(", ")
+        };
+        render_progress_phase_with_running("Executing actions.  ", actions, &running)
+    }
+
+    fn render_loads_extra(&self) -> String {
+        let mut extra = Vec::new();
+        if self.counters.dirs_read > 0 {
+            extra.push(format!("{} dirs read", self.counters.dirs_read));
+        }
+        if self.counters.targets > 0 {
+            extra.push(format!("{} targets declared", self.counters.targets));
+        }
+        extra.join(", ")
+    }
+
+    fn render_analyses_extra(&self) -> String {
+        let mut extra = Vec::new();
+        if self.counters.actions_declared > 0 {
+            extra.push(format!("{} actions", self.counters.actions_declared));
+        }
+        if self.counters.artifacts_declared > 0 {
+            extra.push(format!(
+                "{} artifacts declared",
+                self.counters.artifacts_declared
+            ));
+        }
+        extra.join(", ")
+    }
+
+    fn render_actions_extra(&self) -> String {
+        if self.counters.exec_time_ms == 0 {
+            String::new()
+        } else {
+            format!("{}ms exec time total", self.counters.exec_time_ms)
+        }
+    }
+
+    fn render_action_stats(&self) -> String {
+        let mut res_types = Vec::new();
+        if self.counters.local_actions > 0 {
+            res_types.push(format!("{} local", self.counters.local_actions));
+        }
+        if self.counters.remote_actions > 0 {
+            res_types.push(format!("{} remote", self.counters.remote_actions));
+        }
+        if self.counters.total_cached_actions() > 0 {
+            res_types.push(format!(
+                "{} cache ({}% hit)",
+                self.counters.total_cached_actions(),
+                self.counters.total_cache_hit_percentage()
+            ));
+        }
+        if res_types.is_empty() {
+            String::new()
+        } else {
+            format!("Finished {}", res_types.join(", "))
+        }
+    }
+
+    fn command_header(&self) -> String {
+        format!(
+            "Command: {}.",
+            self.command_name.as_deref().unwrap_or("unknown")
+        )
+    }
+
+    fn current_phase(&self) -> BesProgressPhase {
+        if self.actions.stats().pending() > 0 {
+            BesProgressPhase::Actions
+        } else if self.validations.stats().pending() > 0 {
+            BesProgressPhase::Validations
+        } else if self.analyses.stats().pending() > 0 {
+            BesProgressPhase::Analysis
+        } else if self.loads.stats().pending() > 0 {
+            BesProgressPhase::Loading
+        } else {
+            BesProgressPhase::Command
+        }
+    }
+
+    fn pending_work(&self) -> u64 {
+        self.loads
+            .stats()
+            .pending()
+            .saturating_add(self.analyses.stats().pending())
+            .saturating_add(self.actions.stats().pending())
+            .saturating_add(self.validations.stats().pending())
+    }
+}
+
+fn progress_event_can_render(event: &buck2_data::BuckEvent) -> bool {
+    match event.data.as_ref() {
+        Some(buck2_data::buck_event::Data::SpanStart(_))
+        | Some(buck2_data::buck_event::Data::SpanEnd(_))
+        | Some(buck2_data::buck_event::Data::Record(_)) => true,
+        Some(buck2_data::buck_event::Data::Instant(instant)) => matches!(
+            instant.data.as_ref(),
+            Some(buck2_data::instant_event::Data::DiceStateSnapshot(_))
+        ),
+        None => false,
+    }
+}
+
+fn render_progress_phase(header: &str, stats: &BesProgressPhaseStats, running: u64) -> String {
+    render_progress_phase_with_running(header, stats, &running.to_string())
+}
+
+fn render_progress_phase_with_running(
+    header: &str,
+    stats: &BesProgressPhaseStats,
+    running: &str,
+) -> String {
+    format!(
+        "{header} Remaining {:>5}/{:<5} (running: {running})",
+        stats.pending(),
+        stats.started,
+    )
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct BazelEventConverter {
     build_metadata: BTreeMap<String, String>,
+    skip_successful_action_events: bool,
     saw_started: bool,
     saw_finished: bool,
     progress_count: i32,
@@ -247,16 +898,21 @@ pub(crate) struct BazelEventConverter {
     output_artifacts_from_action_cache_size: u64,
     output_artifacts_from_action_cache_count: u64,
     command_profile: CommandProfileBuilder,
+    bes_progress: BesProgressState,
     pending_pre_start_events: Vec<bep::BuildEvent>,
 }
 
 impl BazelEventConverter {
-    pub(crate) fn new<I>(build_metadata: I) -> Self
+    pub(crate) fn new_with_options<I>(
+        build_metadata: I,
+        upload_successful_action_events: bool,
+    ) -> Self
     where
         I: IntoIterator<Item = (String, String)>,
     {
         Self {
             build_metadata: build_metadata.into_iter().collect(),
+            skip_successful_action_events: !upload_successful_action_events,
             ..Self::default()
         }
     }
@@ -296,6 +952,12 @@ impl BazelEventConverter {
                 self.convert_record(event, record, &mut events);
             }
             None => {}
+        }
+
+        if !self.final_progress_emitted
+            && let Some(progress) = self.bes_progress.handle_event(event)
+        {
+            events.push(self.progress_event(sequence_hint, None, Some(progress)));
         }
 
         if !self.saw_started {
@@ -474,7 +1136,9 @@ impl BazelEventConverter {
                         .output_artifacts_from_action_cache_count
                         .saturating_add(action.outputs.len() as u64);
                 }
-                if let Some(action_event) = action_event(event, span_end, action) {
+                if (!self.skip_successful_action_events || action.failed)
+                    && let Some(action_event) = action_event(event, span_end, action)
+                {
                     self.remember_action(&action_event);
                     self.remember_target_outputs(action);
                     events.push(action_event);
@@ -5508,6 +6172,22 @@ fn action_counts_as_executed(action: &buck2_data::ActionExecutionEnd) -> bool {
     )
 }
 
+fn last_command_execution_time_ms(action: &buck2_data::ActionExecutionEnd) -> u64 {
+    action
+        .commands
+        .last()
+        .and_then(|command| command.details.as_ref())
+        .and_then(|details| details.metadata.as_ref())
+        .and_then(|metadata| metadata.execution_time.as_ref())
+        .map(|duration| {
+            u64::try_from(duration.seconds)
+                .unwrap_or_default()
+                .saturating_mul(1_000)
+                .saturating_add(u64::try_from(duration.nanos).unwrap_or_default() / 1_000_000)
+        })
+        .unwrap_or_default()
+}
+
 fn action_outputs_from_local_action_cache(action: &buck2_data::ActionExecutionEnd) -> bool {
     matches!(
         buck2_data::ActionExecutionKind::try_from(action.execution_kind),
@@ -6033,6 +6713,16 @@ mod tests {
             .expect("progress event")
     }
 
+    fn progress_payloads(events: &[bep::BuildEvent]) -> Vec<&bep::Progress> {
+        events
+            .iter()
+            .filter_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::Progress(progress)) => Some(progress),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn configured_target() -> buck2_data::ConfiguredTargetLabel {
         configured_target_with_package("pkg", "main", "cfg")
     }
@@ -6382,6 +7072,272 @@ mod tests {
         let progress = progress_payload(&events);
         assert_eq!(progress.stdout, "stdout chunk");
         assert_eq!(progress.stderr, "");
+    }
+
+    #[test]
+    fn normal_build_progress_uses_stderr() {
+        let mut converter = BazelEventConverter::default();
+        let mut events = Vec::new();
+
+        events.extend(converter.convert(
+            1,
+            &trace_event_at(
+                1,
+                0,
+                0,
+                buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::Command(
+                        buck2_data::CommandStart {
+                            cli_args: vec![
+                                "buck2".to_owned(),
+                                "build".to_owned(),
+                                "//:main".to_owned(),
+                            ],
+                            data: Some(buck2_data::command_start::Data::Build(
+                                buck2_data::BuildCommandStart {},
+                            )),
+                            ..Default::default()
+                        },
+                    )),
+                }),
+            ),
+        ));
+        events.extend(converter.convert(
+            2,
+            &trace_event_at(
+                2,
+                1,
+                1_000,
+                buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::Load(
+                        buck2_data::LoadBuildFileStart {
+                            module_id: "root//pkg:BUCK".to_owned(),
+                            cell: "root".to_owned(),
+                        },
+                    )),
+                }),
+            ),
+        ));
+        events.extend(converter.convert(
+            3,
+            &trace_event_at(
+                2,
+                1,
+                2_000,
+                buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::Load(
+                        buck2_data::LoadBuildFileEnd {
+                            module_id: "root//pkg:BUCK".to_owned(),
+                            cell: "root".to_owned(),
+                            target_count: Some(3),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                }),
+            ),
+        ));
+        events.extend(converter.convert(
+            4,
+            &trace_event_at(
+                3,
+                1,
+                3_000,
+                buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::Analysis(
+                        buck2_data::AnalysisStart {
+                            target: Some(buck2_data::analysis_start::Target::StandardTarget(
+                                configured_target(),
+                            )),
+                            rule: "genrule".to_owned(),
+                        },
+                    )),
+                }),
+            ),
+        ));
+        events.extend(converter.convert(
+            5,
+            &trace_event_at(
+                3,
+                1,
+                4_000,
+                buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::Analysis(
+                        buck2_data::AnalysisEnd {
+                            target: Some(buck2_data::analysis_end::Target::StandardTarget(
+                                configured_target(),
+                            )),
+                            rule: "genrule".to_owned(),
+                            declared_actions: Some(2),
+                            declared_artifacts: Some(4),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                }),
+            ),
+        ));
+        events.extend(converter.convert(
+            6,
+            &trace_event_at(
+                4,
+                1,
+                5_000,
+                buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::ActionExecution(
+                        buck2_data::ActionExecutionStart {
+                            kind: buck2_data::ActionKind::Run as i32,
+                            name: Some(buck2_data::ActionName {
+                                category: "genrule".to_owned(),
+                                identifier: "main".to_owned(),
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                }),
+            ),
+        ));
+        events.extend(converter.convert(
+            7,
+            &trace_event_at(
+                4,
+                1,
+                6_000,
+                buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::ActionExecution(Box::new(
+                        buck2_data::ActionExecutionEnd {
+                            kind: buck2_data::ActionKind::Run as i32,
+                            name: Some(buck2_data::ActionName {
+                                category: "genrule".to_owned(),
+                                identifier: "main".to_owned(),
+                            }),
+                            execution_kind: buck2_data::ActionExecutionKind::Local as i32,
+                            ..Default::default()
+                        },
+                    ))),
+                    ..Default::default()
+                }),
+            ),
+        ));
+
+        let progress = progress_payloads(&events);
+        assert!(
+            progress
+                .iter()
+                .any(|progress| progress.stderr.contains("Command: build."))
+        );
+        assert!(progress.iter().any(|progress| {
+            progress
+                .stderr
+                .contains("Loading targets.     Remaining     1/1")
+        }));
+        assert!(progress.iter().any(|progress| {
+            progress
+                .stderr
+                .contains("Analyzing targets.   Remaining     1/1")
+        }));
+        assert!(progress.iter().any(|progress| {
+            progress
+                .stderr
+                .contains("Executing actions.   Remaining     1/1")
+        }));
+        assert!(
+            progress
+                .iter()
+                .any(|progress| { progress.stderr.contains("2 actions, 4 artifacts declared") })
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|progress| progress.stderr.contains("Finished 1 local"))
+        );
+        assert!(progress.iter().all(|progress| progress.stdout.is_empty()));
+    }
+
+    #[test]
+    fn successful_action_upload_filter_keeps_progress() {
+        let mut converter =
+            BazelEventConverter::new_with_options(std::iter::empty::<(String, String)>(), false);
+        let mut events = Vec::new();
+        let target = configured_target();
+        let key = buck2_data::ActionKey {
+            owner: Some(buck2_data::action_key::Owner::TargetLabel(target)),
+            key: "action-key".to_owned(),
+            ..Default::default()
+        };
+
+        events.extend(converter.convert(
+            1,
+            &trace_event_at(
+                1,
+                0,
+                0,
+                buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::Command(
+                        buck2_data::CommandStart {
+                            data: Some(buck2_data::command_start::Data::Build(
+                                buck2_data::BuildCommandStart {},
+                            )),
+                            ..Default::default()
+                        },
+                    )),
+                }),
+            ),
+        ));
+        events.extend(converter.convert(
+            2,
+            &trace_event_at(
+                2,
+                1,
+                1_000,
+                buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::ActionExecution(
+                        buck2_data::ActionExecutionStart {
+                            key: Some(key.clone()),
+                            kind: buck2_data::ActionKind::Run as i32,
+                            name: Some(buck2_data::ActionName {
+                                category: "genrule".to_owned(),
+                                identifier: "main".to_owned(),
+                            }),
+                        },
+                    )),
+                }),
+            ),
+        ));
+        events.extend(converter.convert(
+            3,
+            &trace_event_at(
+                2,
+                1,
+                2_000,
+                buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::ActionExecution(Box::new(
+                        buck2_data::ActionExecutionEnd {
+                            key: Some(key),
+                            kind: buck2_data::ActionKind::Run as i32,
+                            name: Some(buck2_data::ActionName {
+                                category: "genrule".to_owned(),
+                                identifier: "main".to_owned(),
+                            }),
+                            execution_kind: buck2_data::ActionExecutionKind::Remote as i32,
+                            ..Default::default()
+                        },
+                    ))),
+                    ..Default::default()
+                }),
+            ),
+        ));
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.payload, Some(build_event::Payload::Action(_))))
+        );
+        assert!(
+            progress_payloads(&events)
+                .iter()
+                .any(|progress| progress.stderr.contains("Finished 1 remote"))
+        );
     }
 
     #[test]
@@ -7272,10 +8228,13 @@ mod tests {
 
     #[test]
     fn command_start_includes_configured_build_metadata() {
-        let mut converter = BazelEventConverter::new([
-            ("PARENT_RUN_ID".to_owned(), "workflow-run".to_owned()),
-            (BUILDBUDDY_VISIBILITY_KEY.to_owned(), "PRIVATE".to_owned()),
-        ]);
+        let mut converter = BazelEventConverter::new_with_options(
+            [
+                ("PARENT_RUN_ID".to_owned(), "workflow-run".to_owned()),
+                (BUILDBUDDY_VISIBILITY_KEY.to_owned(), "PRIVATE".to_owned()),
+            ],
+            true,
+        );
         let event = trace_event(buck2_data::buck_event::Data::SpanStart(
             buck2_data::SpanStartEvent {
                 data: Some(buck2_data::span_start_event::Data::Command(
@@ -10014,7 +10973,11 @@ mod tests {
             Some(build_event::Payload::Configured(_))
         ));
 
-        assert!(completed.is_empty());
+        assert!(
+            !completed
+                .iter()
+                .any(|event| matches!(event.payload, Some(build_event::Payload::Completed(_))))
+        );
 
         let Some(build_event_id::Id::ActionCompleted(action_id)) =
             action[0].id.as_ref().and_then(|id| id.id.as_ref())

@@ -1270,7 +1270,12 @@ impl WorkerState {
             return Ok(());
         }
         let upload_config = BazelArtifactUploadConfig::from_bes(&self.config, &self.connection)?;
-        let stream = StreamState::new(parsed, &self.config.build_metadata, upload_config);
+        let stream = StreamState::new(
+            parsed,
+            &self.config.build_metadata,
+            upload_config,
+            self.config.upload_successful_action_events,
+        );
         self.streams.insert(parsed.invocation_id.clone(), stream);
         Ok(())
     }
@@ -1562,6 +1567,7 @@ impl StreamState {
         parsed: &ParsedMessage,
         build_metadata: &[(String, String)],
         bazel_artifact_upload_config: Option<BazelArtifactUploadConfig>,
+        upload_successful_action_events: bool,
     ) -> Self {
         Self {
             stream_id: StreamId {
@@ -1575,7 +1581,10 @@ impl StreamState {
             ack_task: None,
             project_id: parsed.project_id.clone(),
             pending_unacked: VecDeque::new(),
-            bazel_converter: BazelEventConverter::new(build_metadata.iter().cloned()),
+            bazel_converter: BazelEventConverter::new_with_options(
+                build_metadata.iter().cloned(),
+                upload_successful_action_events,
+            ),
             bazel_artifact_uploader: bazel_artifact_upload_config.map(BazelArtifactUploader::new),
             last_sent_sequence_number: 0,
             saw_command_end: false,
@@ -2447,7 +2456,7 @@ mod tests {
             command_start_data(),
         );
         let parsed = ParsedMessage::from_message(&message).expect("valid message");
-        let mut stream = StreamState::new(&parsed, &[], None);
+        let mut stream = StreamState::new(&parsed, &[], None, true);
 
         let last_sequence = stream.enqueue_event(&parsed, BesEventFormat::Bazel).await;
 
