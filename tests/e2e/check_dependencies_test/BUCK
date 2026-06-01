@@ -1,3 +1,4 @@
+load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup")
 load("@fbsource//tools/build_defs:check_dependencies_test.bzl", "assert_dependencies_test", "audit_dependents_test", "check_dependencies_test", "check_mutually_exclusive_dependencies_test")
 
 ### This file contains some "e2e tests" for the BXL check_dependencies_test infra.
@@ -22,6 +23,11 @@ TARGET3 = "fbcode//buck2/tests/targets/check_dependencies_test:useless_target_3"
 CONTACTS = ["build_infra"]
 
 oncall("build_infra")
+
+buck_filegroup(
+    name = "check_dependencies_oss_data",
+    srcs = ["test_check_dependencies_oss_data"],
+)
 
 check_dependencies_test(
     name = "allow_list_and_block_none",

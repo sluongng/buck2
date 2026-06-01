@@ -1185,6 +1185,14 @@ impl ServerCommandContextTrait for ServerCommandContext<'_> {
             "materializer".to_owned(),
             self.base_context.daemon.materializer.name().to_owned(),
         );
+        metadata.insert(
+            "REPO_ROOT".to_owned(),
+            self.base_context.project_root.root().to_string(),
+        );
+        metadata.insert(
+            "BUILD_WORKING_DIRECTORY".to_owned(),
+            self.working_dir_abs.to_string(),
+        );
 
         if let Some(oncall) = &self.oncall {
             metadata.insert("oncall".to_owned(), oncall.clone());

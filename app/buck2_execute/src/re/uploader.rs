@@ -176,7 +176,10 @@ impl Uploader {
             })
         } else {
             let client = client.clone();
-            let metadata = use_case.metadata(identity);
+            let mut metadata = use_case.metadata(identity);
+            if let Some(id) = identity.and_then(|id| id.action_id.clone()) {
+                metadata.action_id = Some(id);
+            }
             let digests = input_digests.iter().map(|d| d.to_re()).collect();
             let digests_ttl = client.get_digests_ttl(digests, metadata).await;
 
@@ -312,18 +315,18 @@ impl Uploader {
                     }
                     Err(
                         ref err @ ArtifactNotMaterializedReason::RequiresCasDownload {
+                            ref path,
                             ref entry,
                             ref info,
-                            ..
                         },
                     ) => {
                         if let DirectoryEntry::Leaf(ActionDirectoryMember::File(file)) =
                             entry.as_ref()
                         {
-                            // NOTE: find_missing has negative caching, so when we query to know if an
-                            // artifact was uploaded, if it was the result of an action we just ran, it
-                            // won't be here. On the flip side, if a digest has been in the CAS for
-                            // a very long time, it might have expired.
+                            // NOTE: FindMissingBlobs can report an artifact missing even when Buck
+                            // can still materialize it locally from the deferred materializer.
+                            // On the flip side, if a digest has been in the CAS for a very long
+                            // time, it might have expired.
                             if file.digest.to_re() == digest {
                                 if should_error_for_missing_digest(info) {
                                     soft_error!(
@@ -361,6 +364,15 @@ impl Uploader {
                                     quiet: true
                                 )?;
 
+                                // Materialize this file from CAS and include it in this upload.
+                                // Skipping it would leave the downstream action with an
+                                // incomplete input set after FindMissingBlobs reported it absent.
+                                paths_to_materialize.push(path.clone());
+                                upload_files.push(NamedDigest {
+                                    name: fs.resolve(path).as_maybe_relativized_str()?.to_owned(),
+                                    digest,
+                                    ..Default::default()
+                                });
                                 continue;
                             }
                         }
@@ -427,12 +439,17 @@ impl Uploader {
 
         // Upload
         if !upload_files.is_empty() || !upload_blobs.is_empty() {
+            let mut metadata = use_case.metadata(identity);
+            if let Some(id) = identity.and_then(|id| id.action_id.clone()) {
+                metadata.action_id = Some(id);
+            }
             with_error_handler(
                 "upload",
                 client.get_session_id(),
-                client.get_raw_re_client()
+                client
+                    .get_raw_re_client()
                     .upload(
-                        use_case.metadata(identity),
+                        metadata,
                         UploadRequest {
                             files_with_digest: Some(upload_files),
                             inlined_blobs_with_digest: Some(upload_blobs),
@@ -661,7 +678,10 @@ fn query_digest_ttls<'s>(
     input_digests: Vec<TrackedFileDigest>,
 ) -> BoxFuture<'s, buck2_error::Result<StdBuckHashMap<TrackedFileDigest, i64>>> {
     let client = client.dupe();
-    let metadata = use_case.metadata(identity);
+    let mut metadata = use_case.metadata(identity);
+    if let Some(id) = identity.and_then(|id| id.action_id.clone()) {
+        metadata.action_id = Some(id);
+    }
     let digests = input_digests.iter().map(|d| d.to_re()).collect();
 
     async move {

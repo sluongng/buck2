@@ -1,0 +1,21 @@
+load(":defs.bzl", "buildbuddy_local_cache", "buildbuddy_rbe")
+
+oncall("build_infra")
+
+host_cpu = "prelude//cpu:" + (
+    "arm64" if host_info().arch.is_aarch64 else "riscv64" if host_info().arch.is_riscv64 else "x86_64"
+)
+
+host_os = "prelude//os:" + ("macos" if host_info().os.is_macos else "linux")
+
+buildbuddy_local_cache(
+    name = "buildbuddy-local-cache",
+    cpu_configuration = host_cpu,
+    os_configuration = host_os,
+)
+
+buildbuddy_rbe(
+    name = "buildbuddy-rbe",
+    cpu_configuration = host_cpu,
+    os_configuration = host_os,
+)
