@@ -81,8 +81,9 @@ actions:
           cp shim/third-party/rust/BUCK.reindeer shim/third-party/rust/BUCK
 
       # Use the bootstrap Buck2 binary to build the current checkout's Buck2.
-      # The resulting binary path is saved so subsequent steps do not rely on
-      # shell variables crossing step boundaries.
+      # Keep this build remote-only: the workflow is intended to prove that RBE
+      # can bootstrap the fork without falling back to local execution on the
+      # runner.
       - run: |
           set -euo pipefail
 
@@ -105,8 +106,8 @@ actions:
           "$built_buck2" --version
 
       # Rebuild //:buck2 with the freshly built binary, then run the BuildBuddy
-      # remote matrix. The explicit binary build proves the fork can bootstrap
-      # itself remotely before broader test coverage runs with that binary.
+      # remote matrix. Keep this second build remote-only as well, so the final
+      # validation exercises the same RBE path as the matrix tests.
       - run: |
           set -euo pipefail
 
