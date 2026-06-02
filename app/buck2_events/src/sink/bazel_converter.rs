@@ -358,6 +358,7 @@ impl BesProgressCounters {
 }
 
 const BES_PROGRESS_MIN_INTERVAL_US: i64 = 1_000_000;
+const BES_PROGRESS_CLEAR_FROM_CURSOR: &str = "\x1b[J";
 
 #[derive(Debug, Default)]
 struct BesProgressState {
@@ -369,6 +370,7 @@ struct BesProgressState {
     counters: BesProgressCounters,
     last_emitted_at_us: Option<i64>,
     last_rendered: Option<String>,
+    last_rendered_line_count: usize,
 }
 
 impl BesProgressState {
@@ -651,14 +653,27 @@ impl BesProgressState {
             return None;
         }
 
-        let mut rendered = self.render();
+        let rendered = self.render();
         if rendered.is_empty() || self.last_rendered.as_ref() == Some(&rendered) {
             return None;
         }
-        rendered.push('\n');
-        self.last_rendered = Some(rendered.clone());
+        let rendered_line_count = rendered.lines().count();
+        let mut output = if self.last_rendered_line_count > 0 {
+            // BuildBuddy's event log writer interprets ANSI cursor control, so
+            // rewrite the previous progress block instead of appending another
+            // full console snapshot.
+            format!(
+                "\x1b[{}A{}{}",
+                self.last_rendered_line_count, BES_PROGRESS_CLEAR_FROM_CURSOR, rendered
+            )
+        } else {
+            rendered.clone()
+        };
+        output.push('\n');
+        self.last_rendered = Some(rendered);
+        self.last_rendered_line_count = rendered_line_count;
         self.last_emitted_at_us = now_us;
-        Some(rendered)
+        Some(output)
     }
 
     fn has_progress(&self) -> bool {
@@ -7252,6 +7267,10 @@ mod tests {
                 .any(|progress| progress.stderr.contains("Finished 1 local"))
         );
         assert!(progress.iter().all(|progress| progress.stdout.is_empty()));
+        assert!(progress.iter().skip(1).any(|progress| {
+            progress.stderr.starts_with("[")
+                && progress.stderr.contains(BES_PROGRESS_CLEAR_FROM_CURSOR)
+        }));
     }
 
     #[test]
