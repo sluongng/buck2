@@ -23,7 +23,7 @@ load(
     "value_or",
 )
 load(":cgo_builder.bzl", "get_cgo_build_context")
-load(":compile.bzl", "GoTestInfo")
+load(":compile.bzl", "GoTestInfo", "get_inherited_compile_pkgs")
 load(":coverage.bzl", "GoCoverageMode")
 load(":link.bzl", "GoBuildMode", "get_inherited_link_pkgs", "link")
 load(":package_builder.bzl", "GoBuildConfig", "GoSourceInputs", "declare_package_build")
@@ -36,6 +36,7 @@ def _gen_test_main(
     coverage_mode: [GoCoverageMode, None],
     cover_packages: list[str],  # packages those are included for coverage
     test_go_files_argsfile: Artifact,
+    x_test_go_files_argsfile: Artifact,
 ) -> Artifact:
     """
     Generate a `main.go` which calls tests from the given sources.
@@ -53,6 +54,7 @@ def _gen_test_main(
     if coverage_mode != None:
         cmd.extend(["--cover-mode", coverage_mode.value])
     cmd.append(cmd_args(cover_pkgs_argsfile, format = "@{}"))
+    cmd.append(cmd_args(x_test_go_files_argsfile, format = "--xtest-files={}"))
     cmd.append(cmd_args(test_go_files_argsfile, format = "@{}"))
     ctx.actions.run(cmd_args(cmd), category = "go_test_main_gen")
     return output
@@ -65,16 +67,20 @@ def go_test_impl(ctx: AnalysisContext) -> list[Provider]:
     pkg_import_path = go_attr_pkg_name(ctx)
     cgo_enabled = evaluate_cgo_enabled(cxx_toolchain_available, ctx.attrs.cgo_enabled)
 
-    deps = ctx.attrs.deps
-    srcs = ctx.attrs.srcs
+    deps = [] + ctx.attrs.deps
+    cdeps = [] + ctx.attrs.cdeps
+    srcs = [] + ctx.attrs.srcs
+    header_namespace = None
     coverage_enabled = ctx.attrs.coverage_enabled
 
     # Copy the srcs, deps and pkg_import_path from the target library when set. The
     # library code gets compiled together with the tests.
     if ctx.attrs.target_under_test:
         lib = ctx.attrs.target_under_test[GoTestInfo]
-        srcs += lib.srcs
-        deps += lib.deps
+        srcs += lib.srcs or []
+        deps += lib.deps or []
+        cdeps += lib.cdeps or []
+        header_namespace = lib.header_namespace
 
         # TODO: should we assert that pkg_import_path != None here?
         pkg_import_path = lib.pkg_import_path
@@ -83,11 +89,11 @@ def go_test_impl(ctx: AnalysisContext) -> list[Provider]:
     # If coverage is enabled for this test, we need to preprocess the sources
     # with the Go cover tool.
     coverage_mode = GoCoverageMode(ctx.attrs._coverage_mode) if ctx.attrs._coverage_mode else None
-    cgo_build_context = get_cgo_build_context(ctx)
+    cgo_build_context = get_cgo_build_context(ctx, deps + cdeps, header_namespace = header_namespace)
     pkgs = {}
 
-    # Compile all tests into a package.
-    tests, tests_pkg_info, test_go_files_argsfile = declare_package_build(
+    # Compile the package under test with same-package tests.
+    tests, tests_pkg_info, test_go_files_argsfile, x_test_go_files_argsfile = declare_package_build(
         ctx = ctx,
         pkg_import_path = pkg_import_path,
         main = False,
@@ -110,23 +116,63 @@ def go_test_impl(ctx: AnalysisContext) -> list[Provider]:
     )
 
     cover_packages = []
+    inherited_link_pkgs = get_inherited_link_pkgs(deps)
+    inherited_link_pkg_names = set(inherited_link_pkgs.keys())
+    inherited_compile_pkg_names = set(get_inherited_compile_pkgs(deps).keys())
+    deps_provide_pkg = pkg_import_path in inherited_link_pkg_names or pkg_import_path in inherited_compile_pkg_names
 
     # Cover the test package itself
-    if tests.coverage_instrumented:
+    if not deps_provide_pkg and tests.coverage_instrumented:
         cover_packages.append(pkg_import_path)
 
     # Get all packages that are linked to the test (i.e. the entire dependency tree)
-    for import_path, pkg in get_inherited_link_pkgs(deps).items():
+    for import_path, pkg in inherited_link_pkgs.items():
         if pkg.coverage_instrumented:
             # Cover dependencies with coverage instrumented
             cover_packages.append(import_path)
 
-    pkgs[pkg_import_path] = tests
+    if not deps_provide_pkg:
+        pkgs[pkg_import_path] = tests
+
+    external_pkgs = {}
+    for import_path, pkg in pkgs.items():
+        if import_path not in inherited_compile_pkg_names:
+            external_pkgs[import_path] = pkg
+
+    external_tests, _, _, _ = declare_package_build(
+        ctx = ctx,
+        pkg_import_path = pkg_import_path + "_test",
+        main = False,
+        sources = GoSourceInputs(
+            srcs = srcs,
+            embed_srcs = from_named_set(ctx.attrs.embed_srcs),
+            package_root = ctx.attrs.package_root,
+        ),
+        cgo_build_context = cgo_build_context,
+        config = GoBuildConfig(
+            compiler_flags = ctx.attrs.compiler_flags,
+            build_tags = ctx.attrs._build_tags,
+            with_tests = True,
+            external_tests = True,
+            cgo_enabled = cgo_enabled,
+        ),
+        pkgs = external_pkgs,
+        deps = deps,
+        cgo_gen_dir_name = "cgo_gen_xtest",
+    )
+    pkgs[pkg_import_path + "_test"] = external_tests
+
+    link_pkgs = {}
+    for import_path, pkg in inherited_link_pkgs.items():
+        link_pkgs[import_path] = pkg
+    for import_path, pkg in pkgs.items():
+        if import_path not in link_pkgs:
+            link_pkgs[import_path] = pkg
 
     # Generate a 'main.go' file (test runner) which runs the actual tests from the package above.
     # Build the it as a separate package (<foo>.test) - which imports and invokes the test package.
-    gen_main = _gen_test_main(ctx, pkg_import_path, coverage_mode, cover_packages, test_go_files_argsfile)
-    main, _, _ = declare_package_build(
+    gen_main = _gen_test_main(ctx, pkg_import_path, coverage_mode, cover_packages, test_go_files_argsfile, x_test_go_files_argsfile)
+    main, _, _, _ = declare_package_build(
         ctx = ctx,
         pkg_import_path = pkg_import_path + ".test",
         main = True,
@@ -138,7 +184,7 @@ def go_test_impl(ctx: AnalysisContext) -> list[Provider]:
         config = GoBuildConfig(
             cgo_enabled = cgo_enabled,
         ),
-        pkgs = pkgs,
+        pkgs = link_pkgs,
         cgo_gen_dir_name = "cgo_gen_test_main",
     )
 
@@ -147,8 +193,9 @@ def go_test_impl(ctx: AnalysisContext) -> list[Provider]:
         ctx = ctx,
         main = main,
         cgo_enabled = cgo_enabled,
-        pkgs = pkgs,
-        deps = deps,
+        pkgs = link_pkgs,
+        deps = [],
+        native_deps = deps + cdeps,
         link_style = value_or(map_val(LinkStyle, ctx.attrs.link_style), LinkStyle("static")),
         build_mode = GoBuildMode(value_or(ctx.attrs.build_mode, "exe")),
         linker_flags = ctx.attrs.linker_flags,
