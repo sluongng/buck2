@@ -11,6 +11,7 @@
 package gobuckifylib
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -130,7 +131,7 @@ func GenerateGoModBuckFiles(workDir string, patterns []string) error {
 	if err != nil {
 		return err
 	}
-	zipSHA256, err := queryModuleZipSHA256(workDir)
+	zipSHA256, err := queryModuleZipSHA256(workDir, pkgs)
 	if err != nil {
 		return err
 	}
@@ -190,16 +191,56 @@ func GenerateGoModBuckFiles(workDir string, patterns []string) error {
 }
 
 func queryRootModule(workDir string) (*Module, error) {
+	goModPath := queryGoModPath(workDir)
 	cmd := exec.Command("go", "list", "-m", "-json")
 	cmd.Dir = workDir
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("failed to query root module: %w", err)
 	}
-	var mod Module
-	if err := json.Unmarshal(out, &mod); err != nil {
-		return nil, fmt.Errorf("failed to decode root module: %w", err)
+	return selectRootModule(out, workDir, goModPath)
+}
+
+func queryGoModPath(workDir string) string {
+	cmd := exec.Command("go", "env", "GOMOD")
+	cmd.Dir = workDir
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
 	}
+	return strings.TrimSpace(string(out))
+}
+
+func selectRootModule(out []byte, workDir string, goModPath string) (*Module, error) {
+	var first *Module
+	var matchingDir *Module
+	dec := json.NewDecoder(bytes.NewReader(out))
+	for {
+		var mod Module
+		if err := dec.Decode(&mod); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, fmt.Errorf("failed to decode root module: %w", err)
+		}
+		modCopy := mod
+		if first == nil {
+			first = &modCopy
+		}
+		if goModPath != "" && samePath(mod.GoMod, goModPath) {
+			return &modCopy, nil
+		}
+		if samePath(mod.Dir, workDir) {
+			matchingDir = &modCopy
+		}
+	}
+	if matchingDir != nil {
+		return matchingDir, nil
+	}
+	if first != nil {
+		return first, nil
+	}
+	var mod Module
 	return &mod, nil
 }
 
@@ -459,48 +500,38 @@ type moduleDownload struct {
 	Error   string
 }
 
-func queryModuleZipSHA256(workDir string) (map[string]string, error) {
-	cmd := exec.Command("go", "mod", "download", "-json", "all")
-	cmd.Dir = workDir
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create go mod download stdout pipe: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create go mod download stderr pipe: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("failed to start go mod download: %w", err)
-	}
-
+func queryModuleZipSHA256(workDir string, pkgs []*GoModPackage) (map[string]string, error) {
 	checksums := map[string]string{}
-	dec := json.NewDecoder(stdout)
-	for {
-		var mod moduleDownload
-		if err := dec.Decode(&mod); err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return nil, fmt.Errorf("failed to decode go mod download output: %w", err)
-		}
-		if mod.Error != "" || mod.Zip == "" {
+	modules := map[string]*Module{}
+	for _, pkg := range pkgs {
+		if pkg == nil || pkg.Module == nil {
 			continue
 		}
-		sha, err := fileSHA256(mod.Zip)
+		mod := effectiveModule(pkg.Module)
+		if mod == nil || mod.Version == "" {
+			continue
+		}
+		modules[mod.Path+"@"+mod.Version] = mod
+	}
+	keys := make([]string, 0, len(modules))
+	for key := range modules {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		mod := modules[key]
+		downloaded, err := downloadModule(workDir, mod.Path, mod.Version)
 		if err != nil {
 			return nil, err
 		}
-		checksums[mod.Path+"@"+mod.Version] = sha
-	}
-
-	stderrBytes, readErr := io.ReadAll(stderr)
-	waitErr := cmd.Wait()
-	if readErr != nil {
-		return nil, fmt.Errorf("failed to read go mod download stderr: %w", readErr)
-	}
-	if waitErr != nil {
-		return nil, fmt.Errorf("go mod download failed: %w\n%s", waitErr, string(stderrBytes))
+		if downloaded.Zip == "" {
+			continue
+		}
+		sha, err := fileSHA256(downloaded.Zip)
+		if err != nil {
+			return nil, err
+		}
+		checksums[key] = sha
 	}
 	return checksums, nil
 }
@@ -633,8 +664,33 @@ func (s *goModState) isRootPackage(pkg *GoModPackage) bool {
 	return pkg.Module != nil && pkg.Module.Path == s.RootModule.Path
 }
 
-func (s *goModState) labelForPackage(pkg *GoModPackage) string {
+func (s *goModState) isLocalPackage(pkg *GoModPackage) bool {
 	if s.isRootPackage(pkg) {
+		return true
+	}
+	_, ok := s.localModuleRoot(pkg)
+	return ok
+}
+
+func (s *goModState) localModuleRoot(pkg *GoModPackage) (string, bool) {
+	if pkg == nil || pkg.Module == nil {
+		return "", false
+	}
+	mod := pkg.Module
+	localDir := ""
+	if mod.Replace != nil && mod.Replace.Version == "" && mod.Replace.Dir != "" {
+		localDir = mod.Replace.Dir
+	} else if mod.Main && mod.Path != s.RootModule.Path && mod.Dir != "" {
+		localDir = mod.Dir
+	}
+	if localDir == "" || !pathWithinDir(s.RootDir, localDir) || !pathWithinDir(localDir, pkg.Dir) {
+		return "", false
+	}
+	return localDir, true
+}
+
+func (s *goModState) labelForPackage(pkg *GoModPackage) string {
+	if s.isLocalPackage(pkg) {
 		name := rootTargetName(pkg.ImportPath)
 		rel, err := filepath.Rel(s.RootDir, pkg.Dir)
 		if err != nil || rel == "." {
@@ -643,6 +699,37 @@ func (s *goModState) labelForPackage(pkg *GoModPackage) string {
 		return "//" + filepath.ToSlash(rel) + ":" + name
 	}
 	return "//third_party/go:" + s.externalTargetName(pkg.ImportPath)
+}
+
+func samePath(a string, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	aAbs, err := filepath.Abs(a)
+	if err != nil {
+		return false
+	}
+	bAbs, err := filepath.Abs(b)
+	if err != nil {
+		return false
+	}
+	return filepath.Clean(aAbs) == filepath.Clean(bAbs)
+}
+
+func pathWithinDir(root string, path string) bool {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	pathAbs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(rootAbs), filepath.Clean(pathAbs))
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 func rootTargetName(importPath string) string {
@@ -710,7 +797,7 @@ func (s *goModState) writeRootPackageFiles() error {
 	byDir := map[string][]*goModTarget{}
 	protoByDir := map[string][]*goModProtoTarget{}
 	for _, pkg := range sortedPackages(s.Packages) {
-		if !s.isRootPackage(pkg) {
+		if !s.isLocalPackage(pkg) {
 			continue
 		}
 		rel, err := filepath.Rel(s.RootDir, pkg.Dir)
@@ -814,7 +901,7 @@ func parseRootFileLabel(label string) (string, string, bool) {
 func (s *goModState) writeThirdPartyFile() error {
 	var targets []*goModTarget
 	for _, pkg := range sortedPackages(s.Packages) {
-		if s.isRootPackage(pkg) {
+		if s.isLocalPackage(pkg) {
 			continue
 		}
 		archive, pkgRel, err := s.archiveForPackage(pkg)
@@ -858,7 +945,7 @@ func (s *goModState) writeThirdPartyFile() error {
 func (s *goModState) archiveForPackage(pkg *GoModPackage) (*goModArchive, string, error) {
 	mod := effectiveModule(pkg.Module)
 	if mod.Version == "" {
-		return nil, "", fmt.Errorf("module %s for package %s has no version; local replaces are not supported by gomod generation yet", mod.Path, pkg.ImportPath)
+		return nil, "", fmt.Errorf("module %s for package %s has no version; local replacements and workspace modules must live under %s", pkg.Module.Path, pkg.ImportPath, s.RootDir)
 	}
 	key := mod.Path + "@" + mod.Version
 	archive, ok := s.Archives[key]
