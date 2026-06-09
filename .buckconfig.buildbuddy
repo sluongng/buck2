@@ -16,9 +16,9 @@ clean_stale_enabled = true
 restarter = true
 
 [buck2_re_client]
-engine_address = remote.buildbuddy.io
-action_cache_address = remote.buildbuddy.io
-cas_address = remote.buildbuddy.io
+engine_address = grpc://remote.buildbuddy.io/
+action_cache_address = grpc://remote.buildbuddy.io/
+cas_address = grpc://remote.buildbuddy.io/
 # Keep capabilities enabled so Buck uses BuildBuddy's advertised remote cache
 # protocol features, including ByteStream and BatchUpdate compression.
 capabilities = true
