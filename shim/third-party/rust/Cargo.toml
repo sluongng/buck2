@@ -83,6 +83,7 @@ equivalent = "1.0.2"
 erased-serde = "0.4.10"
 faccess = "0.2.4"
 fancy-regex = "0.16.2"
+fastcdc = "4.0.1"
 fbinit = "0.2"
 flate2 = "1.0.33"
 fnv = "1.0"
@@ -234,7 +235,7 @@ tonic-prost = "0.14.5"
 tonic-prost-build = "0.14.5"
 tower = { version = "0.5.3", features = ["util"] }
 tower-layer = "0.3.3"
-tower-lsp-server = "0.21.1"
+tower-lsp-server = "0.22.1"
 tower-service = "0.3.3"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 tracing-core = { version = "0.1.33", features = ["valuable"] }
