@@ -45,7 +45,6 @@ def _git_fetch_impl(ctx):
     ctx.actions.run(
         cmd,
         category = "git_fetch",
-        prefer_local = True,
         allow_cache_upload = ctx.attrs.allow_cache_upload,
     )
 
