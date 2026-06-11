@@ -13,8 +13,13 @@ load(
     "executable_shared_lib_arguments",
     "make_link_args",
 )
-load("@prelude//cxx:cxx_toolchain_types.bzl", "CxxToolchainInfo")
-load("@prelude//cxx:linker.bzl", "get_default_shared_library_name", "get_shared_library_name_linker_flags")
+load("@prelude//cxx:cxx_toolchain_types.bzl", "CxxToolchainInfo", "LinkerType")
+load(
+    "@prelude//cxx:linker.bzl",
+    "get_default_shared_library_name",
+    "get_no_as_needed_shared_libs_flags",
+    "get_shared_library_name_linker_flags",
+)
 load(
     "@prelude//linking:link_info.bzl",
     "LinkStyle",
@@ -47,6 +52,7 @@ load(":toolchain.bzl", "GoToolchainInfo", "get_toolchain_env_vars")
 GoPkgLinkInfo = provider(
     fields = {
         "pkgs": provider_field(typing.Any, default = None),  # {str: "artifact"}
+        "native_deps": provider_field(typing.Any, default = None),  # [Dependency]
     }
 )
 
@@ -71,6 +77,13 @@ def _build_mode_param(mode: GoBuildMode) -> str:
 def get_inherited_link_pkgs(deps: list[Dependency]) -> dict[str, GoPkg]:
     return merge_pkgs([d[GoPkgLinkInfo].pkgs for d in deps if GoPkgLinkInfo in d])
 
+def get_inherited_native_link_deps(deps: list[Dependency]) -> list[Dependency]:
+    native_deps = []
+    for dep in deps:
+        if GoPkgLinkInfo in dep:
+            native_deps += dep[GoPkgLinkInfo].native_deps or []
+    return native_deps
+
 # TODO(cjhopman): Is link_style a LibOutputStyle or a LinkStrategy here? Based
 # on returning an empty thing for link_style != shared, it seems likely its
 # intended to be LibOutputStyle, but it's called in places that are passing what
@@ -90,12 +103,35 @@ def _process_shared_dependencies(ctx: AnalysisContext, artifact: Artifact, deps:
     )
     shared_libs = traverse_shared_library_info(shlib_info, transformation_provider = None)
 
-    return executable_shared_lib_arguments(
+    shared_args = executable_shared_lib_arguments(
         ctx,
         ctx.attrs._cxx_toolchain[CxxToolchainInfo],
         artifact,
         shared_libs,
     )
+
+    # The Go linker delegates cgo links through -extld. GNU ld does not use the
+    # runtime rpath to find indirect shared-library deps while linking. DT_RUNPATH
+    # is also not transitive at runtime, so keep the symlink-tree libraries as
+    # direct NEEDED entries.
+    if ctx.attrs._cxx_toolchain[CxxToolchainInfo].linker_info.type == LinkerType("gnu") and shared_args.shared_libs_symlink_tree != None:
+        no_as_needed_shared_libs = cmd_args(
+            ["-Wl,--push-state"] + get_no_as_needed_shared_libs_flags(LinkerType("gnu")),
+            [shared_lib.lib.output for shared_lib in shared_libs],
+            "-Wl,--pop-state",
+        )
+        return ExecutableSharedLibArguments(
+            extra_link_args = shared_args.extra_link_args + [
+                cmd_args(shared_args.shared_libs_symlink_tree, format = "-Wl,-rpath-link,{}"),
+                no_as_needed_shared_libs,
+            ],
+            runtime_files = shared_args.runtime_files,
+            external_debug_info = shared_args.external_debug_info,
+            shared_libs_symlink_tree = shared_args.shared_libs_symlink_tree,
+            dwp_symlink_tree = shared_args.dwp_symlink_tree,
+        )
+
+    return shared_args
 
 def link(
     ctx: AnalysisContext,
@@ -103,6 +139,7 @@ def link(
     cgo_enabled: bool,
     pkgs: dict[str, GoPkg] = {},
     deps: list[Dependency] = [],
+    native_deps: list[Dependency] = [],
     build_mode: GoBuildMode = GoBuildMode("exe"),
     link_mode: [str, None] = None,
     link_style: LinkStyle = LinkStyle("static"),
@@ -167,7 +204,8 @@ def link(
 
     go_stdlib = ctx.attrs._go_stdlib[GoStdlib]
 
-    executable_args = _process_shared_dependencies(ctx, output, deps, link_style)
+    all_native_deps = deps + native_deps + get_inherited_native_link_deps(deps)
+    executable_args = _process_shared_dependencies(ctx, output, all_native_deps, link_style)
 
     if link_mode == None:
         if build_mode == GoBuildMode("c_shared"):
@@ -188,7 +226,7 @@ def link(
             ctx.actions,
             ctx.label,
             cxx_toolchain.linker_info,
-            cxx_inherited_link_info(deps),
+            cxx_inherited_link_info(all_native_deps),
             to_link_strategy(link_style),
             prefer_stripped = False,
             transformation_spec_context = None,
@@ -222,8 +260,8 @@ def link(
         cxx_link_cmd = cmd_args(
             [
                 cxx_toolchain.linker_info.linker,
-                cmd_args(ext_link_argfile, format = "@{}"),
                 "%*" if is_win else '"$@"',
+                cmd_args(ext_link_argfile, format = "@{}"),
             ],
             delimiter = " ",
         )
