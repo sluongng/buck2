@@ -24,10 +24,7 @@ def _base_module_for_package():
         return "buck2." + package.replace("/", ".")
     return None
 
-def python_library(srcs = [], deps = [], visibility = ["PUBLIC"], cpp_deps = [], **kwargs):
-    # `cpp_deps` is an fbcode-only attribute for native extension dependencies;
-    # the open source prelude `python_library` rule does not support it, so drop it.
-    _unused = cpp_deps  # @unused
+def python_library(srcs = [], deps = [], cpp_deps = [], visibility = ["PUBLIC"], **kwargs):
     if "base_module" not in kwargs:
         base_module = _base_module_for_package()
         if base_module != None:
@@ -35,7 +32,7 @@ def python_library(srcs = [], deps = [], visibility = ["PUBLIC"], cpp_deps = [],
 
     # @lint-ignore BUCKLINT: avoid "Direct usage of native rules is not allowed."
     native.python_library(
-        deps = _fix_labels(deps),
+        deps = _fix_labels(deps) + _fix_labels(cpp_deps),
         srcs = srcs,
         visibility = visibility,
         **kwargs

@@ -1,5 +1,8 @@
 load("@prelude//bazel_compat/rules_cc/cc:defs.bzl", "cc_binary", "cc_library")
 load("@prelude//toolchains/cxx/llvm:defs.bzl", "cxx_llvm_toolchain", "download_llvm_distribution")
+load("@prelude//utils:source_listing.bzl", "source_listing")
+
+source_listing()
 
 cc_library(
     name = "hello_lib",
