@@ -1,0 +1,27 @@
+load("@prelude//bazel_compat/rules_cc/cc:defs.bzl", "cc_binary", "cc_library")
+load("@prelude//toolchains/cxx/llvm:defs.bzl", "cxx_llvm_toolchain", "download_llvm_distribution")
+
+cc_library(
+    name = "hello_lib",
+    srcs = ["hello.cpp"],
+    hdrs = ["hello.h"],
+    defines = ["HELLO_FROM_RULES_CC=1"],
+    visibility = ["PUBLIC"],
+)
+
+cc_binary(
+    name = "hello",
+    srcs = ["main.cpp"],
+    deps = [":hello_lib"],
+)
+
+download_llvm_distribution(
+    name = "llvm_dist",
+    target = "linux-amd64-musl",
+)
+
+cxx_llvm_toolchain(
+    name = "llvm_cxx",
+    distribution = ":llvm_dist",
+    target = "x86_64-unknown-linux-gnu",
+)

@@ -939,10 +939,16 @@ http_archive = prelude_rule(
     further = None,
     attrs = (
         # @unsorted-dict-items
-        remote_common.urls_arg()
-        | remote_common.sha256_arg()
-        | remote_common.unarchive_args()
-        | {
+        remote_common.urls_arg() |
+        remote_common.sha256_arg() |
+        remote_common.unarchive_args() |
+        {
+            "remote_download": attrs.bool(default = False, doc = """
+                If true, download and extract the archive inside the `http_archive`
+                action instead of using Buck's local downloader action. This requires
+                remote actions to have external network access and requires `sha1` or
+                `sha256` so the downloaded bytes are verified before extraction.
+            """),
             "sha1": attrs.option(attrs.string(), default = None),
             "size_bytes": attrs.option(attrs.int(), default = None),
         }
