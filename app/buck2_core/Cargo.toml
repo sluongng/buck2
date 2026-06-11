@@ -39,7 +39,7 @@ allocative = { workspace = true }
 cmp_any = { workspace = true }
 dupe = { workspace = true }
 gazebo = { workspace = true }
-lock_free_hashtable = { workspace = true }
+lock_free_hashtable = { workspace = true, features = ["allocative"] }
 static_interner = { workspace = true }
 
 buck2_data = { workspace = true }

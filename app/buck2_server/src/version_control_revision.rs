@@ -67,7 +67,7 @@ impl Drop for AbortOnDropHandle {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RepoVcs {
     Hg,
     Git,
@@ -86,24 +86,117 @@ async fn create_revision_data(
 ) -> buck2_data::VersionControlRevision {
     let mut revision = buck2_data::VersionControlRevision::default();
     match repo_type(repo_root).await {
-        Ok(repo_vcs) => {
-            match repo_vcs {
-                RepoVcs::Hg => create_hg_data(&mut revision, revision_type, repo_root).await,
-                RepoVcs::Git => {
-                    // TODO(rajneeshl): Implement the git data
-                    // Add a message for now so we can actually tell if revision is null due to git
-                    revision.command_error = Some("Git revision data not implemented".to_owned());
-                }
-                RepoVcs::Unknown => {
-                    revision.command_error = Some("Unknown repository type".to_owned());
-                }
+        Ok(repo_vcs) => match repo_vcs {
+            RepoVcs::Hg => create_hg_data(&mut revision, revision_type, repo_root).await,
+            RepoVcs::Git => create_git_data(&mut revision, revision_type, repo_root).await,
+            RepoVcs::Unknown => {
+                revision.command_error = Some("Unknown repository type".to_owned());
             }
-        }
+        },
         Err(e) => {
             revision.command_error = Some(format!("Failed to get repository type: {e:#}"));
         }
     }
     revision
+}
+
+async fn create_git_data(
+    revision: &mut buck2_data::VersionControlRevision,
+    revision_type: RevisionDataType,
+    repo_root: &AbsNormPathBuf,
+) {
+    match revision_type {
+        RevisionDataType::CurrentRevision => get_git_revision(revision, repo_root).await,
+        RevisionDataType::Status => get_git_status(revision, repo_root).await,
+    }
+}
+
+async fn get_git_revision(
+    revision: &mut buck2_data::VersionControlRevision,
+    repo_root: &AbsNormPathBuf,
+) {
+    let stdout = match run_git(repo_root, &["rev-parse", "HEAD"], "git rev-parse HEAD").await {
+        Ok(stdout) => stdout,
+        Err(e) => {
+            revision.command_error = Some(e);
+            return;
+        }
+    };
+    let hash = stdout.trim();
+    if hash.is_empty() {
+        revision.command_error =
+            Some("Command 'git rev-parse HEAD' returned empty output".to_owned());
+        return;
+    }
+    // The proto field name is historical. BuildBuddy consumes this as the
+    // source-control commit hash regardless of whether the repo is Hg or Git.
+    revision.hg_revision = Some(hash.to_owned());
+}
+
+async fn get_git_status(
+    revision: &mut buck2_data::VersionControlRevision,
+    repo_root: &AbsNormPathBuf,
+) {
+    let stdout = match run_git(
+        repo_root,
+        &["status", "--porcelain"],
+        "git status --porcelain",
+    )
+    .await
+    {
+        Ok(stdout) => stdout,
+        Err(e) => {
+            revision.command_error = Some(e);
+            return;
+        }
+    };
+    revision.has_local_changes = Some(!stdout.trim().is_empty());
+}
+
+async fn run_git(
+    repo_root: &AbsNormPathBuf,
+    args: &[&str],
+    command_description: &str,
+) -> Result<String, String> {
+    let Some(repo_root) = repo_root.as_path().to_str() else {
+        return Err(format!(
+            "Cannot run '{command_description}' because the repository path is not valid UTF-8"
+        ));
+    };
+
+    let mut git_args = Vec::with_capacity(args.len() + 2);
+    git_args.push("-C");
+    git_args.push(repo_root);
+    git_args.extend_from_slice(args);
+
+    let output = match reap_on_drop_command("git", &git_args, None) {
+        Ok(command) => command.output().await,
+        Err(e) => {
+            return Err(format!(
+                "reap_on_drop_command for '{command_description}' failed: {e}"
+            ));
+        }
+    };
+
+    match output {
+        Ok(result) => {
+            if !result.status.success() {
+                let stderr = std::str::from_utf8(&result.stderr)
+                    .map_err(|e| format!("{command_description} stderr is not utf8: {e}"))?;
+                return Err(format!(
+                    "Command '{command_description}' failed with error code {}; stderr: {}",
+                    result.status, stderr
+                ));
+            }
+
+            std::str::from_utf8(&result.stdout)
+                .map(|stdout| stdout.trim().to_owned())
+                .map_err(|e| format!("{command_description} stdout is not utf8: {e}"))
+        }
+        Err(e) => Err(format!(
+            "Command '{command_description}' failed with error: {e:?}"
+        )),
+    }
 }
 
 async fn create_hg_data(
@@ -184,29 +277,144 @@ async fn get_hg_status(revision: &mut buck2_data::VersionControlRevision) {
     };
 }
 
+async fn detect_repo_type(repo_root: &AbsNormPathBuf) -> buck2_error::Result<RepoVcs> {
+    let (hg_metadata, git_metadata) = tokio::join!(
+        async_fs_util::metadata(repo_root.join(ForwardRelativePath::new(".hg").unwrap())),
+        async_fs_util::metadata(repo_root.join(ForwardRelativePath::new(".git").unwrap()))
+    );
+
+    let is_hg = hg_metadata.is_ok_and(|output| output.is_dir());
+    let is_git = git_metadata.is_ok_and(|output| output.is_dir() || output.is_file());
+
+    if is_hg {
+        Ok(RepoVcs::Hg)
+    } else if is_git {
+        Ok(RepoVcs::Git)
+    } else {
+        Ok(RepoVcs::Unknown)
+    }
+}
+
 async fn repo_type(repo_root: &AbsNormPathBuf) -> buck2_error::Result<&'static RepoVcs> {
     static REPO_TYPE: OnceCell<buck2_error::Result<RepoVcs>> = OnceCell::const_new();
-    async fn repo_type_impl(repo_root: &AbsNormPathBuf) -> buck2_error::Result<RepoVcs> {
-        let (hg_metadata, git_metadata) = tokio::join!(
-            async_fs_util::metadata(repo_root.join(ForwardRelativePath::new(".hg").unwrap())),
-            async_fs_util::metadata(repo_root.join(ForwardRelativePath::new(".git").unwrap()))
-        );
-
-        let is_hg = hg_metadata.is_ok_and(|output| output.is_dir());
-        let is_git = git_metadata.is_ok_and(|output| output.is_dir());
-
-        if is_hg {
-            Ok(RepoVcs::Hg)
-        } else if is_git {
-            Ok(RepoVcs::Git)
-        } else {
-            Ok(RepoVcs::Unknown)
-        }
-    }
-
     REPO_TYPE
-        .get_or_init(|| repo_type_impl(repo_root))
+        .get_or_init(|| detect_repo_type(repo_root))
         .await
         .as_ref()
         .map_err(|e| e.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+
+    use super::*;
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new() -> Self {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "buck2-git-revision-test-{}-{timestamp}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn abs_norm_path(&self) -> AbsNormPathBuf {
+            AbsNormPathBuf::new(self.path.clone()).unwrap()
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ignored = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn git_available() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed with status {}; stderr: {}",
+            args,
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[tokio::test]
+    async fn git_revision_data_reports_head_and_dirty_status() {
+        if !git_available() {
+            return;
+        }
+
+        let repo = TestDir::new();
+        run_git(repo.path(), &["init", "-q"]);
+        run_git(repo.path(), &["config", "user.email", "buck2@example.com"]);
+        run_git(repo.path(), &["config", "user.name", "Buck2 Test"]);
+        fs::write(repo.path().join("BUCK"), "").unwrap();
+        run_git(repo.path(), &["add", "BUCK"]);
+        run_git(repo.path(), &["commit", "-qm", "initial"]);
+        let expected_revision = run_git(repo.path(), &["rev-parse", "HEAD"]);
+
+        let repo_root = repo.abs_norm_path();
+        let mut revision = buck2_data::VersionControlRevision::default();
+        create_git_data(&mut revision, RevisionDataType::CurrentRevision, &repo_root).await;
+        assert_eq!(revision.command_error, None);
+        assert_eq!(
+            revision.hg_revision.as_deref(),
+            Some(expected_revision.as_str())
+        );
+
+        let mut status = buck2_data::VersionControlRevision::default();
+        create_git_data(&mut status, RevisionDataType::Status, &repo_root).await;
+        assert_eq!(status.command_error, None);
+        assert_eq!(status.has_local_changes, Some(false));
+
+        fs::write(repo.path().join("BUCK"), "# changed").unwrap();
+        let mut status = buck2_data::VersionControlRevision::default();
+        create_git_data(&mut status, RevisionDataType::Status, &repo_root).await;
+        assert_eq!(status.command_error, None);
+        assert_eq!(status.has_local_changes, Some(true));
+    }
+
+    #[tokio::test]
+    async fn detect_repo_type_accepts_git_file() {
+        let repo = TestDir::new();
+        fs::write(repo.path().join(".git"), "gitdir: ../real-git-dir").unwrap();
+
+        assert_eq!(
+            detect_repo_type(&repo.abs_norm_path()).await.unwrap(),
+            RepoVcs::Git
+        );
+    }
 }
