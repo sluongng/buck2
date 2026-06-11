@@ -37,8 +37,11 @@ oncall("build_infra")
 
 download_llvm_distribution(
     name = "llvm_dist",
-    remote_download = True,
+    # BuildBuddy RBE images have tar/gzip but do not provide a zstd CLI.
+    archive_type = "tar.gz",
+    sha256 = "3590e82cd56ff58cdf71732b0fbc3eb8f21d4fc00b8592d1329af522381f08cc",
     target = "linux-amd64-musl",
+    url = "https://github.com/sluongng/buck2/releases/download/v0.202624.0/llvm-toolchain-minimal-22.1.7-linux-amd64-musl.tar.gz",
 )
 
 cxx_llvm_toolchain(
