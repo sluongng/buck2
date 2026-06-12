@@ -116,12 +116,22 @@ actions:
           export BUCK2_TEST_EXTRA_EXTERNAL_CONFIG="$PWD/.buckconfig.buildbuddy"
 
           built_buck2=$(cat .buildbuddy-workflow/built-buck2.path)
-          "$built_buck2" \
-            --isolation-dir "buildbuddy-rbe-selftest-$BUILDBUDDY_INVOCATION_ID" \
-            build \
-            --config-file .buckconfig.buildbuddy \
-            --remote-only \
-            //:buck2
+          remote_only_buck2_build() {
+            local attempt="$1"
+            "$built_buck2" \
+              --isolation-dir "buildbuddy-rbe-selftest-$BUILDBUDDY_INVOCATION_ID-$attempt" \
+              build \
+              --config-file .buckconfig.buildbuddy \
+              --remote-only \
+              //:buck2
+          }
+
+          if ! remote_only_buck2_build initial; then
+            echo "Remote-only //:buck2 build failed; retrying once with fresh Buck2 daemon state" >&2
+            "$built_buck2" killall >/dev/null 2>&1 || true
+            rm -rf "buck-out/buildbuddy-rbe-selftest-$BUILDBUDDY_INVOCATION_ID-retry"
+            remote_only_buck2_build retry
+          fi
 
           BUCK2="$built_buck2" buildbuddy/run_buck2_test_matrix.sh \
             --mode remote \
