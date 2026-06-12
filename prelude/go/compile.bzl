@@ -26,8 +26,10 @@ GoTestInfo = provider(
     # @unsorted-dict-items
     fields = {
         "deps": provider_field(typing.Any, default = None),  # [Dependency]
+        "cdeps": provider_field(typing.Any, default = None),  # [Dependency]
         "srcs": provider_field(typing.Any, default = None),  # ["source"]
         "pkg_import_path": provider_field(typing.Any, default = None),  # str
+        "header_namespace": provider_field(typing.Any, default = None),  # str
         "coverage_enabled": provider_field(bool),
     },
 )

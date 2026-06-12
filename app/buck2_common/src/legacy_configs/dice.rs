@@ -464,6 +464,10 @@ const CONFIGS_INVISIBLE_TO_DICE: &[BuckconfigKeyRef<'static>] = &[
         property: "override_use_case",
     },
     BuckconfigKeyRef {
+        section: "buck2_re_client",
+        property: "request_metadata_tool_name",
+    },
+    BuckconfigKeyRef {
         section: "scuba",
         property: "defaults",
     },
