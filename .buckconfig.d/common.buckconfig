@@ -1,6 +1,7 @@
 [cells]
 prelude = prelude
 none = none
+buildbuddy_toolchains = buildbuddy/toolchains
 
 [cell_aliases]
 config = prelude

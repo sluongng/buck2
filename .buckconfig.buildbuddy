@@ -15,9 +15,6 @@ clean_stale_enabled = true
 # recovered by restarting.
 restarter = true
 
-[cells]
-buildbuddy_toolchains = buildbuddy/toolchains
-
 [cell_aliases]
 # Use BuildBuddy-specific hermetic toolchains without changing the default shim
 # toolchains used by ordinary local builds.
