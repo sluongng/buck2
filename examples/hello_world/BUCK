@@ -13,3 +13,40 @@ cxx_library(
     exported_headers = glob(["**/*.hpp"]),
     visibility = ["PUBLIC"],
 )
+
+cxx_binary(
+    name = "story",
+    allow_cache_upload = True,
+    srcs = ["story_main.cpp"],
+    link_style = "static",
+    deps = [":story_renderer"],
+)
+
+cxx_library(
+    name = "story_numbers",
+    allow_cache_upload = True,
+    archive_allow_cache_upload = True,
+    srcs = ["story_numbers.cpp"],
+    exported_headers = ["story_numbers.hpp"],
+    visibility = ["PUBLIC"],
+)
+
+cxx_library(
+    name = "story_messages",
+    allow_cache_upload = True,
+    archive_allow_cache_upload = True,
+    srcs = ["story_messages.cpp"],
+    exported_headers = ["story_messages.hpp"],
+    deps = [":story_numbers"],
+    visibility = ["PUBLIC"],
+)
+
+cxx_library(
+    name = "story_renderer",
+    allow_cache_upload = True,
+    archive_allow_cache_upload = True,
+    srcs = ["story_renderer.cpp"],
+    exported_headers = ["story_renderer.hpp"],
+    deps = [":story_messages"],
+    visibility = ["PUBLIC"],
+)
