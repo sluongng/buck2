@@ -1,0 +1,10 @@
+load(":defs.bzl", "consumer", "producer")
+
+producer(
+    name = "producer",
+)
+
+consumer(
+    name = "consumer",
+    dep = ":producer",
+)
