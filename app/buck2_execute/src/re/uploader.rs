@@ -12,6 +12,7 @@ use std::borrow::Borrow;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 
 use buck2_common::cas_digest::TrackedCasDigest;
@@ -563,6 +564,27 @@ fn add_injected_missing_digests<'a>(
         for d in digests {
             if let Some(i) = input_digests.get(d) {
                 missing_digests.insert(i);
+            }
+        }
+    }
+
+    let ingested_digests_once = buck2_env!(
+        "BUCK2_TEST_INJECTED_MISSING_DIGESTS_ONCE",
+        type=Vec<FileDigest>,
+        converter=convert_digests,
+        applicability=testing
+    )?;
+    if let Some(digests) = ingested_digests_once {
+        static INJECTED_ONCE: LazyLock<Mutex<StdBuckHashSet<FileDigest>>> =
+            LazyLock::new(|| Mutex::new(StdBuckHashSet::default()));
+
+        for d in digests {
+            if let Some(i) = input_digests.get(d) {
+                let mut injected_once = INJECTED_ONCE.lock().expect("Poisoned lock");
+                if !injected_once.contains(&d) {
+                    injected_once.insert(d.clone());
+                    missing_digests.insert(i);
+                }
             }
         }
     }
