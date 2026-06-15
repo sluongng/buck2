@@ -47,12 +47,6 @@ remote_cache_chunk_cache_dir = buck-out/buildbuddy-re-chunks
 [build]
 execution_platforms = root//buildbuddy:buildbuddy-rbe
 
-[external_cells]
-# The released bootstrap Buck2 normally uses the prelude bundled into that
-# binary. Use the checkout prelude instead so workflow fixes under prelude/
-# apply before the fork has bootstrapped a new Buck2 binary.
-prelude = disabled
-
 [http_archive]
 # Download and extract archives inside remote actions so BuildBuddy RBE owns
 # toolchain preparation instead of depending on the workflow runner's host.
