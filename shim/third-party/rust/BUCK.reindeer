@@ -7069,6 +7069,12 @@ cargo.rust_library(
 )
 
 alias(
+    name = "http-body",
+    actual = ":http-body-1",
+    visibility = ["PUBLIC"],
+)
+
+alias(
     name = "http-body-util",
     actual = ":http-body-util-0.1",
     visibility = ["PUBLIC"],
