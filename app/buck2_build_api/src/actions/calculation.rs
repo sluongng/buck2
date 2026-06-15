@@ -21,6 +21,7 @@ use buck2_artifact::artifact::build_artifact::BuildArtifact;
 use buck2_build_signals::env::NodeDuration;
 use buck2_build_signals::env::WaitingData;
 use buck2_common::events::HasEvents;
+use buck2_common::file_ops::metadata::FileDigest;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::fs::artifact_path_resolver::ArtifactFs;
 use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
@@ -38,7 +39,9 @@ use buck2_events::span::SpanId;
 use buck2_execute::artifact::artifact_dyn::ArtifactDyn;
 use buck2_execute::execute::result::CommandExecutionReport;
 use buck2_execute::execute::result::CommandExecutionStatus;
+use buck2_execute::materialize::materializer::ReLostInput;
 use buck2_execute::output_size::OutputSize;
+use buck2_hash::BuckHashMap;
 use buck2_hash::BuckIndexMap;
 use buck2_interpreter::print_handler::EventDispatcherPrintHandler;
 use buck2_interpreter::soft_error::Buck2StarlarkSoftErrorHandler;
@@ -62,6 +65,7 @@ use smallvec::SmallVec;
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
 use tracing::debug;
+use tracing::info;
 
 use crate::actions::RegisteredAction;
 use crate::actions::artifact::get_artifact_fs::GetArtifactFs;
@@ -69,6 +73,7 @@ use crate::actions::error::ActionError;
 use crate::actions::error_handler::ActionErrorHandlerError;
 use crate::actions::error_handler::ActionSubErrorResult;
 use crate::actions::error_handler::StarlarkActionErrorContext;
+use crate::actions::execute::action_executor::ActionExecutionMetadata;
 use crate::actions::execute::action_executor::ActionOutputs;
 use crate::actions::execute::action_executor::BuckActionExecutor;
 use crate::actions::execute::action_executor::HasActionExecutor;
@@ -85,6 +90,8 @@ use crate::starlark::values::UnpackValue;
 use crate::starlark::values::type_repr::StarlarkTypeRepr;
 
 pub struct ActionCalculation;
+
+const MAX_REPEATED_LOST_INPUT_REWINDS: usize = 20;
 
 async fn build_action_impl(
     ctx: &mut DiceComputations<'_>,
@@ -110,7 +117,15 @@ async fn build_action_impl(
     build_action_no_redirect(ctx, cancellation, action).await
 }
 
-async fn build_action_no_redirect(
+fn build_action_no_redirect<'a>(
+    ctx: &'a mut DiceComputations<'_>,
+    cancellation: &'a CancellationContext,
+    action: Arc<RegisteredAction>,
+) -> BoxFuture<'a, buck2_error::Result<ActionOutputs>> {
+    build_action_no_redirect_impl(ctx, cancellation, action).boxed()
+}
+
+async fn build_action_no_redirect_impl(
     ctx: &mut DiceComputations<'_>,
     cancellation: &CancellationContext,
     action: Arc<RegisteredAction>,
@@ -310,9 +325,15 @@ async fn build_action_inner(
         }
         None => buck2_data::ExpectedEligibleForDedupe::UnknownEligibility,
     };
-    let (execute_result, command_reports) = executor
-        .execute(waiting_data, ensured_inputs, action, cancellation)
-        .await;
+    let (execute_result, command_reports) = execute_with_lost_input_rewinds(
+        ctx,
+        cancellation,
+        executor,
+        waiting_data,
+        ensured_inputs,
+        action,
+    )
+    .await;
 
     let allow_omit_details = execute_result.is_ok();
 
@@ -573,6 +594,143 @@ fn is_action_eligible_for_dedupe(
     }
 
     buck2_data::EligibleForDedupe::Eligible
+}
+
+struct LostCasInput {
+    digest: FileDigest,
+    path: ProjectRelativePathBuf,
+}
+
+async fn execute_with_lost_input_rewinds(
+    ctx: &mut DiceComputations<'_>,
+    cancellation: &CancellationContext,
+    executor: &BuckActionExecutor,
+    waiting_data: WaitingData,
+    ensured_inputs: BuckIndexMap<ArtifactGroup, ArtifactGroupValues>,
+    action: &Arc<RegisteredAction>,
+) -> (
+    Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError>,
+    Vec<CommandExecutionReport>,
+) {
+    let mut command_reports = Vec::new();
+    let mut rewinds_by_action_key = BuckHashMap::default();
+
+    loop {
+        let (execute_result, mut attempt_reports) = executor
+            .execute(
+                waiting_data.clone(),
+                ensured_inputs.clone(),
+                action,
+                cancellation,
+            )
+            .await;
+        command_reports.append(&mut attempt_reports);
+
+        let lost_input = match &execute_result {
+            Ok(_) => return (execute_result, command_reports),
+            Err(error) => lost_cas_input(error),
+        };
+
+        let Some(lost_input) = lost_input else {
+            return (execute_result, command_reports);
+        };
+
+        let Some(producer_key) =
+            lost_input_producer(action.key(), &ensured_inputs, &lost_input.digest)
+        else {
+            return (execute_result, command_reports);
+        };
+
+        let rewind_count = rewinds_by_action_key
+            .entry(producer_key.dupe())
+            .or_insert(0);
+        if *rewind_count >= MAX_REPEATED_LOST_INPUT_REWINDS {
+            return (execute_result, command_reports);
+        }
+        *rewind_count += 1;
+
+        info!(
+            consumer_action = %action.key(),
+            producer_action = %producer_key,
+            lost_input_path = %lost_input.path,
+            lost_input_digest = %lost_input.digest,
+            rewind_count = *rewind_count,
+            "Re-executing producer action after a generated input disappeared from remote CAS"
+        );
+
+        let producer_action = match ActionCalculation::get_action(ctx, &producer_key).await {
+            Ok(action) => action,
+            Err(error) => {
+                return (
+                    Err(ExecuteError::Error {
+                        error: error.context(format!(
+                            "Failed to look up producer action {producer_key} while rewinding lost input {}",
+                            lost_input.path
+                        )),
+                    }),
+                    command_reports,
+                );
+            }
+        };
+
+        if let Err(error) = build_action_no_redirect(ctx, cancellation, producer_action)
+            .boxed()
+            .await
+        {
+            return (
+                Err(ExecuteError::Error {
+                    error: error.context(format!(
+                        "Failed to re-execute producer action {producer_key} while rewinding lost input {}",
+                        lost_input.path
+                    )),
+                }),
+                command_reports,
+            );
+        }
+    }
+}
+
+fn lost_cas_input(error: &ExecuteError) -> Option<LostCasInput> {
+    let error = match error {
+        ExecuteError::Error { error } => error,
+        ExecuteError::CommandExecutionError {
+            error: Some(error), ..
+        } => error,
+        _ => return None,
+    };
+
+    let lost_input = error.find_typed_context::<ReLostInput>()?;
+
+    Some(LostCasInput {
+        digest: lost_input.digest.clone(),
+        path: lost_input.path.clone(),
+    })
+}
+
+fn lost_input_producer(
+    consumer_key: &ActionKey,
+    ensured_inputs: &BuckIndexMap<ArtifactGroup, ArtifactGroupValues>,
+    lost_digest: &FileDigest,
+) -> Option<ActionKey> {
+    for values in ensured_inputs.values() {
+        for (artifact, value) in values.iter() {
+            let Some(value_digest) = value.digest() else {
+                continue;
+            };
+            if value_digest != lost_digest {
+                continue;
+            };
+            let Some(action_key) = artifact.action_key() else {
+                continue;
+            };
+            if action_key == consumer_key {
+                continue;
+            }
+            return Some(action_key.dupe());
+        }
+    }
+
+    None
 }
 
 fn check_infra_error_patterns(

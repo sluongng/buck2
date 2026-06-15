@@ -64,6 +64,7 @@ use crate::execute::blobs::ActionBlobs;
 use crate::materialize::materializer::ArtifactNotMaterializedReason;
 use crate::materialize::materializer::CasDownloadInfo;
 use crate::materialize::materializer::Materializer;
+use crate::materialize::materializer::ReLostInput;
 use crate::re::action_identity::ReActionIdentity;
 use crate::re::client::RemoteExecutionClient;
 use crate::re::error::with_error_handler;
@@ -341,6 +342,10 @@ impl Uploader {
                             // On the flip side, if a digest has been in the CAS for a very long
                             // time, it might have expired.
                             if file.digest.to_re() == digest {
+                                let lost_input = ReLostInput {
+                                    path: path.clone(),
+                                    digest: file.digest.data().clone(),
+                                };
                                 if should_error_for_missing_digest(info) {
                                     soft_error!(
                                         "cas_missing_fatal",
@@ -362,7 +367,8 @@ impl Uploader {
                                         To proceed, you should restart Buck using `buck2 killall`. \
                                         Debug information: {:#}",
                                         err
-                                    ));
+                                    )
+                                    .context(lost_input));
                                 }
 
                                 soft_error!(
@@ -380,7 +386,7 @@ impl Uploader {
                                 // Materialize this file from CAS and include it in this upload.
                                 // Skipping it would leave the downstream action with an
                                 // incomplete input set after FindMissingBlobs reported it absent.
-                                paths_to_materialize.push(path.clone());
+                                paths_to_materialize.push((path.clone(), Some(lost_input)));
                                 upload_files.push(NamedDigest {
                                     name: fs.resolve(path).as_maybe_relativized_str()?.to_owned(),
                                     digest,
@@ -398,7 +404,7 @@ impl Uploader {
                             digest,
                             ..Default::default()
                         });
-                        paths_to_materialize.push(path);
+                        paths_to_materialize.push((path, None));
                     }
                     Err(
                         ref err @ ArtifactNotMaterializedReason::DeferredMaterializerCorruption {
@@ -411,11 +417,15 @@ impl Uploader {
             }
         }
 
-        if !paths_to_materialize.is_empty() {
-            materializer
-                .ensure_materialized(paths_to_materialize)
-                .await
-                .buck_error_context("Error materializing paths for upload")?;
+        for (path, lost_input) in paths_to_materialize {
+            if let Err(error) = materializer.ensure_materialized(vec![path]).await {
+                let error = error.context("Error materializing paths for upload");
+                let error = match lost_input {
+                    Some(lost_input) => error.context(lost_input),
+                    None => error,
+                };
+                return Err(error);
+            }
         }
 
         // Compute stats of digests we're about to upload so we can report them
