@@ -63,19 +63,24 @@ def download_llvm_distribution(
         os: str | None = None,
         arch: str | None = None,
         suffix: str | None = None,
+        url: str | None = None,
+        sha256: str | None = None,
+        archive_type: str = "tar.zst",
         remote_download: bool = True,
         visibility = None):
     os = os or _host_os()
     arch = arch or _host_arch()
     target = target or _default_target(os, arch)
     release = _release_for(llvm_version, target, suffix)
+    url = url or release["url"]
+    sha256 = sha256 or release["sha256"]
     archive_name = name + "-archive"
 
     _native.http_archive(
         name = archive_name,
-        urls = [release["url"]],
-        sha256 = release["sha256"],
-        type = "tar.zst",
+        urls = [url],
+        sha256 = sha256,
+        type = archive_type,
         remote_download = remote_download,
         visibility = visibility,
     )
@@ -169,6 +174,7 @@ def _target_flags(ctx: AnalysisContext):
 
 def _cxx_llvm_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
     dist = ctx.attrs.distribution[LLVMDistributionInfo]
+    dist_hidden = cmd_args(hidden = ctx.attrs.distribution[DefaultInfo].default_outputs[0])
     os = dist.os
     target_flags = _target_flags(ctx)
     clang = _tool(ctx, "clang")
@@ -186,29 +192,30 @@ def _cxx_llvm_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
         as_compiler_info = AsCompilerInfo(
             compiler = RunInfo(args = cmd_args(clang)),
             compiler_type = "clang",
-            compiler_flags = cmd_args(target_flags),
+            compiler_flags = cmd_args(dist_hidden, target_flags),
             preprocessor_flags = cmd_args(ctx.attrs.c_preprocessor_flags),
         ),
         asm_compiler_info = AsmCompilerInfo(
             compiler = RunInfo(args = cmd_args(clang)),
             compiler_type = "clang",
-            compiler_flags = cmd_args(target_flags),
+            compiler_flags = cmd_args(dist_hidden, target_flags),
             preprocessor_flags = cmd_args(ctx.attrs.c_preprocessor_flags),
         ),
         c_compiler_info = CCompilerInfo(
             compiler = RunInfo(args = cmd_args(clang)),
             compiler_type = "clang",
-            compiler_flags = cmd_args(target_flags, ctx.attrs.c_compiler_flags),
+            compiler_flags = cmd_args(dist_hidden, target_flags, ctx.attrs.c_compiler_flags),
             preprocessor_flags = cmd_args(ctx.attrs.c_preprocessor_flags),
         ),
         cxx_compiler_info = CxxCompilerInfo(
             compiler = RunInfo(args = cmd_args(clangxx)),
             compiler_type = "clang",
-            compiler_flags = cmd_args(target_flags, ctx.attrs.cxx_compiler_flags),
+            compiler_flags = cmd_args(dist_hidden, target_flags, ctx.attrs.cxx_compiler_flags),
             preprocessor_flags = cmd_args(ctx.attrs.cxx_preprocessor_flags),
         ),
         linker_info = LinkerInfo(
             archiver = RunInfo(args = cmd_args(llvm_ar)),
+            archiver_flags = cmd_args(dist_hidden),
             archiver_type = "gnu",
             archiver_supports_argfiles = True,
             archive_objects_locally = False,
@@ -221,7 +228,7 @@ def _cxx_llvm_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
             link_style = LinkStyle(ctx.attrs.link_style),
             link_weight = 1,
             linker = RunInfo(args = cmd_args(clangxx)),
-            linker_flags = cmd_args(linker_flags),
+            linker_flags = cmd_args(dist_hidden, linker_flags),
             object_file_extension = _object_extension(os),
             post_linker_flags = cmd_args(ctx.attrs.post_linker_flags),
             shared_dep_runtime_ld_flags = ctx.attrs.shared_dep_runtime_ld_flags,
