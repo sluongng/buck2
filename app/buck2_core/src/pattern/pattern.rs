@@ -1276,7 +1276,7 @@ where
     }))
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PackageSpec<T: PatternType> {
     /// Given targets in a package.
     Targets(Vec<(TargetName, T)>),

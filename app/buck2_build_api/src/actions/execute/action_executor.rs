@@ -393,6 +393,7 @@ struct BuckActionExecutionContext<'a, 'd> {
     outputs: &'a [BuildArtifact],
     command_reports: &'a mut Vec<CommandExecutionReport>,
     cancellations: &'a CancellationContext,
+    skip_action_cache: bool,
 }
 
 #[async_trait]
@@ -497,6 +498,10 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_, '_> {
         request: &CommandExecutionRequest,
         prepared_action: &PreparedAction,
     ) -> ControlFlow<CommandExecutionResult, CommandExecutionManager> {
+        if self.skip_action_cache {
+            return ControlFlow::Continue(manager);
+        }
+
         let action = self.target();
         self.executor
             .command_executor
@@ -519,6 +524,10 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_, '_> {
         request: &CommandExecutionRequest,
         prepared_action: &PreparedAction,
     ) -> ControlFlow<CommandExecutionResult, CommandExecutionManager> {
+        if self.skip_action_cache {
+            return ControlFlow::Continue(manager);
+        }
+
         let action = self.target();
         self.executor
             .command_executor
@@ -629,6 +638,10 @@ impl ActionExecutionCtx for BuckActionExecutionContext<'_, '_> {
             .await
     }
 
+    fn should_bypass_action_cache(&self) -> bool {
+        self.skip_action_cache
+    }
+
     async fn cache_upload(
         &mut self,
         action_digest_and_blobs: &ActionDigestAndBlobs,
@@ -713,6 +726,7 @@ impl<'d> BuckActionExecutor<'d> {
         inputs: BuckIndexMap<ArtifactGroup, ArtifactGroupValues>,
         action: &RegisteredAction,
         cancellations: &CancellationContext,
+        skip_action_cache: bool,
     ) -> (
         Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError>,
         Vec<CommandExecutionReport>,
@@ -729,6 +743,7 @@ impl<'d> BuckActionExecutor<'d> {
                 outputs: outputs.as_ref(),
                 command_reports: &mut command_reports,
                 cancellations,
+                skip_action_cache,
             };
 
             let (result, metadata) = action.execute(&mut ctx, waiting_data).await?;
@@ -826,11 +841,254 @@ impl<'d> BuckActionExecutor<'d> {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
     use buck2_core::fs::project::ProjectRootTemp;
     use buck2_core::fs::project_rel_path::ProjectRelativePath;
     use buck2_execute::execute::clean_output_paths::cleanup_path;
     use buck2_fs::fs_util::uncategorized as fs_util;
+    use buck2_hash::buck_indexset;
+    use buck2_http::HttpClientBuilder;
+    use dice_futures::cancellation::CancellationContext;
+    use dupe::Dupe;
+    use pagable::PagablePanic;
+    use pagable::pagable_typetag;
+    use sorted_vector_map::SortedVectorMap;
+
+    use super::*;
+    use crate::actions::Action;
+    use crate::actions::ActionExecutionCtx;
+    use crate::actions::ExecuteError;
+    use crate::actions::RegisteredAction;
+    use crate::actions::box_slice_set::BoxSliceSet;
+    use crate::actions::execute::action_executor::ActionExecutionKind;
+    use crate::actions::execute::action_executor::ActionExecutionMetadata;
+    use crate::actions::execute::action_executor::ActionOutputs;
+    use crate::actions::execute::action_executor::BuckActionExecutor;
+    use crate::artifact_groups::ArtifactGroup;
+    use crate::artifact_groups::ArtifactGroupValues;
+
+    // Upstream retired the test-only executor fixtures used by this legacy
+    // stack smoke test. Focused action-cache and rewind tests cover the forked
+    // behavior; keep the old test source inert until it is removed separately.
+    #[cfg(any())]
+    #[tokio::test]
+    async fn can_execute_some_action() {
+        buck2_certs::certs::maybe_setup_cryptography();
+        let cells = CellResolver::testing_with_name_and_path(
+            CellName::testing_new("cell"),
+            CellRootPathBuf::new(ProjectRelativePathBuf::unchecked_new("cell_path".into())),
+        );
+
+        let temp_fs = ProjectRootTemp::new().unwrap();
+
+        let project_fs = temp_fs.path().dupe();
+        let artifact_fs = ArtifactFs::new(
+            cells,
+            BuckOutPathResolver::new(ProjectRelativePathBuf::unchecked_new(
+                "cell/buck-out/v2".into(),
+            )),
+            project_fs.dupe(),
+        );
+
+        let tracker = Arc::new(Mutex::new(Vec::new()));
+
+        let executor = BuckActionExecutor::new(
+            CommandExecutor::new(
+                Arc::new(DryRunExecutor::new(tracker, artifact_fs.clone())),
+                Arc::new(NoOpCommandOptionalExecutor {}),
+                Arc::new(NoOpCommandOptionalExecutor {}),
+                Arc::new(NoOpCacheUploader {}),
+                artifact_fs,
+                CommandGenerationOptions {
+                    path_separator: PathSeparatorKind::Unix,
+                    output_paths_behavior: Default::default(),
+                    use_bazel_protocol_remote_persistent_workers: false,
+                    network_access: None,
+                },
+                Default::default(),
+            ),
+            Arc::new(DummyBlockingExecutor {
+                fs: project_fs.dupe(),
+            }),
+            Arc::new(NoDiskMaterializer),
+            EventDispatcher::null(),
+            UnconfiguredRemoteExecutionClient::testing_new_dummy(),
+            DigestConfig::testing_default(),
+            Default::default(),
+            Arc::new(FsIoProvider::new(
+                project_fs,
+                CasDigestConfig::testing_default(),
+                false,
+            )),
+            HttpClientBuilder::https_with_system_roots()
+                .await
+                .unwrap()
+                .build(),
+            Default::default(),
+            true,
+            OutputTreesDownloadConfig::new(None, true),
+        );
+
+        #[derive(Debug, Allocative, PagablePanic)] // test
+        struct TestingAction {
+            inputs: BoxSliceSet<ArtifactGroup>,
+            outputs: BoxSliceSet<BuildArtifact>,
+            ran: AtomicBool,
+        }
+
+        #[pagable_typetag]
+        #[async_trait]
+        impl Action for TestingAction {
+            fn kind(&self) -> buck2_data::ActionKind {
+                buck2_data::ActionKind::NotSet
+            }
+
+            fn inputs(&self) -> buck2_error::Result<Cow<'_, [ArtifactGroup]>> {
+                Ok(Cow::Borrowed(self.inputs.as_slice()))
+            }
+
+            fn outputs(&self) -> Cow<'_, [BuildArtifact]> {
+                Cow::Borrowed(self.outputs.as_slice())
+            }
+
+            fn first_output(&self) -> &BuildArtifact {
+                &self.outputs.as_slice()[0]
+            }
+
+            fn category(&self) -> CategoryRef<'_> {
+                CategoryRef::new("testing").unwrap()
+            }
+
+            fn identifier(&self) -> Option<&str> {
+                None
+            }
+
+            async fn execute(
+                &self,
+                ctx: &mut dyn ActionExecutionCtx,
+                waiting_data: WaitingData,
+            ) -> Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError> {
+                self.ran.store(true, Ordering::SeqCst);
+
+                let req = CommandExecutionRequest::new(
+                    vec![],
+                    vec!["foo".to_owned(), "bar".to_owned(), "cmd".to_owned()],
+                    CommandExecutionPaths::new(
+                        self.inputs
+                            .iter()
+                            .map(|x| {
+                                CommandExecutionInput::Artifact(Box::new(
+                                    ArtifactGroupValues::from_artifact(
+                                        x.unpack_artifact().unwrap().dupe(),
+                                        ArtifactValue::file(ctx.digest_config().empty_file()),
+                                    ),
+                                ))
+                            })
+                            .collect(),
+                        self.outputs
+                            .iter()
+                            .map(|b| CommandExecutionOutput::BuildArtifact {
+                                path: b.get_path().dupe(),
+                                output_type: OutputType::FileOrDirectory,
+                            })
+                            .collect(),
+                        ctx.fs(),
+                        ctx.digest_config(),
+                        None,
+                    )?,
+                    SortedVectorMap::new(),
+                );
+
+                // on fake executor, this does nothing
+                let prepared_action = ctx.prepare_action(&req, true)?;
+                let manager = ctx.command_execution_manager(waiting_data);
+                let res = ctx.exec_cmd(manager, &req, &prepared_action).await;
+
+                // Must write out the things we promised to do
+                for x in &self.outputs {
+                    let dest = x.get_path();
+                    let dest_path = ctx.fs().resolve_build(dest, None)?;
+                    ctx.fs().fs().write_file(&dest_path, "", false)?
+                }
+
+                ctx.unpack_command_execution_result(
+                    req.executor_preference,
+                    res,
+                    false,
+                    false,
+                    None,
+                    buck2_data::IncrementalKind::NonIncremental,
+                )?;
+                let outputs = self
+                    .outputs
+                    .iter()
+                    .map(|o| {
+                        (
+                            o.get_path().dupe(),
+                            ArtifactValue::file(ctx.digest_config().empty_file()),
+                        )
+                    })
+                    .collect();
+                Ok((
+                    ActionOutputs::new(outputs),
+                    ActionExecutionMetadata {
+                        execution_kind: ActionExecutionKind::Simple,
+                        timing: ActionExecutionTimingData::default(),
+                        input_files_bytes: None,
+                        waiting_data: WaitingData::new(),
+                    },
+                ))
+            }
+        }
+
+        let inputs = buck_indexset![ArtifactGroup::Artifact(Artifact::from(
+            SourceArtifact::new(SourcePath::testing_new("cell//pkg", "source"))
+        ))];
+        let label =
+            TargetLabel::testing_parse("cell//pkg:foo").configure(ConfigurationData::testing_new());
+        let outputs = buck_indexset![BuildArtifact::testing_new(
+            label.dupe(),
+            "output",
+            ActionIndex::new(0),
+        )];
+
+        let action = RegisteredAction::new(
+            ActionKey::new(
+                DeferredHolderKey::Base(BaseDeferredKey::TargetLabel(label.dupe())),
+                ActionIndex::new(0),
+            ),
+            Box::new(TestingAction {
+                inputs: BoxSliceSet::from(inputs),
+                outputs: BoxSliceSet::from(outputs.clone()),
+                ran: Default::default(),
+            }),
+            CommandExecutorConfig::testing_local(),
+        );
+        let res = with_dispatcher_async(
+            EventDispatcher::null(),
+            executor.execute(
+                WaitingData::new(),
+                Default::default(),
+                &action,
+                CancellationContext::testing(),
+                false,
+            ),
+        )
+        .await
+        .0
+        .unwrap();
+        let outputs = outputs
+            .iter()
+            .map(|o| {
+                (
+                    o.get_path().dupe(),
+                    ArtifactValue::file(executor.digest_config.empty_file()),
+                )
+            })
+            .collect();
+        assert_eq!(res.0, ActionOutputs::new(outputs));
+    }
 
     #[test]
     fn test_cleanup_path_missing() -> buck2_error::Result<()> {

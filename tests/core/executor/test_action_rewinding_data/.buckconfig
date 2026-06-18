@@ -1,0 +1,20 @@
+[buck2]
+digest_algorithms = SHA1
+materializations = deferred
+
+[buildfile]
+name = TARGETS.fixture
+
+[cells]
+root = .
+
+[build]
+execution_platforms = root//platforms:platforms
+
+[buck2_re_client]
+address = remote.buildbuddy.io
+engine_address = remote.buildbuddy.io
+action_cache_address = remote.buildbuddy.io
+cas_address = remote.buildbuddy.io
+capabilities = true
+http_headers = x-buildbuddy-api-key:$BUILDBUDDY_API_KEY
