@@ -85,8 +85,22 @@ def _package_name_arg():
             attrs.string(),
             default = None,
             doc = """
-    Sets the full name of the package being compiled. This defaults to the path from the buck root.
+    Sets the import path of the package being compiled. This defaults to the path from the buck root.
      (e.g. given a ./.buckconfig, a rule in ./a/b/BUCK defaults to package "a/b")
+
+     Prefer import_path for new targets. package_name is kept for compatibility.
+""",
+        ),
+    }
+
+def _import_path_arg():
+    return {
+        "import_path": attrs.option(
+            attrs.string(),
+            default = None,
+            doc = """
+    Sets the Go import path of the package being compiled. This defaults to the path from the buck
+     root. If both import_path and package_name are set, they must be equal.
 """,
         ),
     }
@@ -249,6 +263,7 @@ go_common = struct(
     link_style_arg = _link_style_arg,
     link_mode_arg = _link_mode_arg,
     package_name_arg = _package_name_arg,
+    import_path_arg = _import_path_arg,
     compiler_flags_arg = _compiler_flags_arg,
     assembler_flags_arg = _assembler_flags_arg,
     linker_flags_arg = _linker_flags_arg,

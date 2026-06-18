@@ -6,7 +6,9 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
+load("@prelude//toolchains/go:remote_go_proto_toolchain.bzl", _remote_go_proto_toolchain = "remote_go_proto_toolchain")
 load("@prelude//toolchains/go:system_go_bootstrap_toolchain.bzl", _system_go_bootstrap_toolchain = "system_go_bootstrap_toolchain")
+load("@prelude//toolchains/go:system_go_proto_toolchain.bzl", _system_go_proto_toolchain = "system_go_proto_toolchain")
 load("@prelude//toolchains/go:system_go_toolchain.bzl", _system_go_toolchain = "system_go_toolchain")
 
 # deprecated: use `@prelude///toolchains/go:system_go_bootstrap_toolchain.bzl` instead
@@ -14,3 +16,6 @@ system_go_bootstrap_toolchain = _system_go_bootstrap_toolchain
 
 # deprecated: use `@prelude///toolchains/go:system_go_toolchain.bzl` instead
 system_go_toolchain = _system_go_toolchain
+
+remote_go_proto_toolchain = _remote_go_proto_toolchain
+system_go_proto_toolchain = _system_go_proto_toolchain

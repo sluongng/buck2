@@ -29,6 +29,7 @@ load("@prelude//toolchains:python.bzl", "remote_python_toolchain", "system_pytho
 load("@prelude//toolchains:remote_test_execution.bzl", "remote_test_execution_toolchain")
 load("@prelude//toolchains:rust.bzl", "system_rust_toolchain")
 load("@prelude//toolchains:zip_file.bzl", "zip_file_toolchain")
+load("@prelude//toolchains/go:remote_go_proto_toolchain.bzl", "remote_go_proto_toolchain")
 load("@prelude//toolchains/go:system_go_bootstrap_toolchain.bzl", "system_go_bootstrap_toolchain")
 load("@prelude//toolchains/go:system_go_toolchain.bzl", "system_go_toolchain")
 
@@ -93,6 +94,11 @@ def system_demo_toolchains():
 
     system_go_toolchain(
         name = "go",
+        visibility = ["PUBLIC"],
+    )
+
+    remote_go_proto_toolchain(
+        name = "go_proto",
         visibility = ["PUBLIC"],
     )
 
