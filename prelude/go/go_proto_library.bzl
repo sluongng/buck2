@@ -202,7 +202,7 @@ def _go_proto_library_impl(ctx: AnalysisContext) -> list[Provider]:
 
     package_root = paths.dirname(generated_srcs[0].short_path)
     all_deps = ctx.attrs.deps + _compiler_deps(compilers)
-    pkg, pkg_info, _ = declare_package_build(
+    pkg, pkg_info, _, _ = declare_package_build(
         ctx = ctx,
         pkg_import_path = ctx.attrs.import_path,
         main = False,
@@ -229,14 +229,19 @@ def _go_proto_library_impl(ctx: AnalysisContext) -> list[Provider]:
     return [
         DefaultInfo(default_output = pkg.archive_file),
         GoPkgCompileInfo(pkgs = pkgs),
-        GoPkgLinkInfo(pkgs = merge_pkgs([
-            pkgs,
-            get_inherited_link_pkgs(all_deps),
-        ])),
+        GoPkgLinkInfo(
+            pkgs = merge_pkgs([
+                pkgs,
+                get_inherited_link_pkgs(all_deps),
+            ]),
+            native_deps = [],
+        ),
         GoTestInfo(
             deps = all_deps,
+            cdeps = [],
             srcs = generated_srcs,
             pkg_import_path = ctx.attrs.import_path,
+            header_namespace = "",
             coverage_enabled = False,
         ),
         create_merged_link_info_for_propagation(ctx, filter(None, [d.get(MergedLinkInfo) for d in all_deps])),
