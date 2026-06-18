@@ -1,0 +1,48 @@
+load("@fbcode//buck2/tests/prelude:py_assertion.bzl", "py_assertion")
+
+oncall("golang")
+
+prelude = native
+
+prelude.go_library(
+    name = "lib",
+    srcs = ["lib.go"],
+)
+
+prelude.go_test(
+    name = "test",
+    srcs = ["external_test.go"],
+    deps = [":lib"],
+    embed_srcs = ["external_fixture.txt"],
+    # @oss-disable[end= ]: env = {"GO_TEST2JSON_TOOL": "$(exe_target fbsource//third-party/go:test2json)"},
+)
+
+prelude.go_test(
+    name = "coverage_test",
+    srcs = ["external_test.go"],
+    deps = [":lib"],
+    embed_srcs = ["external_fixture.txt"],
+    coverage_mode = "set",
+    # @oss-disable[end= ]: env = {"GO_TEST2JSON_TOOL": "$(exe_target fbsource//third-party/go:test2json)"},
+)
+
+py_assertion(
+    name = "check_output",
+    script = """
+import subprocess
+import sys
+assert "PASS" in subprocess.check_output([sys.argv[1]]).decode()
+""",
+    script_args = ["$(location_exec :test)"],
+)
+
+py_assertion(
+    name = "check_coverage",
+    script = """
+import subprocess
+import sys
+output = subprocess.check_output([sys.argv[1]], stderr=subprocess.STDOUT, text=True)
+assert "coverage: 100.0% of statements in tests/prelude/go/go_test/external" in output, output
+""",
+    script_args = ["$(location_exec :coverage_test)"],
+)
