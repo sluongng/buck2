@@ -80,9 +80,10 @@ actions:
 
           cp shim/third-party/rust/BUCK.reindeer shim/third-party/rust/BUCK
 
-      # Use the bootstrap Buck2 binary to build the current checkout's Buck2.
-      # The resulting binary path is saved so subsequent steps do not rely on
-      # shell variables crossing step boundaries.
+      # Use the bootstrap Buck2 binary to build the current checkout's Buck2
+      # locally. This seeds the remote cache from the workflow runner before
+      # remote-only validation, avoiding cold-cache archive fetches on RBE
+      # workers that may not have reliable external DNS.
       - run: |
           set -euo pipefail
 
@@ -92,21 +93,31 @@ actions:
           export BUCK2_TEST_EXTRA_EXTERNAL_CONFIG="$PWD/.buckconfig.buildbuddy"
 
           buck2_bootstrap=$(cat .buildbuddy-workflow/bootstrap-buck2.path)
-          built_buck2_json="$("$buck2_bootstrap" \
-            --isolation-dir "buildbuddy-rbe-build-$BUILDBUDDY_INVOCATION_ID" \
-            build \
-            --show-full-json-output \
-            --config-file .buckconfig.buildbuddy \
-            --remote-only \
-            //:buck2)"
+          local_buck2_build() {
+            local attempt="$1"
+            "$buck2_bootstrap" \
+              --isolation-dir "buildbuddy-rbe-build-$BUILDBUDDY_INVOCATION_ID-$attempt" \
+              build \
+              --show-full-json-output \
+              --config-file .buckconfig.buildbuddy \
+              --local-only \
+              //:buck2
+          }
+
+          if ! built_buck2_json="$(local_buck2_build initial)"; then
+            echo "Local //:buck2 bootstrap build failed; retrying once with fresh Buck2 daemon state" >&2
+            "$buck2_bootstrap" killall >/dev/null 2>&1 || true
+            rm -rf "buck-out/buildbuddy-rbe-build-$BUILDBUDDY_INVOCATION_ID-retry"
+            built_buck2_json="$(local_buck2_build retry)"
+          fi
           built_buck2="$(python3 -c 'import json, sys; outputs = json.load(sys.stdin); output = next(iter(outputs.values())); print(output[0] if isinstance(output, list) else output)' <<< "$built_buck2_json")"
           printf '%s\n' "$built_buck2" > .buildbuddy-workflow/built-buck2.path
           test -x "$built_buck2"
           "$built_buck2" --version
 
       # Rebuild //:buck2 with the freshly built binary, then run the BuildBuddy
-      # remote matrix. The explicit binary build proves the fork can bootstrap
-      # itself remotely before broader test coverage runs with that binary.
+      # remote matrix. Keep this second build remote-only as well, so the final
+      # validation exercises the same RBE path as the matrix tests.
       - run: |
           set -euo pipefail
 
@@ -115,12 +126,22 @@ actions:
           export BUCK2_TEST_EXTRA_EXTERNAL_CONFIG="$PWD/.buckconfig.buildbuddy"
 
           built_buck2=$(cat .buildbuddy-workflow/built-buck2.path)
-          "$built_buck2" \
-            --isolation-dir "buildbuddy-rbe-selftest-$BUILDBUDDY_INVOCATION_ID" \
-            build \
-            --config-file .buckconfig.buildbuddy \
-            --remote-only \
-            //:buck2
+          remote_only_buck2_build() {
+            local attempt="$1"
+            "$built_buck2" \
+              --isolation-dir "buildbuddy-rbe-selftest-$BUILDBUDDY_INVOCATION_ID-$attempt" \
+              build \
+              --config-file .buckconfig.buildbuddy \
+              --remote-only \
+              //:buck2
+          }
+
+          if ! remote_only_buck2_build initial; then
+            echo "Remote-only //:buck2 build failed; retrying once with fresh Buck2 daemon state" >&2
+            "$built_buck2" killall >/dev/null 2>&1 || true
+            rm -rf "buck-out/buildbuddy-rbe-selftest-$BUILDBUDDY_INVOCATION_ID-retry"
+            remote_only_buck2_build retry
+          fi
 
           BUCK2="$built_buck2" buildbuddy/run_buck2_test_matrix.sh \
             --mode remote \
