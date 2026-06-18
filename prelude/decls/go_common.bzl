@@ -26,6 +26,19 @@ def _deps_arg():
         ),
     }
 
+def _cdeps_arg():
+    return {
+        "cdeps": attrs.list(
+            attrs.dep(),
+            default = [],
+            doc = """
+    The set of C/C++ dependencies needed by this rule's cgo sources. These dependencies provide
+     headers, preprocessor flags, linker inputs, and runtime shared libraries, but are not treated as
+     Go package dependencies.
+""",
+        ),
+    }
+
 def _srcs_arg():
     return {
         "srcs": attrs.list(
@@ -258,6 +271,7 @@ def _coverage_enabled():
 
 go_common = struct(
     deps_arg = _deps_arg,
+    cdeps_arg = _cdeps_arg,
     srcs_arg = _srcs_arg,
     package_root_arg = _package_root_arg,
     link_style_arg = _link_style_arg,
