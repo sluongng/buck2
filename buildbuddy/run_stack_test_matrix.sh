@@ -383,6 +383,22 @@ prepare_matrix_worktree() {
     esac
 }
 
+REMOTE_SUPPORT_FILES=(
+    BUCK
+    rust-toolchain.toml
+    .buckconfig.d/common.buckconfig
+    buildbuddy/BUCK
+    buildbuddy/defs.bzl
+    buildbuddy/toolchains/BUCK
+    shim/tools/target_determinator/macros/ci.bzl
+)
+
+REMOTE_SUPPORT_DIRS=(
+    docs/buck2_lab
+    prelude
+    shim
+)
+
 prepare_remote_worktree() {
     local worktree="$1"
 
@@ -390,33 +406,18 @@ prepare_remote_worktree() {
         return
     fi
 
-    for support_file in \
-        BUCK \
-        rust-toolchain.toml \
-        .buckconfig.d/common.buckconfig \
-        buildbuddy/BUCK \
-        buildbuddy/defs.bzl \
-        buildbuddy/toolchains/BUCK \
-        prelude/http_archive/extract_archive.bzl \
-        prelude/http_archive/http_archive.bzl \
-        prelude/http_archive/unarchive.bzl \
-        prelude/toolchains/dex.bzl \
-        prelude/toolchains/haskell.bzl \
-        prelude/toolchains/java.bzl \
-        prelude/toolchains/kotlin.bzl \
-        prelude/toolchains/rust.bzl \
-        prelude/toolchains/cxx/llvm/defs.bzl \
-        prelude/toolchains/cxx/llvm/releases.bzl \
-        prelude/toolchains/go/defs.bzl \
-        prelude/toolchains/go/releases.bzl \
-        prelude/toolchains/go/remote_go_proto_toolchain.bzl \
-        shim/tools/target_determinator/macros/ci.bzl; do
+    for support_file in "${REMOTE_SUPPORT_FILES[@]}"; do
         if [[ ! -f "$ROOT_DIR/$support_file" ]]; then
             continue
         fi
         echo "Copying $support_file from $ROOT_DIR"
         mkdir -p "$worktree/$(dirname "$support_file")"
         cp "$ROOT_DIR/$support_file" "$worktree/$support_file"
+    done
+    for support_dir in "${REMOTE_SUPPORT_DIRS[@]}"; do
+        echo "Copying $support_dir/ from $ROOT_DIR"
+        mkdir -p "$worktree/$support_dir"
+        cp -R "$ROOT_DIR/$support_dir/." "$worktree/$support_dir/"
     done
 
     if [[ "$STAGE_REMOTE_CONFIG" == 1 ]]; then
@@ -451,7 +452,17 @@ for commit in "${COMMITS[@]}"; do
             fi
         fi
         if [[ "$USES_REMOTE" == 1 ]]; then
-            printf '(cd %q && [ -f buildbuddy/BUCK ] || { mkdir -p buildbuddy && cp %q buildbuddy/BUCK && cp %q buildbuddy/defs.bzl; })\n' "$worktree" "$ROOT_DIR/buildbuddy/BUCK" "$ROOT_DIR/buildbuddy/defs.bzl"
+            for support_file in "${REMOTE_SUPPORT_FILES[@]}"; do
+                if [[ ! -f "$ROOT_DIR/$support_file" ]]; then
+                    continue
+                fi
+                printf 'mkdir -p %q\n' "$worktree/$(dirname "$support_file")"
+                printf 'cp %q %q\n' "$ROOT_DIR/$support_file" "$worktree/$support_file"
+            done
+            for support_dir in "${REMOTE_SUPPORT_DIRS[@]}"; do
+                printf 'mkdir -p %q\n' "$worktree/$support_dir"
+                printf 'cp -R %q %q\n' "$ROOT_DIR/$support_dir/." "$worktree/$support_dir/"
+            done
             if [[ "$STAGE_REMOTE_CONFIG" == 1 ]]; then
                 printf 'cp %q %q\n' "$REMOTE_CONFIG_FILE" "$worktree/.buckconfig.local"
                 printf 'cp %q %q\n' "$ROOT_DIR/.buckconfig.buildbuddy" "$worktree/.buckconfig.buildbuddy"

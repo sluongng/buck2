@@ -8,6 +8,14 @@
 
 load("@prelude//:genrule_toolchain.bzl", "GenruleToolchainInfo")
 
+def _genrule_toolchain_impl(ctx):
+    return [
+        DefaultInfo(),
+        GenruleToolchainInfo(
+            zip_scrubber = ctx.attrs.zip_scrubber[RunInfo] if ctx.attrs.zip_scrubber else None,
+        ),
+    ]
+
 def _system_genrule_toolchain_impl(_ctx):
     return [
         DefaultInfo(),
@@ -19,5 +27,13 @@ def _system_genrule_toolchain_impl(_ctx):
 system_genrule_toolchain = rule(
     impl = _system_genrule_toolchain_impl,
     attrs = {},
+    is_toolchain_rule = True,
+)
+
+genrule_toolchain = rule(
+    impl = _genrule_toolchain_impl,
+    attrs = {
+        "zip_scrubber": attrs.option(attrs.exec_dep(providers = [RunInfo]), default = None),
+    },
     is_toolchain_rule = True,
 )

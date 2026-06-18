@@ -111,6 +111,7 @@ TARGET_PLATFORM_ARGS=()
 
 case "$MATRIX" in
     smoke | app-rust)
+        TARGET_PLATFORM_ARGS=(--target-platforms prelude//platforms:default)
         MATRIX_TARGETS=(
             //app/buck2_action_impl_tests:buck2_action_impl_tests
             //app/buck2_build_api_tests:buck2_build_api_tests
@@ -118,6 +119,7 @@ case "$MATRIX" in
             //app/buck2_error_tests:buck2_error_tests
             //app/buck2_interpreter_for_build_tests:buck2_interpreter_for_build_tests
             //app/buck2_node_tests:buck2_node_tests
+            prelude//toolchains/android/src/com/facebook/buck/util/zip:zip_scrubber_main
         )
 
         if [[ "$MATRIX" == "smoke" ]]; then

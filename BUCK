@@ -12,6 +12,12 @@ clippy_configuration(
     clippy_toml_src = "clippy.toml",
 )
 
+export_file(
+    name = "rust-toolchain",
+    src = "rust-toolchain.toml",
+    visibility = ["PUBLIC"],
+)
+
 # Need a custom transition here so that buck2 is always built with pagable enabled,
 # even if its parent does not have pagable enabled.
 pagable_transition_alias(
