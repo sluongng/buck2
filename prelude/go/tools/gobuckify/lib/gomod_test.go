@@ -11,6 +11,7 @@
 package gobuckifylib
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -201,5 +202,194 @@ func TestArchiveForPackageEscapesURLOnly(t *testing.T) {
 	}
 	if archive.StripPrefix != "github.com/Masterminds/semver/v3@v3.4.0" {
 		t.Fatalf("StripPrefix = %q", archive.StripPrefix)
+	}
+}
+
+func TestSelectRootModuleFromGoWorkModules(t *testing.T) {
+	dir := t.TempDir()
+	rootDir := filepath.Join(dir, "root")
+	depDir := filepath.Join(dir, "dep")
+	out := []byte(moduleJSON(t, &Module{
+		Path:  "example.com/dep",
+		Dir:   depDir,
+		GoMod: filepath.Join(depDir, "go.mod"),
+		Main:  true,
+	}) + "\n" + moduleJSON(t, &Module{
+		Path:  "example.com/root",
+		Dir:   rootDir,
+		GoMod: filepath.Join(rootDir, "go.mod"),
+		Main:  true,
+	}) + "\n")
+
+	mod, err := selectRootModule(out, rootDir, filepath.Join(rootDir, "go.mod"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mod.Path != "example.com/root" || mod.Dir != rootDir {
+		t.Fatalf("selected module = %#v", mod)
+	}
+}
+
+func TestLocalReplacePackagesAreGeneratedLocally(t *testing.T) {
+	dir := t.TempDir()
+	appDir := filepath.Join(dir, "app")
+	localModuleDir := filepath.Join(dir, "localdep")
+	localPkgDir := filepath.Join(localModuleDir, "pkg")
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(localPkgDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appDir, "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localPkgDir, "pkg.go"), []byte("package pkg\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	rootPkg := &GoModPackage{
+		Dir:        appDir,
+		ImportPath: "example.com/root/app",
+		Name:       "main",
+		Module: &Module{
+			Path: "example.com/root",
+			Dir:  dir,
+		},
+		Imports: []string{"example.com/localdep/pkg"},
+		GoFiles: []string{"main.go"},
+	}
+	localPkg := &GoModPackage{
+		Dir:        localPkgDir,
+		ImportPath: "example.com/localdep/pkg",
+		Name:       "pkg",
+		Module: &Module{
+			Path:    "example.com/localdep",
+			Version: "v0.0.0",
+			Dir:     localModuleDir,
+			Replace: &Module{
+				Path: "./localdep",
+				Dir:  localModuleDir,
+			},
+		},
+		GoFiles: []string{"pkg.go"},
+	}
+	state := &goModState{
+		RootDir:       dir,
+		RootModule:    &Module{Path: "example.com/root", Dir: dir},
+		Packages:      map[string]*GoModPackage{},
+		Labels:        map[string]string{},
+		TargetNames:   map[string]string{},
+		Archives:      map[string]*goModArchive{},
+		ProtoArchives: map[string]*goModArchive{},
+		ModulePatches: map[string]goModModulePatch{},
+		FilesByDir:    map[string][]string{},
+		ZipSHA256:     map[string]string{},
+	}
+	for _, pkg := range []*GoModPackage{rootPkg, localPkg} {
+		state.Packages[pkg.ImportPath] = pkg
+		state.FilesByDir[pkg.ImportPath] = packageFiles(pkg)
+		state.Labels[pkg.ImportPath] = state.labelForPackage(pkg)
+	}
+	if got := state.Labels["example.com/localdep/pkg"]; got != "//localdep/pkg:pkg" {
+		t.Fatalf("local replacement label = %q", got)
+	}
+	checksums, err := queryModuleZipSHA256(dir, []*GoModPackage{localPkg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(checksums) != 0 {
+		t.Fatalf("local replacement checksums = %#v", checksums)
+	}
+	if err := state.writeRootPackageFiles(); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.writeThirdPartyFile(); err != nil {
+		t.Fatal(err)
+	}
+
+	appBuck := readFile(t, filepath.Join(appDir, GoModBuckFileName))
+	for _, want := range []string{
+		"import_path = \"example.com/root/app\"",
+		"\"//localdep/pkg:pkg\"",
+	} {
+		if !strings.Contains(appBuck, want) {
+			t.Fatalf("root BUCK missing %q:\n%s", want, appBuck)
+		}
+	}
+	localBuck := readFile(t, filepath.Join(localPkgDir, GoModBuckFileName))
+	for _, want := range []string{
+		"go_library(",
+		"import_path = \"example.com/localdep/pkg\"",
+		"\"pkg.go\"",
+	} {
+		if !strings.Contains(localBuck, want) {
+			t.Fatalf("local replacement BUCK missing %q:\n%s", want, localBuck)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "third_party", "go", GoModBuckFileName)); !os.IsNotExist(err) {
+		t.Fatalf("third-party BUCK exists for local-only packages: %v", err)
+	}
+}
+
+func TestGenerateGoModBuckFilesLocalReplace(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "localdep"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "go.mod"), "module example.com/root\n\ngo 1.22\n\nrequire example.com/dep v0.0.0\n\nreplace example.com/dep => ./localdep\n")
+	writeFile(t, filepath.Join(dir, "main.go"), "package main\n\nimport \"example.com/dep\"\n\nfunc main() { _ = dep.Value() }\n")
+	writeFile(t, filepath.Join(dir, "localdep", "go.mod"), "module example.com/dep\n\ngo 1.22\n")
+	writeFile(t, filepath.Join(dir, "localdep", "dep.go"), "package dep\n\nfunc Value() string { return \"local\" }\n")
+
+	if err := GenerateGoModBuckFiles(dir, []string{"./..."}); err != nil {
+		t.Fatal(err)
+	}
+	rootBuck := readFile(t, filepath.Join(dir, GoModBuckFileName))
+	for _, want := range []string{
+		"import_path = \"example.com/root\"",
+		"\"//localdep:dep\"",
+	} {
+		if !strings.Contains(rootBuck, want) {
+			t.Fatalf("root BUCK missing %q:\n%s", want, rootBuck)
+		}
+	}
+	localBuck := readFile(t, filepath.Join(dir, "localdep", GoModBuckFileName))
+	for _, want := range []string{
+		"go_library(",
+		"import_path = \"example.com/dep\"",
+		"\"dep.go\"",
+	} {
+		if !strings.Contains(localBuck, want) {
+			t.Fatalf("local BUCK missing %q:\n%s", want, localBuck)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "third_party", "go", GoModBuckFileName)); !os.IsNotExist(err) {
+		t.Fatalf("third-party BUCK exists for local-only packages: %v", err)
+	}
+}
+
+func moduleJSON(t *testing.T, mod *Module) string {
+	t.Helper()
+	out, err := json.Marshal(mod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(content)
+}
+
+func writeFile(t *testing.T, path string, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
 	}
 }
