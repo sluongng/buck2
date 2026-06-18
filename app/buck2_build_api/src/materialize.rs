@@ -39,9 +39,9 @@ use futures::FutureExt;
 
 use crate::actions::artifact::get_artifact_fs::GetArtifactFs;
 use crate::actions::artifact::materializer::ArtifactMaterializer;
-use crate::actions::calculation::ActionCalculation;
 use crate::actions::execute::dice_data::GetReClient;
 use crate::actions::impls::run_action_knobs::HasRunActionKnobs;
+use crate::actions::rewind::ActionRewindRequest;
 use crate::artifact_groups::ArtifactGroup;
 use crate::artifact_groups::ArtifactGroupValues;
 use crate::artifact_groups::calculation::ArtifactGroupCalculation;
@@ -101,13 +101,12 @@ async fn materialize_artifact_group(
             ctx.per_transaction_data().get_materializer(),
         ));
 
-        let mut retried_lost_output = false;
-        loop {
+        {
             let mut materialize_futs = Vec::new();
 
             for (artifact, value) in values.iter() {
                 if let BaseArtifactKind::Build(artifact) = artifact.as_parts().0 {
-                    if !retried_lost_output && !queue_tracker.insert(artifact.dupe()) {
+                    if !queue_tracker.insert(artifact.dupe()) {
                         // We've already requested this artifact, no use requesting it again.
                         continue;
                     }
@@ -169,14 +168,13 @@ async fn materialize_artifact_group(
             }
 
             match buck2_util::future::try_join_all(materialize_futs).await {
-                Ok(_) => break,
-                Err(error)
-                    if force
-                        && !retried_lost_output
-                        && error.tags().contains(&ErrorTag::ReNotFound) =>
-                {
-                    reexecute_materialization_producers(ctx, &values).await?;
-                    retried_lost_output = true;
+                Ok(_) => {}
+                Err(error) if force && error.tags().contains(&ErrorTag::ReNotFound) => {
+                    remove_materialization_queue_entries(&values, queue_tracker);
+                    return Err(match materialization_rewind_request(&values) {
+                        Some(request) => error.context(request),
+                        None => error,
+                    });
                 }
                 Err(error) => return Err(error),
             }
@@ -186,10 +184,7 @@ async fn materialize_artifact_group(
     Ok(values)
 }
 
-async fn reexecute_materialization_producers(
-    ctx: &mut DiceComputations<'_>,
-    values: &ArtifactGroupValues,
-) -> buck2_error::Result<()> {
+fn materialization_rewind_request(values: &ArtifactGroupValues) -> Option<ActionRewindRequest> {
     let mut producers = Vec::new();
 
     for (artifact, _) in values.iter() {
@@ -200,15 +195,29 @@ async fn reexecute_materialization_producers(
         }
     }
 
-    for producer in producers {
-        tracing::info!(
-            producer_action = %producer,
-            "Re-executing producer action after a requested output disappeared from remote CAS"
-        );
-        ActionCalculation::reexecute_action_for_lost_cas_output(ctx, &producer).await?;
+    if producers.is_empty() {
+        return None;
     }
 
-    Ok(())
+    for producer in &producers {
+        tracing::info!(
+            producer_action = %producer,
+            "Requesting DICE graph rewind after a requested output disappeared from remote CAS"
+        );
+    }
+
+    Some(ActionRewindRequest::new(producers))
+}
+
+fn remove_materialization_queue_entries(
+    values: &ArtifactGroupValues,
+    queue_tracker: &Arc<BuckDashSet<BuildArtifact>>,
+) {
+    for (artifact, _) in values.iter() {
+        if let BaseArtifactKind::Build(artifact) = artifact.as_parts().0 {
+            queue_tracker.remove(artifact);
+        }
+    }
 }
 
 async fn ensure_uploaded(

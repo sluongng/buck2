@@ -2008,7 +2008,7 @@ impl RemoteExecutionClientImpl {
                     }
                 };
 
-                if let Some(digest) = should_fail_re_download_once(&chunk)? {
+                if let Some(digest) = should_fail_re_download(&chunk)? {
                     return Err(test_re_error(
                         &format!("Injected missing CAS download for {digest}"),
                         TCode::NOT_FOUND,
@@ -2173,17 +2173,31 @@ impl RemoteExecutionClientImpl {
     }
 }
 
-fn should_fail_re_download_once(
+fn should_fail_re_download(
     files: &[NamedDigestWithPermissions],
 ) -> buck2_error::Result<Option<TDigest>> {
     fn convert_digests(val: &str) -> buck2_error::Result<Vec<TDigest>> {
-        val.split(' ')
+        val.split_whitespace()
             .map(|digest| {
                 TDigest::from_str(digest)
                     .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::InvalidDigest))
                     .with_buck_error_context(|| format!("Invalid digest: {digest}"))
             })
             .collect()
+    }
+
+    let injected_digests_file = buck2_env!(
+        "BUCK2_TEST_FAIL_RE_DOWNLOAD_DIGESTS_ONCE_FILE",
+        applicability = testing
+    )?;
+    if let Some(path) = injected_digests_file {
+        let injected_digests = std::fs::read_to_string(&path)
+            .with_buck_error_context(|| format!("Failed to read `{path}`"))?;
+        for injected_digest in convert_digests(&injected_digests)? {
+            if should_fail_digest_once(files, &injected_digest) {
+                return Ok(Some(injected_digest));
+            }
+        }
     }
 
     let injected_digests = buck2_env!(
@@ -2198,23 +2212,23 @@ fn should_fail_re_download_once(
     };
 
     for injected_digest in injected_digests {
-        let injected_digest_str = injected_digest.to_string();
-        if !files
-            .iter()
-            .any(|file| file.named_digest.digest.to_string() == injected_digest_str)
-        {
-            continue;
-        }
-
-        let mut failed_once = TEST_FAIL_RE_DOWNLOAD_DIGESTS_ONCE
-            .lock()
-            .expect("Poisoned lock");
-        if failed_once.insert(injected_digest_str) {
+        if should_fail_digest_once(files, &injected_digest) {
             return Ok(Some(injected_digest.clone()));
         }
     }
 
     Ok(None)
+}
+
+fn should_fail_digest_once(files: &[NamedDigestWithPermissions], digest: &TDigest) -> bool {
+    if !files.iter().any(|file| file.named_digest.digest == *digest) {
+        return false;
+    }
+
+    TEST_FAIL_RE_DOWNLOAD_DIGESTS_ONCE
+        .lock()
+        .expect("Poisoned lock")
+        .insert(digest.to_string())
 }
 
 /// Drop the REClient on a blocking thread. The REClient destructor does a blocking wait on async

@@ -2,6 +2,9 @@ load(
     ":defs.bzl",
     "consumer",
     "consumer_two",
+    "nondeterministic_middle",
+    "nondeterministic_producer",
+    "prefixed_consumer",
     "producer",
     "tree_consumer",
     "tree_producer",
@@ -44,4 +47,28 @@ tree_producer(
 tree_consumer(
     name = "tree_consumer",
     dep = ":tree_producer",
+)
+
+nondeterministic_producer(
+    name = "nondeterministic_producer",
+)
+
+prefixed_consumer(
+    name = "nondeterministic_consumer",
+    dep = ":nondeterministic_producer",
+    out = "nondeterministic_consumer.txt",
+    prefix = "nondeterministic consumer saw: ",
+)
+
+nondeterministic_middle(
+    name = "nondeterministic_middle",
+    dep = ":nondeterministic_producer",
+)
+
+prefixed_consumer(
+    name = "nondeterministic_chain_consumer",
+    category = "consume_nondeterministic_chain",
+    dep = ":nondeterministic_middle",
+    out = "nondeterministic_chain_consumer.txt",
+    prefix = "nondeterministic chain consumer saw: ",
 )

@@ -395,7 +395,8 @@ impl Uploader {
                                         err
                                     ),
                                     quiet: true
-                                )?;
+                                )
+                                .map_err(|e| e.context(lost_input.clone()))?;
 
                                 // Materialize this file from CAS and include it in this upload.
                                 // Skipping it would leave the downstream action with an
@@ -566,7 +567,7 @@ fn add_injected_missing_digests<'a>(
     missing_digests: &mut StdBuckHashSet<&'a TrackedFileDigest>,
 ) -> buck2_error::Result<()> {
     fn convert_digests(val: &str) -> buck2_error::Result<Vec<FileDigest>> {
-        val.split(' ')
+        val.split_whitespace()
             .map(|digest| {
                 let digest = TDigest::from_str(digest)
                     .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::InvalidDigest))
@@ -576,6 +577,26 @@ fn add_injected_missing_digests<'a>(
                 buck2_error::Ok(digest)
             })
             .collect()
+    }
+
+    fn add_digests_once<'a>(
+        input_digests: &StdBuckHashSet<&'a TrackedFileDigest>,
+        missing_digests: &mut StdBuckHashSet<&'a TrackedFileDigest>,
+        digests: Vec<FileDigest>,
+    ) {
+        static INJECTED_ONCE: LazyLock<Mutex<StdBuckHashSet<FileDigest>>> =
+            LazyLock::new(|| Mutex::new(StdBuckHashSet::default()));
+
+        for d in digests {
+            let matched = input_digests.get(&d);
+            if let Some(i) = matched {
+                let mut injected_once = INJECTED_ONCE.lock().expect("Poisoned lock");
+                if !injected_once.contains(&d) {
+                    injected_once.insert(d.clone());
+                    missing_digests.insert(i);
+                }
+            }
+        }
     }
 
     let ingested_digests = buck2_env!(
@@ -592,6 +613,20 @@ fn add_injected_missing_digests<'a>(
         }
     }
 
+    let injected_digests_file = buck2_env!(
+        "BUCK2_TEST_INJECTED_MISSING_DIGESTS_ONCE_FILE",
+        applicability = testing
+    )?;
+    if let Some(path) = injected_digests_file {
+        let injected_digests = std::fs::read_to_string(&path)
+            .with_buck_error_context(|| format!("Failed to read {path}"))?;
+        add_digests_once(
+            input_digests,
+            missing_digests,
+            convert_digests(&injected_digests)?,
+        );
+    }
+
     let ingested_digests_once = buck2_env!(
         "BUCK2_TEST_INJECTED_MISSING_DIGESTS_ONCE",
         type=Vec<FileDigest>,
@@ -599,18 +634,7 @@ fn add_injected_missing_digests<'a>(
         applicability=testing
     )?;
     if let Some(digests) = ingested_digests_once {
-        static INJECTED_ONCE: LazyLock<Mutex<StdBuckHashSet<FileDigest>>> =
-            LazyLock::new(|| Mutex::new(StdBuckHashSet::default()));
-
-        for d in digests {
-            if let Some(i) = input_digests.get(d) {
-                let mut injected_once = INJECTED_ONCE.lock().expect("Poisoned lock");
-                if !injected_once.contains(&d) {
-                    injected_once.insert(d.clone());
-                    missing_digests.insert(i);
-                }
-            }
-        }
+        add_digests_once(input_digests, missing_digests, digests.to_vec());
     }
 
     Ok(())

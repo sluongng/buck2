@@ -41,7 +41,6 @@ use buck2_execute::execute::result::CommandExecutionReport;
 use buck2_execute::execute::result::CommandExecutionStatus;
 use buck2_execute::materialize::materializer::ReLostInput;
 use buck2_execute::output_size::OutputSize;
-use buck2_hash::BuckHashMap;
 use buck2_hash::BuckIndexMap;
 use buck2_interpreter::print_handler::EventDispatcherPrintHandler;
 use buck2_interpreter::soft_error::Buck2StarlarkSoftErrorHandler;
@@ -78,6 +77,8 @@ use crate::actions::execute::action_executor::ActionOutputs;
 use crate::actions::execute::action_executor::BuckActionExecutor;
 use crate::actions::execute::action_executor::HasActionExecutor;
 use crate::actions::execute::error::ExecuteError;
+use crate::actions::rewind::ActionRewindRequest;
+use crate::actions::rewind::HasActionRewindTracker;
 use crate::artifact_groups::ArtifactGroup;
 use crate::artifact_groups::ArtifactGroupValues;
 use crate::artifact_groups::calculation::ensure_artifact_group_staged;
@@ -90,23 +91,6 @@ use crate::starlark::values::UnpackValue;
 use crate::starlark::values::type_repr::StarlarkTypeRepr;
 
 pub struct ActionCalculation;
-
-const MAX_REPEATED_LOST_INPUT_REWINDS: usize = 20;
-
-#[derive(Copy, Clone)]
-enum ActionExecutionMode {
-    Normal,
-    LostInputRewind,
-}
-
-impl ActionExecutionMode {
-    fn store_activation_data(self) -> bool {
-        match self {
-            Self::Normal => true,
-            Self::LostInputRewind => false,
-        }
-    }
-}
 
 async fn build_action_impl(
     ctx: &mut DiceComputations<'_>,
@@ -137,28 +121,13 @@ fn build_action_no_redirect<'a>(
     cancellation: &'a CancellationContext,
     action: Arc<RegisteredAction>,
 ) -> BoxFuture<'a, buck2_error::Result<ActionOutputs>> {
-    build_action_no_redirect_impl(ctx, cancellation, action, ActionExecutionMode::Normal).boxed()
-}
-
-fn build_action_for_lost_input_rewind<'a>(
-    ctx: &'a mut DiceComputations<'_>,
-    cancellation: &'a CancellationContext,
-    action: Arc<RegisteredAction>,
-) -> BoxFuture<'a, buck2_error::Result<ActionOutputs>> {
-    build_action_no_redirect_impl(
-        ctx,
-        cancellation,
-        action,
-        ActionExecutionMode::LostInputRewind,
-    )
-    .boxed()
+    build_action_no_redirect_impl(ctx, cancellation, action).boxed()
 }
 
 async fn build_action_no_redirect_impl(
     ctx: &mut DiceComputations<'_>,
     cancellation: &CancellationContext,
     action: Arc<RegisteredAction>,
-    mode: ActionExecutionMode,
 ) -> buck2_error::Result<ActionOutputs> {
     let inputs = action.inputs()?;
     let waiting_data = WaitingData::new();
@@ -265,21 +234,19 @@ async fn build_action_no_redirect_impl(
         memory_peak: action_execution_data.memory_peak,
         re_platform_name: action_execution_data.extra_data.re_platform_name.clone(),
     };
-    if mode.store_activation_data() {
-        ctx.store_evaluation_data(BuildKeyActivationData {
-            action_with_extra_data: ActionWithExtraData {
-                action: action.dupe(),
-                extra_data: action_execution_data.extra_data,
-            },
-            duration: NodeDuration {
-                user: action_execution_data.wall_time.unwrap_or_default(),
-                total: now.end_now(),
-                queue: action_execution_data.queue_duration,
-            },
-            spans,
-            waiting_data: action_execution_data.waiting_data,
-        })?;
-    }
+    ctx.store_evaluation_data(BuildKeyActivationData {
+        action_with_extra_data: ActionWithExtraData {
+            action: action.dupe(),
+            extra_data: action_execution_data.extra_data,
+        },
+        duration: NodeDuration {
+            user: action_execution_data.wall_time.unwrap_or_default(),
+            total: now.end_now(),
+            queue: action_execution_data.queue_duration,
+        },
+        spans,
+        waiting_data: action_execution_data.waiting_data,
+    })?;
 
     ctx.action_executed(execution_metrics)?;
 
@@ -357,13 +324,15 @@ async fn build_action_inner(
         }
         None => buck2_data::ExpectedEligibleForDedupe::UnknownEligibility,
     };
-    let (execute_result, command_reports) = execute_with_lost_input_rewinds(
+    let skip_action_cache = ctx.per_transaction_data().is_action_rewound(action.key());
+    let (execute_result, command_reports) = execute_with_lost_input_rewind_request(
         ctx,
         cancellation,
         executor,
         waiting_data,
         ensured_inputs,
         action,
+        skip_action_cache,
     )
     .await;
 
@@ -633,92 +602,73 @@ struct LostCasInput {
     path: ProjectRelativePathBuf,
 }
 
-async fn execute_with_lost_input_rewinds(
-    ctx: &mut DiceComputations<'_>,
+async fn execute_with_lost_input_rewind_request(
+    _ctx: &mut DiceComputations<'_>,
     cancellation: &CancellationContext,
     executor: &BuckActionExecutor,
     waiting_data: WaitingData,
     ensured_inputs: BuckIndexMap<ArtifactGroup, ArtifactGroupValues>,
     action: &Arc<RegisteredAction>,
+    skip_action_cache: bool,
 ) -> (
     Result<(ActionOutputs, ActionExecutionMetadata), ExecuteError>,
     Vec<CommandExecutionReport>,
 ) {
-    let mut command_reports = Vec::new();
-    let mut rewinds_by_action_key = BuckHashMap::default();
+    let (execute_result, command_reports) = executor
+        .execute(
+            waiting_data,
+            ensured_inputs.clone(),
+            action,
+            cancellation,
+            skip_action_cache,
+        )
+        .await;
 
-    loop {
-        let (execute_result, mut attempt_reports) = executor
-            .execute(
-                waiting_data.clone(),
-                ensured_inputs.clone(),
-                action,
-                cancellation,
-            )
-            .await;
-        command_reports.append(&mut attempt_reports);
+    let execute_result = match execute_result {
+        Ok(result) => Ok(result),
+        Err(error) => Err(add_lost_input_rewind_request(
+            action.key(),
+            &ensured_inputs,
+            error,
+        )),
+    };
 
-        let lost_input = match &execute_result {
-            Ok(_) => return (execute_result, command_reports),
-            Err(error) => lost_cas_input(error),
-        };
+    (execute_result, command_reports)
+}
 
-        let Some(lost_input) = lost_input else {
-            return (execute_result, command_reports);
-        };
+fn add_lost_input_rewind_request(
+    consumer_key: &ActionKey,
+    ensured_inputs: &BuckIndexMap<ArtifactGroup, ArtifactGroupValues>,
+    error: ExecuteError,
+) -> ExecuteError {
+    let Some(lost_input) = lost_cas_input(&error) else {
+        return error;
+    };
 
-        let Some(producer_key) =
-            lost_input_producer(action.key(), &ensured_inputs, &lost_input.digest)
-        else {
-            return (execute_result, command_reports);
-        };
+    let Some(producer_key) = lost_input_producer(consumer_key, ensured_inputs, &lost_input.digest)
+    else {
+        return error;
+    };
 
-        let rewind_count = rewinds_by_action_key
-            .entry(producer_key.dupe())
-            .or_insert(0);
-        if *rewind_count >= MAX_REPEATED_LOST_INPUT_REWINDS {
-            return (execute_result, command_reports);
-        }
-        *rewind_count += 1;
+    info!(
+        consumer_action = %consumer_key,
+        producer_action = %producer_key,
+        lost_input_path = %lost_input.path,
+        lost_input_digest = %lost_input.digest,
+        "Requesting DICE graph rewind after a generated input disappeared from remote CAS"
+    );
 
-        info!(
-            consumer_action = %action.key(),
-            producer_action = %producer_key,
-            lost_input_path = %lost_input.path,
-            lost_input_digest = %lost_input.digest,
-            rewind_count = *rewind_count,
-            "Re-executing producer action after a generated input disappeared from remote CAS"
-        );
-
-        let producer_action = match ActionCalculation::get_action(ctx, &producer_key).await {
-            Ok(action) => action,
-            Err(error) => {
-                return (
-                    Err(ExecuteError::Error {
-                        error: error.context(format!(
-                            "Failed to look up producer action {producer_key} while rewinding lost input {}",
-                            lost_input.path
-                        )),
-                    }),
-                    command_reports,
-                );
-            }
-        };
-
-        if let Err(error) = build_action_for_lost_input_rewind(ctx, cancellation, producer_action)
-            .boxed()
-            .await
-        {
-            return (
-                Err(ExecuteError::Error {
-                    error: error.context(format!(
-                        "Failed to re-execute producer action {producer_key} while rewinding lost input {}",
-                        lost_input.path
-                    )),
-                }),
-                command_reports,
-            );
-        }
+    let request = ActionRewindRequest::new(vec![producer_key, consumer_key.dupe()]);
+    match error {
+        ExecuteError::Error { error } => ExecuteError::Error {
+            error: error.context(request),
+        },
+        ExecuteError::CommandExecutionError {
+            error: Some(error), ..
+        } => ExecuteError::Error {
+            error: error.context(request),
+        },
+        error => error,
     }
 }
 
@@ -961,15 +911,6 @@ impl ActionCalculation {
         // We don't currently consume this in buck_e2e but it's good to log for debugging purposes.
         debug!("build_action {}", action_key);
         ctx.compute(BuildKey::ref_cast(action_key)).map(|v| v?)
-    }
-
-    pub async fn reexecute_action_for_lost_cas_output(
-        ctx: &mut DiceComputations<'_>,
-        action_key: &ActionKey,
-    ) -> buck2_error::Result<ActionOutputs> {
-        let action = ActionCalculation::get_action(ctx, action_key).await?;
-        build_action_for_lost_input_rewind(ctx, CancellationContext::never_cancelled(), action)
-            .await
     }
 
     pub fn build_artifact<'a>(

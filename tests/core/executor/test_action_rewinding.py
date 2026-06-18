@@ -10,10 +10,12 @@
 
 import hashlib
 import os
+from pathlib import Path
 
 import pytest
 from buck2.tests.e2e_util.api.buck import Buck
 from buck2.tests.e2e_util.buck_workspace import buck_test
+from buck2.tests.e2e_util.helper.utils import filter_events
 from buck2.tests.e2e_util.helper.utils import read_what_ran
 
 
@@ -47,6 +49,10 @@ TARGET = "root//:consumer"
 CONSUMER_TWO_TARGET = "root//:consumer_two"
 TREE_CONSUMER_TARGET = "root//:tree_consumer"
 TOP_LEVEL_OUTPUT_TARGET = "root//:top_level_output"
+NONDETERMINISTIC_PRODUCER_TARGET = "root//:nondeterministic_producer"
+NONDETERMINISTIC_CONSUMER_TARGET = "root//:nondeterministic_consumer"
+NONDETERMINISTIC_MIDDLE_TARGET = "root//:nondeterministic_middle"
+NONDETERMINISTIC_CHAIN_CONSUMER_TARGET = "root//:nondeterministic_chain_consumer"
 
 REMOTE_ARGS = [
     "--remote-only",
@@ -74,6 +80,62 @@ async def _assert_remote_actions_ran(
     for fragment in expected_identity_fragments:
         assert any(fragment in identity for identity in actions), actions
     assert all(executor == "Re" for executor in actions.values()), actions
+
+
+async def _seed_stale_digest(
+    buck: Buck,
+    fail_digests_file: Path,
+    target: str,
+) -> str:
+    result = await buck.build(
+        target,
+        *REMOTE_ARGS,
+    )
+    output = result.get_build_report().output_for_target(target)
+    content = output.read_text()
+    fail_digests_file.write_text(_digest(content), encoding="utf-8")
+    return content
+
+
+async def _seed_stale_digest_from_action_event(
+    buck: Buck,
+    fail_digests_file: Path,
+    target: str,
+    output_path: str,
+) -> None:
+    await buck.build(
+        target,
+        *REMOTE_ARGS,
+        "--materializations=none",
+    )
+    action_executions = await filter_events(
+        buck,
+        "Event",
+        "data",
+        "SpanEnd",
+        "data",
+        "ActionExecution",
+    )
+    outputs = [
+        output
+        for execution in action_executions
+        for output in execution.get("outputs", [])
+        if output.get("path") == output_path
+    ]
+    assert len(outputs) == 1, outputs
+    fail_digests_file.write_text(outputs[0]["digest"], encoding="utf-8")
+
+
+def _single_recorded_digest(path: Path) -> str:
+    digests = path.read_text(encoding="utf-8").splitlines()
+    assert len(digests) == 1, digests
+    return digests[0]
+
+
+def _digest_of_prefixed_output(output: Path, prefix: str) -> str:
+    content = output.read_text()
+    assert content.startswith(prefix)
+    return _digest(content[len(prefix) :])
 
 
 @buck_test()
@@ -193,3 +255,86 @@ async def test_rewinds_top_level_output_evicted_from_remote_cache_mid_build(
     output = result.get_build_report().output_for_target(TOP_LEVEL_OUTPUT_TARGET)
     assert output.read_text() == TOP_LEVEL_OUTPUT_CONTENT
     await _assert_remote_actions_ran(buck, ["root//:top_level_output"])
+
+
+@buck_test()
+@requires_buildbuddy_remote
+async def test_rewinds_nondeterministic_generated_input_with_fresh_digest(
+    buck: Buck,
+    tmp_path: Path,
+) -> None:
+    fail_digests_file = tmp_path / "lost-input-digests"
+    fail_digests_file.write_text("", encoding="utf-8")
+    await _restart_with_test_env(
+        buck,
+        {
+            "BUCK2_TEST_INJECTED_MISSING_DIGESTS_ONCE_FILE": str(fail_digests_file),
+            "BUCK2_TEST_FAIL_RE_DOWNLOAD_DIGESTS_ONCE_FILE": str(fail_digests_file),
+        },
+    )
+    await _seed_stale_digest_from_action_event(
+        buck,
+        fail_digests_file,
+        NONDETERMINISTIC_PRODUCER_TARGET,
+        "nondeterministic.txt",
+    )
+
+    result = await buck.build(
+        NONDETERMINISTIC_CONSUMER_TARGET,
+        *REMOTE_ARGS,
+    )
+
+    output = result.get_build_report().output_for_target(
+        NONDETERMINISTIC_CONSUMER_TARGET
+    )
+    assert _digest_of_prefixed_output(
+        output,
+        "nondeterministic consumer saw: ",
+    ) != _single_recorded_digest(fail_digests_file)
+    await _assert_remote_actions_ran(
+        buck,
+        ["root//:nondeterministic_producer", "root//:nondeterministic_consumer"],
+    )
+
+
+@buck_test()
+@requires_buildbuddy_remote
+async def test_rewinds_nondeterministic_intermediate_action_with_fresh_digest(
+    buck: Buck,
+    tmp_path: Path,
+) -> None:
+    fail_digests_file = tmp_path / "lost-intermediate-digests"
+    fail_digests_file.write_text("", encoding="utf-8")
+    await _restart_with_test_env(
+        buck,
+        {
+            "BUCK2_TEST_INJECTED_MISSING_DIGESTS_ONCE_FILE": str(fail_digests_file),
+            "BUCK2_TEST_FAIL_RE_DOWNLOAD_DIGESTS_ONCE_FILE": str(fail_digests_file),
+        },
+    )
+    await _seed_stale_digest_from_action_event(
+        buck,
+        fail_digests_file,
+        NONDETERMINISTIC_MIDDLE_TARGET,
+        "nondeterministic_middle.txt",
+    )
+
+    result = await buck.build(
+        NONDETERMINISTIC_CHAIN_CONSUMER_TARGET,
+        *REMOTE_ARGS,
+    )
+
+    output = result.get_build_report().output_for_target(
+        NONDETERMINISTIC_CHAIN_CONSUMER_TARGET
+    )
+    assert _digest_of_prefixed_output(
+        output,
+        "nondeterministic chain consumer saw: ",
+    ) != _single_recorded_digest(fail_digests_file)
+    await _assert_remote_actions_ran(
+        buck,
+        [
+            "root//:nondeterministic_middle",
+            "root//:nondeterministic_chain_consumer",
+        ],
+    )

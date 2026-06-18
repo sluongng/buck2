@@ -121,3 +121,82 @@ tree_consumer = rule(
         "dep": attrs.dep(),
     },
 )
+
+def _nondeterministic_producer_impl(ctx):
+    out = ctx.actions.declare_output(
+        "nondeterministic.txt",
+        has_content_based_path = False,
+    )
+    ctx.actions.run(
+        [
+            "/bin/sh",
+            "-c",
+            "cat /proc/sys/kernel/random/uuid > \"$1\" 2>/dev/null || date +%s%N > \"$1\"",
+            "--",
+            out.as_output(),
+        ],
+        category = "produce_nondeterministic",
+    )
+    return [DefaultInfo(default_output = out)]
+
+nondeterministic_producer = rule(
+    impl = _nondeterministic_producer_impl,
+    attrs = {},
+)
+
+def _nondeterministic_middle_impl(ctx):
+    inp = ctx.attrs.dep[DefaultInfo].default_outputs[0]
+    out = ctx.actions.declare_output(
+        "nondeterministic_middle.txt",
+        has_content_based_path = False,
+    )
+    command = "cat \"$1\" > \"$2\"; " + (
+        "cat /proc/sys/kernel/random/uuid >> \"$2\" 2>/dev/null || " +
+        "date +%s%N >> \"$2\""
+    )
+    ctx.actions.run(
+        [
+            "/bin/sh",
+            "-c",
+            command,
+            "--",
+            inp,
+            out.as_output(),
+        ],
+        category = "middle_nondeterministic",
+    )
+    return [DefaultInfo(default_output = out)]
+
+nondeterministic_middle = rule(
+    impl = _nondeterministic_middle_impl,
+    attrs = {
+        "dep": attrs.dep(),
+    },
+)
+
+def _prefixed_consumer_impl(ctx):
+    inp = ctx.attrs.dep[DefaultInfo].default_outputs[0]
+    out = ctx.actions.declare_output(ctx.attrs.out, has_content_based_path = False)
+    ctx.actions.run(
+        [
+            "/bin/sh",
+            "-c",
+            "printf '%s' \"$1\" > \"$3\"; cat \"$2\" >> \"$3\"",
+            "--",
+            ctx.attrs.prefix,
+            inp,
+            out.as_output(),
+        ],
+        category = ctx.attrs.category,
+    )
+    return [DefaultInfo(default_output = out)]
+
+prefixed_consumer = rule(
+    impl = _prefixed_consumer_impl,
+    attrs = {
+        "category": attrs.string(default = "consume_prefixed"),
+        "dep": attrs.dep(),
+        "out": attrs.string(),
+        "prefix": attrs.string(),
+    },
+)
