@@ -1,0 +1,233 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+load("@prelude//tests:test_toolchain.bzl", "noop_test_toolchain")
+load("@prelude//toolchains:dex.bzl", "system_noop_dex_toolchain")
+load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
+load("@prelude//toolchains:haskell.bzl", "system_haskell_toolchain")
+load(
+    "@prelude//toolchains:java.bzl",
+    "java_test_toolchain",
+    "system_java_bootstrap_toolchain",
+    "system_java_lib",
+    "system_java_tool",
+    "system_prebuilt_jar_bootstrap_toolchain",
+)
+load("@prelude//toolchains:kotlin.bzl", "system_kotlin_bootstrap_toolchain")
+load("@prelude//toolchains:ocaml.bzl", "system_ocaml_toolchain")
+load(
+    "@prelude//toolchains:python.bzl",
+    "system_python_bootstrap_toolchain",
+    "system_python_toolchain",
+    "system_python_wheel_toolchain",
+)
+load("@prelude//toolchains:remote_test_execution.bzl", "remote_test_execution_toolchain")
+load("@prelude//toolchains:rust.bzl", "downloaded_rust_toolchain")
+load("@prelude//toolchains:zip_file.bzl", "zip_file_toolchain")
+load("@prelude//toolchains/cxx/llvm:defs.bzl", "cxx_llvm_toolchain", "download_llvm_distribution")
+load("@prelude//toolchains/go:defs.bzl", "download_go_toolchains")
+load("@prelude//toolchains/go:remote_go_proto_toolchain.bzl", "remote_go_proto_toolchain")
+
+oncall("build_infra")
+
+download_llvm_distribution(
+    name = "llvm_dist",
+    # BuildBuddy RBE images have tar/gzip but do not provide a zstd CLI.
+    archive_type = "tar.gz",
+    sha256 = "3590e82cd56ff58cdf71732b0fbc3eb8f21d4fc00b8592d1329af522381f08cc",
+    target = "linux-amd64-musl",
+    url = "https://github.com/sluongng/buck2/releases/download/v0.202624.0/llvm-toolchain-minimal-22.1.7-linux-amd64-musl.tar.gz",
+)
+
+cxx_llvm_toolchain(
+    name = "cxx",
+    cxx_compiler_flags = ["-std=c++20"],
+    distribution = ":llvm_dist",
+    target = "x86_64-unknown-linux-gnu",
+    visibility = ["PUBLIC"],
+)
+
+alias(
+    name = "cxx_no_default_deps",
+    actual = ":cxx",
+    visibility = ["PUBLIC"],
+)
+
+system_genrule_toolchain(
+    name = "genrule",
+    visibility = ["PUBLIC"],
+)
+
+system_noop_dex_toolchain(
+    name = "empty_dex",
+    visibility = ["PUBLIC"],
+)
+
+download_go_toolchains(
+    version = "1.24.4",
+    remote_download = True,
+    visibility = ["PUBLIC"],
+)
+
+remote_go_proto_toolchain(
+    name = "go_proto",
+    remote_download = True,
+    visibility = ["PUBLIC"],
+)
+
+system_haskell_toolchain(
+    name = "haskell",
+    visibility = ["PUBLIC"],
+)
+
+java_home = read_root_config("java", "java_home", "/usr/lib/jvm/default")
+
+system_java_tool(
+    name = "java_tool",
+    tool_name = java_home + "/bin/java",
+    visibility = ["PUBLIC"],
+)
+
+system_java_tool(
+    name = "javac_tool",
+    tool_name = java_home + "/bin/javac",
+    visibility = ["PUBLIC"],
+)
+
+system_java_tool(
+    name = "jar_tool",
+    tool_name = java_home + "/bin/jar",
+    visibility = ["PUBLIC"],
+)
+
+system_java_tool(
+    name = "jlink_tool",
+    tool_name = java_home + "/bin/jlink",
+    visibility = ["PUBLIC"],
+)
+
+system_java_tool(
+    name = "jmod_tool",
+    tool_name = java_home + "/bin/jmod",
+    visibility = ["PUBLIC"],
+)
+
+system_java_lib(
+    name = "jrt_fs_jar",
+    jar = java_home + "/lib/jrt-fs.jar",
+)
+
+system_java_bootstrap_toolchain(
+    name = "java",
+    java = ":java_tool",
+    javac = ":javac_tool",
+    jlink = ":jlink_tool",
+    jmod = ":jmod_tool",
+    jrt_fs_jar = ":jrt_fs_jar",
+    visibility = ["PUBLIC"],
+)
+
+system_java_bootstrap_toolchain(
+    name = "java_bootstrap",
+    java = ":java_tool",
+    javac = ":javac_tool",
+    jlink = ":jlink_tool",
+    jmod = ":jmod_tool",
+    jrt_fs_jar = ":jrt_fs_jar",
+    visibility = ["PUBLIC"],
+)
+
+system_java_bootstrap_toolchain(
+    name = "java_for_android",
+    java = ":java_tool",
+    javac = ":javac_tool",
+    jlink = ":jlink_tool",
+    jmod = ":jmod_tool",
+    jrt_fs_jar = ":jrt_fs_jar",
+    visibility = ["PUBLIC"],
+)
+
+system_java_bootstrap_toolchain(
+    name = "java_for_host_test",
+    java = ":java_tool",
+    javac = ":javac_tool",
+    jlink = ":jlink_tool",
+    jmod = ":jmod_tool",
+    jrt_fs_jar = ":jrt_fs_jar",
+    visibility = ["PUBLIC"],
+)
+
+java_test_toolchain(
+    name = "java_test",
+    visibility = ["PUBLIC"],
+)
+
+system_prebuilt_jar_bootstrap_toolchain(
+    name = "prebuilt_jar",
+    java = ":java_tool",
+    visibility = ["PUBLIC"],
+)
+
+system_prebuilt_jar_bootstrap_toolchain(
+    name = "prebuilt_jar_bootstrap",
+    java = ":java_tool",
+    visibility = ["PUBLIC"],
+)
+
+system_prebuilt_jar_bootstrap_toolchain(
+    name = "prebuilt_jar_bootstrap_no_snapshot",
+    java = ":java_tool",
+    visibility = ["PUBLIC"],
+)
+
+system_kotlin_bootstrap_toolchain(
+    name = "kotlin_bootstrap",
+    visibility = ["PUBLIC"],
+)
+
+system_ocaml_toolchain(
+    name = "ocaml",
+    visibility = ["PUBLIC"],
+)
+
+system_python_toolchain(
+    name = "python",
+    visibility = ["PUBLIC"],
+)
+
+system_python_bootstrap_toolchain(
+    name = "python_bootstrap",
+    visibility = ["PUBLIC"],
+)
+
+system_python_wheel_toolchain(
+    name = "python_wheel",
+    visibility = ["PUBLIC"],
+)
+
+downloaded_rust_toolchain(
+    name = "rust",
+    default_edition = "2024",
+    rust_toolchain = "root//:rust-toolchain",
+    visibility = ["PUBLIC"],
+)
+
+remote_test_execution_toolchain(
+    name = "remote_test_execution",
+    visibility = ["PUBLIC"],
+)
+
+noop_test_toolchain(
+    name = "test",
+    visibility = ["PUBLIC"],
+)
+
+zip_file_toolchain(
+    name = "zip_file",
+    visibility = ["PUBLIC"],
+)

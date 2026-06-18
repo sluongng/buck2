@@ -15,6 +15,14 @@ clean_stale_enabled = true
 # recovered by restarting.
 restarter = true
 
+[cells]
+buildbuddy_toolchains = buildbuddy/toolchains
+
+[cell_aliases]
+# Use BuildBuddy-specific hermetic toolchains without changing the default shim
+# toolchains used by ordinary local builds.
+toolchains = buildbuddy_toolchains
+
 [buck2_re_client]
 # Keep the legacy default address so bootstrap binaries that predate split
 # service address config can still connect to BuildBuddy.
@@ -49,9 +57,9 @@ execution_platforms = root//buildbuddy:buildbuddy-rbe
 prelude = disabled
 
 [http_archive]
-# Download archives on the workflow runner and upload them as inputs for remote
-# actions. Some RBE workers cannot resolve public archive hosts directly.
-remote_download = false
+# Download and extract archives inside remote actions so BuildBuddy RBE owns
+# toolchain preparation instead of depending on the workflow runner's host.
+remote_download = true
 
 [bes]
 backend = grpcs://remote.buildbuddy.io

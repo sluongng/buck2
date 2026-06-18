@@ -4,6 +4,11 @@ load(":defs.bzl", "buck2_bundle", "pagable_transition_alias")
 
 oncall("build_infra")
 
+export_file(
+    name = "rust-toolchain",
+    visibility = ["PUBLIC"],
+)
+
 # Need a custom transition here so that buck2 is always built with pagable enabled,
 # even if its parent does not have pagable enabled.
 pagable_transition_alias(
