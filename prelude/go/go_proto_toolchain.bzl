@@ -142,6 +142,7 @@ def _remote_go_proto_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
         sub_targets = [],
         exec_deps = ctx.attrs.exec_deps[HttpArchiveExecDeps],
         prefer_local = False,
+        resolve_static_crates = False,
         has_content_based_path = True,
     )
     protoc = output.project(ctx.attrs.protoc)
