@@ -62,6 +62,8 @@ def http_archive_impl(ctx: AnalysisContext) -> list[Provider]:
         sha256 = ctx.attrs.sha256,
         size_bytes = ctx.attrs.size_bytes,
         strip_prefix = ctx.attrs.strip_prefix,
+        patch_args = ctx.attrs.patch_args,
+        patches = ctx.attrs.patches,
         sub_targets = ctx.attrs.sub_targets,
         exec_deps = ctx.attrs.exec_deps[HttpArchiveExecDeps],
         prefer_local = prefer_local,
