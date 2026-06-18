@@ -32,6 +32,8 @@ def _impl(ctx: AnalysisContext) -> list[Provider]:
         sha256 = None,
         size_bytes = None,
         strip_prefix = ctx.attrs.strip_prefix,
+        patch_args = ctx.attrs.patch_args,
+        patches = ctx.attrs.patches,
         sub_targets = ctx.attrs.sub_targets,
         exec_deps = ctx.attrs.exec_deps[HttpArchiveExecDeps],
         # no need -- no http involved
