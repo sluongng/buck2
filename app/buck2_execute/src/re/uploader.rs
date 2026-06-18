@@ -66,6 +66,7 @@ use crate::materialize::materializer::CasDownloadInfo;
 use crate::materialize::materializer::MaterializationPurpose;
 use crate::materialize::materializer::MaterializeRequest;
 use crate::materialize::materializer::Materializer;
+use crate::materialize::materializer::ReLostInput;
 use crate::re::action_identity::ReActionIdentity;
 use crate::re::client::RemoteExecutionClient;
 use crate::re::error::with_error_handler;
@@ -124,9 +125,23 @@ impl Uploader {
             }
         };
 
+        let mut injectable_input_digests = input_digests.clone();
+        {
+            for entry in input_dir.unordered_walk().without_paths() {
+                let digest = match entry {
+                    DirectoryEntry::Dir(d) => d.as_fingerprinted_dyn().fingerprint(),
+                    DirectoryEntry::Leaf(ActionDirectoryMember::File(f)) => &f.digest,
+                    DirectoryEntry::Leaf(..) => continue,
+                };
+                injectable_input_digests.insert(digest);
+            }
+
+            injectable_input_digests.insert(input_dir.fingerprint());
+        };
+
         let mut upload_blobs = Vec::new();
         let mut missing_digests = BuckMutSet::default();
-        add_injected_missing_digests(&input_digests, &mut missing_digests)?;
+        add_injected_missing_digests(&injectable_input_digests, &mut missing_digests)?;
         let input_digests = input_digests.into_iter().collect::<Vec<_>>();
 
         let digests_and_ttls_iterator = if deduplicate_get_digests_ttl_calls {
@@ -332,6 +347,10 @@ impl Uploader {
                             // On the flip side, if a digest has been in the CAS for a very long
                             // time, it might have expired.
                             if file.digest.to_re() == digest {
+                                let lost_input = ReLostInput {
+                                    path: path.clone(),
+                                    digest: *file.digest.data(),
+                                };
                                 if should_error_for_missing_digest(info) {
                                     soft_error!(
                                         "cas_missing_fatal",
@@ -353,7 +372,8 @@ impl Uploader {
                                         To proceed, you should restart Buck using `buck2 killall`. \
                                         Debug information: {:#}",
                                         err
-                                    ));
+                                    )
+                                    .context(lost_input));
                                 }
 
                                 soft_error!(
@@ -366,12 +386,17 @@ impl Uploader {
                                         err
                                     ),
                                     quiet: true
-                                )?;
+                                )
+                                .map_err(|e| e.context(lost_input.clone()))?;
 
                                 // Materialize this file from CAS and include it in this upload.
                                 // Skipping it would leave the downstream action with an
                                 // incomplete input set after FindMissingBlobs reported it absent.
-                                artifacts_to_materialize.push((path.clone(), ArtifactValue::file(metadata)));
+                                artifacts_to_materialize.push((
+                                    path.clone(),
+                                    ArtifactValue::file(metadata),
+                                    Some(lost_input),
+                                ));
                                 upload_files.push(NamedDigest {
                                     name: fs.resolve(path).as_maybe_relativized_str()?.to_owned(),
                                     digest,
@@ -389,7 +414,7 @@ impl Uploader {
                             digest,
                             ..Default::default()
                         });
-                        artifacts_to_materialize.push((path, ArtifactValue::file(metadata)));
+                        artifacts_to_materialize.push((path, ArtifactValue::file(metadata), None));
                     }
                     Err(
                         ref err @ ArtifactNotMaterializedReason::DeferredMaterializerCorruption {
@@ -402,24 +427,35 @@ impl Uploader {
             }
         }
 
-        // The upload reads these files; the lease covers it.
-        let _materialized_lease = if artifacts_to_materialize.is_empty() {
-            None
-        } else {
-            let response = materializer
-                .materialize(MaterializeRequest {
-                    artifacts: artifacts_to_materialize,
-                    outputs: Vec::new(),
-                    purpose: MaterializationPurpose::IntermediateOnly,
-                    re_use_case: use_case,
-                })
-                .await
-                .buck_error_context("Error materializing paths for upload")?;
-            for result in response.results {
-                result.buck_error_context("Error materializing paths for upload")?;
+        // Keep every materialization lease alive while the upload reads the files.
+        let mut _materialized_leases = Vec::new();
+        for (path, value, lost_input) in artifacts_to_materialize {
+            let result = async {
+                let response = materializer
+                    .materialize(MaterializeRequest {
+                        artifacts: vec![(path, value)],
+                        outputs: Vec::new(),
+                        purpose: MaterializationPurpose::IntermediateOnly,
+                        re_use_case: use_case,
+                    })
+                    .await?;
+                for result in response.results {
+                    result?;
+                }
+                buck2_error::Ok(response.lease)
             }
-            Some(response.lease)
-        };
+            .await;
+            match result {
+                Ok(lease) => _materialized_leases.push(lease),
+                Err(error) => {
+                    let error = error.context("Error materializing paths for upload");
+                    return Err(match lost_input {
+                        Some(lost_input) => error.context(lost_input),
+                        None => error,
+                    });
+                }
+            }
+        }
 
         // Compute stats of digests we're about to upload so we can report them
         // to the span end event of this stage of execution.
@@ -552,7 +588,7 @@ fn add_injected_missing_digests<'a>(
     missing_digests: &mut BuckMutSet<&'a TrackedFileDigest>,
 ) -> buck2_error::Result<()> {
     fn convert_digests(val: &str) -> buck2_error::Result<Vec<FileDigest>> {
-        val.split(' ')
+        val.split_whitespace()
             .map(|digest| {
                 let digest = TDigest::from_str(digest)
                     .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::InvalidDigest))
@@ -562,6 +598,26 @@ fn add_injected_missing_digests<'a>(
                 buck2_error::Ok(digest)
             })
             .collect()
+    }
+
+    fn add_digests_once<'a>(
+        input_digests: &BuckMutSet<&'a TrackedFileDigest>,
+        missing_digests: &mut BuckMutSet<&'a TrackedFileDigest>,
+        digests: Vec<FileDigest>,
+    ) {
+        static INJECTED_ONCE: LazyLock<Mutex<BuckMutSet<FileDigest>>> =
+            LazyLock::new(|| Mutex::new(BuckMutSet::default()));
+
+        for d in digests {
+            let matched = input_digests.get(&d);
+            if let Some(i) = matched {
+                let mut injected_once = INJECTED_ONCE.lock().expect("Poisoned lock");
+                if !injected_once.contains(&d) {
+                    injected_once.insert(d);
+                    missing_digests.insert(i);
+                }
+            }
+        }
     }
 
     let ingested_digests = buck2_env!(
@@ -576,6 +632,30 @@ fn add_injected_missing_digests<'a>(
                 missing_digests.insert(i);
             }
         }
+    }
+
+    let injected_digests_file = buck2_env!(
+        "BUCK2_TEST_INJECTED_MISSING_DIGESTS_ONCE_FILE",
+        applicability = testing
+    )?;
+    if let Some(path) = injected_digests_file {
+        let injected_digests = std::fs::read_to_string(path)
+            .with_buck_error_context(|| format!("Failed to read {path}"))?;
+        add_digests_once(
+            input_digests,
+            missing_digests,
+            convert_digests(&injected_digests)?,
+        );
+    }
+
+    let ingested_digests_once = buck2_env!(
+        "BUCK2_TEST_INJECTED_MISSING_DIGESTS_ONCE",
+        type=Vec<FileDigest>,
+        converter=convert_digests,
+        applicability=testing
+    )?;
+    if let Some(digests) = ingested_digests_once {
+        add_digests_once(input_digests, missing_digests, digests.to_vec());
     }
 
     Ok(())
