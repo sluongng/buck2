@@ -58,6 +58,11 @@ def _is_skipped(fn: Callable[..., Any]) -> str | None:
     return None
 
 
+def _xfail_marker(fn: Callable[..., Any]) -> Any | None:
+    markers = _markers(fn, "xfail")
+    return markers[-1] if markers else None
+
+
 async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
@@ -76,6 +81,7 @@ async def _run_case(
     if skip_reason is not None:
         print("SKIP " + case_name + ": " + skip_reason)
         return True, case_name
+    xfail_marker = _xfail_marker(fn)
 
     signature = inspect.signature(fn)
     kwargs = dict(params)
@@ -106,9 +112,38 @@ async def _run_case(
                 _absolutize_env_path("TEST_REPO_DATA")
                 async with buck_fixture(buck_markers[-1].args[0]) as buck:
                     kwargs["buck"] = buck
-                    await _maybe_await(fn(**kwargs))
+                    try:
+                        await _maybe_await(fn(**kwargs))
+                    except BaseException:
+                        if xfail_marker is not None:
+                            print(
+                                "XFAIL "
+                                + case_name
+                                + ": "
+                                + xfail_marker.kwargs.get("reason", "xfail")
+                            )
+                            return True, case_name
+                        raise
         else:
-            await _maybe_await(fn(**kwargs))
+            try:
+                await _maybe_await(fn(**kwargs))
+            except BaseException:
+                if xfail_marker is not None:
+                    print(
+                        "XFAIL "
+                        + case_name
+                        + ": "
+                        + xfail_marker.kwargs.get("reason", "xfail")
+                    )
+                    return True, case_name
+                raise
+    if xfail_marker is not None and xfail_marker.kwargs.get("strict", False):
+        raise AssertionError(
+            "XPASS(strict) "
+            + case_name
+            + ": "
+            + xfail_marker.kwargs.get("reason", "xfail")
+        )
     return True, case_name
 
 
