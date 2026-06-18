@@ -48,6 +48,7 @@ use crate::key::DiceKey;
 use crate::key::ParentKey;
 use crate::opaque::OpaqueValue;
 use crate::updater::ActiveTransactionGuard;
+use crate::updater::TransactionUpdater;
 use crate::user_cycle::KeyComputingUserCycleDetectorData;
 use crate::value::DiceComputedValue;
 use crate::value::TrackedInvalidationPaths;
@@ -99,6 +100,13 @@ impl TransactionCtx {
 
     pub(crate) fn get_version(&self) -> VersionNumber {
         self.ctx.get_version()
+    }
+
+    pub(crate) fn into_updater_for_latest(self) -> TransactionUpdater {
+        TransactionUpdater::new(
+            self.ctx.transaction_data.dice.dupe(),
+            self.ctx.transaction_data.user_data.dupe(),
+        )
     }
 
     pub(crate) fn compute<'a, K>(

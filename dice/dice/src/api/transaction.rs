@@ -103,6 +103,18 @@ impl DiceTransaction {
         DiceEquality(self.0.get_version())
     }
 
+    /// Applies invalidations to the latest DICE version while preserving this
+    /// transaction's user data.
+    pub async fn update_to_latest<K, I>(self, changed: I) -> DiceResult<DiceTransaction>
+    where
+        K: Key,
+        I: IntoIterator<Item = K> + Send + Sync + 'static,
+    {
+        let mut updater = DiceTransactionUpdater(self.0.into_updater_for_latest());
+        updater.changed(changed)?;
+        Ok(updater.commit().await)
+    }
+
     /// Request the result of computing a particular key.
     ///
     /// This is similar to `DiceComputations::compute`, but a bit more flexible as it takes `&self`
