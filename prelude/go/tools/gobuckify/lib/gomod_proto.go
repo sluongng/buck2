@@ -11,7 +11,6 @@
 package gobuckifylib
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -230,6 +229,7 @@ func scanGoProtoTargets(rootDir string) (*goProtoScan, error) {
 		if err != nil {
 			return nil, err
 		}
+		buildContent := stripStarlarkLineComments(string(content))
 		relDir, err := filepath.Rel(rootDir, filepath.Dir(buildFile))
 		if err != nil {
 			return nil, err
@@ -238,7 +238,7 @@ func scanGoProtoTargets(rootDir string) (*goProtoScan, error) {
 			relDir = ""
 		}
 		relDir = filepath.ToSlash(relDir)
-		for _, block := range extractCallBlocks(string(content), "proto_library") {
+		for _, block := range extractCallBlocks(buildContent, "proto_library") {
 			lib := &parsedProtoLibrary{
 				Name: parseStringAttr(block, "name"),
 				Dir:  relDir,
@@ -249,11 +249,11 @@ func scanGoProtoTargets(rootDir string) (*goProtoScan, error) {
 				protoLibraries[protoKey(relDir, lib.Name)] = lib
 			}
 		}
-		for _, block := range extractCallBlocks(string(content), "go_proto_library") {
+		for _, block := range extractCallBlocks(buildContent, "go_proto_library") {
 			lib := &parsedGoProtoLibrary{
 				Name:       parseStringAttr(block, "name"),
 				Dir:        relDir,
-				ImportPath: parseStringAttr(block, "importpath"),
+				ImportPath: firstNonEmpty(parseStringAttr(block, "importpath"), parseStringAttr(block, "import_path")),
 				Proto:      parseStringAttr(block, "proto"),
 				Deps:       parseStringListAttr(block, "deps"),
 				Mode:       parseStringAttr(block, "mode"),
@@ -263,7 +263,7 @@ func scanGoProtoTargets(rootDir string) (*goProtoScan, error) {
 				goProtoLibraries[protoKey(relDir, lib.Name)] = lib
 			}
 		}
-		for _, block := range extractCallBlocks(string(content), "alias") {
+		for _, block := range extractCallBlocks(buildContent, "alias") {
 			name := parseStringAttr(block, "name")
 			actual := parseStringAttr(block, "actual")
 			if name != "" && actual != "" {
@@ -278,7 +278,7 @@ func scanGoProtoTargets(rootDir string) (*goProtoScan, error) {
 
 	protoImportMappings := map[string]string{}
 	for _, goProto := range goProtoLibraries {
-		protoLib := protoLibraries[resolveLocalLabel(goProto.Dir, goProto.Proto)]
+		protoLib := protoLibraries[resolveLocalLabelWithAliases(goProto.Dir, goProto.Proto, aliases)]
 		if protoLib == nil {
 			continue
 		}
@@ -296,9 +296,9 @@ func scanGoProtoTargets(rootDir string) (*goProtoScan, error) {
 	needVTProto := false
 	for _, key := range sortedGoProtoKeys(goProtoLibraries) {
 		goProto := goProtoLibraries[key]
-		protoLib := protoLibraries[resolveLocalLabel(goProto.Dir, goProto.Proto)]
+		protoLib := protoLibraries[resolveLocalLabelWithAliases(goProto.Dir, goProto.Proto, aliases)]
 		if protoLib == nil {
-			if target := knownExternalProtoTarget(goProto, aliases[resolveLocalLabel(goProto.Dir, goProto.Proto)]); target != nil {
+			if target := knownExternalProtoTarget(goProto, resolveAliasActual(goProto.Dir, goProto.Proto, aliases)); target != nil {
 				needGRPC = needGRPC || target.GRPC
 				needVTProto = needVTProto || target.VTProto
 				target.ImportMappings = protoImportMappings
@@ -312,7 +312,7 @@ func scanGoProtoTargets(rootDir string) (*goProtoScan, error) {
 			}
 			continue
 		}
-		protoSrcs := collectProtoSrcs(protoLib, protoLibraries)
+		protoSrcs := collectProtoSrcs(protoLib, protoLibraries, aliases)
 		directSrcs := relFiles(protoLib.Dir, protoLib.Srcs)
 		grpcSrcs := protoFilesMatching(rootDir, directSrcs, regexp.MustCompile("(?m)^\\s*service\\s+[A-Za-z_]"))
 		grpc := goProtoWantsGRPC(goProto) && len(grpcSrcs) > 0
@@ -321,7 +321,7 @@ func scanGoProtoTargets(rootDir string) (*goProtoScan, error) {
 		needGRPC = needGRPC || grpc
 		needVTProto = needVTProto || vtproto
 		depSet := stringSet{}
-		for _, dep := range depImportsForGoProto(rootDir, goProto, protoLib, protoLibraries, goProtoLibraries, protoImportMappings) {
+		for _, dep := range depImportsForGoProto(rootDir, goProto, protoLib, protoLibraries, goProtoLibraries, protoImportMappings, aliases) {
 			depSet.Add(dep)
 		}
 		if vtproto {
@@ -405,7 +405,7 @@ func goProtoWantsGRPC(goProto *parsedGoProtoLibrary) bool {
 	return false
 }
 
-func collectProtoSrcs(root *parsedProtoLibrary, libs map[string]*parsedProtoLibrary) []string {
+func collectProtoSrcs(root *parsedProtoLibrary, libs map[string]*parsedProtoLibrary, aliases map[string]string) []string {
 	seenLibs := map[string]bool{}
 	seenFiles := stringSet{}
 	var visit func(*parsedProtoLibrary)
@@ -422,17 +422,17 @@ func collectProtoSrcs(root *parsedProtoLibrary, libs map[string]*parsedProtoLibr
 			seenFiles.Add(relFile(lib.Dir, src))
 		}
 		for _, dep := range lib.Deps {
-			visit(libs[resolveLocalLabel(lib.Dir, dep)])
+			visit(libs[resolveLocalLabelWithAliases(lib.Dir, dep, aliases)])
 		}
 	}
 	visit(root)
 	return seenFiles.Sorted()
 }
 
-func depImportsForGoProto(rootDir string, goProto *parsedGoProtoLibrary, protoLib *parsedProtoLibrary, protoLibraries map[string]*parsedProtoLibrary, goProtoLibraries map[string]*parsedGoProtoLibrary, protoImportMappings map[string]string) []string {
+func depImportsForGoProto(rootDir string, goProto *parsedGoProtoLibrary, protoLib *parsedProtoLibrary, protoLibraries map[string]*parsedProtoLibrary, goProtoLibraries map[string]*parsedGoProtoLibrary, protoImportMappings map[string]string, aliases map[string]string) []string {
 	deps := stringSet{}
 	for _, dep := range goProto.Deps {
-		key := resolveLocalLabel(goProto.Dir, dep)
+		key := resolveLocalLabelWithAliases(goProto.Dir, dep, aliases)
 		if local := goProtoLibraries[key]; local != nil {
 			deps.Add(local.ImportPath)
 			continue
@@ -441,7 +441,7 @@ func depImportsForGoProto(rootDir string, goProto *parsedGoProtoLibrary, protoLi
 			deps.Add(importPath)
 		}
 	}
-	for _, src := range collectProtoSrcs(protoLib, protoLibraries) {
+	for _, src := range collectProtoSrcs(protoLib, protoLibraries, aliases) {
 		for _, importedProto := range parseProtoImports(filepath.Join(rootDir, filepath.FromSlash(src))) {
 			if importPath, ok := protoImportMappings[importedProto]; ok && importPath != goProto.ImportPath {
 				deps.Add(importPath)
@@ -589,6 +589,52 @@ func resolveLocalLabel(currentDir, label string) string {
 	return ""
 }
 
+func resolveLocalLabelWithAliases(currentDir, label string, aliases map[string]string) string {
+	key := resolveLocalLabel(currentDir, label)
+	seen := map[string]bool{}
+	for key != "" && !seen[key] {
+		seen[key] = true
+		actual := aliases[key]
+		if actual == "" {
+			return key
+		}
+		next := resolveLocalLabel(protoKeyDir(key), actual)
+		if next == "" {
+			return key
+		}
+		key = next
+	}
+	return key
+}
+
+func resolveAliasActual(currentDir, label string, aliases map[string]string) string {
+	key := resolveLocalLabel(currentDir, label)
+	seen := map[string]bool{}
+	for key != "" && !seen[key] {
+		seen[key] = true
+		actual := aliases[key]
+		if actual == "" {
+			return ""
+		}
+		if next := resolveLocalLabel(protoKeyDir(key), actual); next != "" {
+			key = next
+			continue
+		}
+		return actual
+	}
+	return ""
+}
+
+func protoKeyDir(key string) string {
+	if strings.HasPrefix(key, "//") {
+		pkgAndName := strings.TrimPrefix(key, "//")
+		if idx := strings.LastIndex(pkgAndName, ":"); idx >= 0 {
+			return pkgAndName[:idx]
+		}
+	}
+	return ""
+}
+
 func protoTargetLabel(target *goModProtoTarget) string {
 	if target.Dir == "" {
 		return "//:" + target.Name
@@ -597,50 +643,83 @@ func protoTargetLabel(target *goModProtoTarget) string {
 }
 
 func extractCallBlocks(content, name string) []string {
-	needle := name + "("
 	var blocks []string
-	for offset := 0; ; {
-		idx := strings.Index(content[offset:], needle)
-		if idx < 0 {
-			break
+	for i := 0; i < len(content); {
+		if isStarlarkQuote(content[i]) {
+			i = skipStarlarkStringLiteral(content, i)
+			continue
 		}
-		start := offset + idx + len(name)
-		end := matchingParen(content, start)
+		if content[i] == '#' {
+			for i < len(content) && content[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if !callNameAt(content, name, i) {
+			i++
+			continue
+		}
+		open := i + len(name)
+		for open < len(content) && isStarlarkWhitespace(content[open]) {
+			open++
+		}
+		end := matchingParen(content, open)
 		if end < 0 {
 			break
 		}
-		blocks = append(blocks, content[start+1:end])
-		offset = end + 1
+		blocks = append(blocks, content[open+1:end])
+		i = end + 1
 	}
 	return blocks
 }
 
+func callNameAt(content, name string, index int) bool {
+	if !strings.HasPrefix(content[index:], name) {
+		return false
+	}
+	if index > 0 && (isStarlarkIdentifierChar(content[index-1]) || content[index-1] == '.') {
+		return false
+	}
+	afterName := index + len(name)
+	if afterName < len(content) && isStarlarkIdentifierChar(content[afterName]) {
+		return false
+	}
+	for afterName < len(content) && isStarlarkWhitespace(content[afterName]) {
+		afterName++
+	}
+	return afterName < len(content) && content[afterName] == '('
+}
+
+func isStarlarkIdentifierChar(c byte) bool {
+	return c == '_' || ('0' <= c && c <= '9') || ('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z')
+}
+
+func isStarlarkWhitespace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
 func matchingParen(content string, open int) int {
+	return matchingStarlarkDelimiter(content, open, '(', ')')
+}
+
+func matchingStarlarkDelimiter(content string, open int, openChar byte, closeChar byte) int {
 	depth := 0
-	inString := false
-	escaped := false
 	for i := open; i < len(content); i++ {
 		c := content[i]
-		if inString {
-			if escaped {
-				escaped = false
-				continue
-			}
-			if c == '\\' {
-				escaped = true
-				continue
-			}
-			if c == '"' {
-				inString = false
+		if isStarlarkQuote(c) {
+			i = skipStarlarkStringLiteral(content, i) - 1
+			continue
+		}
+		if c == '#' {
+			for i < len(content) && content[i] != '\n' {
+				i++
 			}
 			continue
 		}
 		switch c {
-		case '"':
-			inString = true
-		case '(':
+		case openChar:
 			depth++
-		case ')':
+		case closeChar:
 			depth--
 			if depth == 0 {
 				return i
@@ -651,27 +730,245 @@ func matchingParen(content string, open int) int {
 }
 
 func parseStringAttr(block, name string) string {
-	re := regexp.MustCompile(fmt.Sprintf("(?m)\\b%s\\s*=\\s*\\\"([^\\\"]*)\\\"", regexp.QuoteMeta(name)))
-	match := re.FindStringSubmatch(block)
-	if match == nil {
+	expr, ok := findStarlarkAttrExpr(block, name)
+	if !ok {
 		return ""
 	}
-	return match[1]
+	value, ok := parseStarlarkStringExpr(expr)
+	if !ok {
+		return ""
+	}
+	return value
 }
 
 func parseStringListAttr(block, name string) []string {
-	re := regexp.MustCompile(fmt.Sprintf("(?s)\\b%s\\s*=\\s*\\[(.*?)\\]", regexp.QuoteMeta(name)))
-	match := re.FindStringSubmatch(block)
-	if match == nil {
+	expr, ok := findStarlarkAttrExpr(block, name)
+	if !ok {
 		return nil
 	}
-	itemRe := regexp.MustCompile("\\\"([^\\\"]+)\\\"")
-	items := itemRe.FindAllStringSubmatch(match[1], -1)
-	values := make([]string, 0, len(items))
-	for _, item := range items {
-		values = append(values, item[1])
+	return parseStarlarkStringListExpr(expr)
+}
+
+func findStarlarkAttrExpr(block, name string) (string, bool) {
+	parenDepth := 0
+	bracketDepth := 0
+	braceDepth := 0
+	for i := 0; i < len(block); i++ {
+		c := block[i]
+		if isStarlarkQuote(c) {
+			i = skipStarlarkStringLiteral(block, i) - 1
+			continue
+		}
+		if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 && strings.HasPrefix(block[i:], name) {
+			nameEnd := i + len(name)
+			if (i == 0 || !isStarlarkIdentifierChar(block[i-1])) && (nameEnd == len(block) || !isStarlarkIdentifierChar(block[nameEnd])) {
+				j := nameEnd
+				for j < len(block) && isStarlarkWhitespace(block[j]) {
+					j++
+				}
+				if j < len(block) && block[j] == '=' {
+					valueStart := j + 1
+					for valueStart < len(block) && isStarlarkWhitespace(block[valueStart]) {
+						valueStart++
+					}
+					valueEnd := findStarlarkExprEnd(block, valueStart)
+					return strings.TrimSpace(block[valueStart:valueEnd]), true
+				}
+			}
+		}
+		switch c {
+		case '(':
+			parenDepth++
+		case ')':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case '[':
+			bracketDepth++
+		case ']':
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		case '{':
+			braceDepth++
+		case '}':
+			if braceDepth > 0 {
+				braceDepth--
+			}
+		}
+	}
+	return "", false
+}
+
+func findStarlarkExprEnd(content string, start int) int {
+	parenDepth := 0
+	bracketDepth := 0
+	braceDepth := 0
+	for i := start; i < len(content); i++ {
+		c := content[i]
+		if isStarlarkQuote(c) {
+			i = skipStarlarkStringLiteral(content, i) - 1
+			continue
+		}
+		switch c {
+		case '(':
+			parenDepth++
+		case ')':
+			if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 {
+				return i
+			}
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case '[':
+			bracketDepth++
+		case ']':
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		case '{':
+			braceDepth++
+		case '}':
+			if braceDepth > 0 {
+				braceDepth--
+			}
+		case ',':
+			if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 {
+				return i
+			}
+		}
+	}
+	return len(content)
+}
+
+func parseStarlarkStringExpr(expr string) (string, bool) {
+	expr = strings.TrimSpace(expr)
+	if len(expr) == 0 || !isStarlarkQuote(expr[0]) {
+		return "", false
+	}
+	value, end, ok := parseStarlarkStringLiteral(expr, 0)
+	if !ok || strings.TrimSpace(expr[end:]) != "" {
+		return "", false
+	}
+	return value, true
+}
+
+func parseStarlarkStringListExpr(expr string) []string {
+	var values []string
+	for i := 0; i < len(expr); {
+		for i < len(expr) && isStarlarkWhitespace(expr[i]) {
+			i++
+		}
+		if i >= len(expr) || expr[i] != '[' {
+			break
+		}
+		end := matchingStarlarkDelimiter(expr, i, '[', ']')
+		if end < 0 {
+			break
+		}
+		values = append(values, parseStarlarkStringListItems(expr[i+1:end])...)
+		i = end + 1
+		for i < len(expr) && isStarlarkWhitespace(expr[i]) {
+			i++
+		}
+		if i >= len(expr) || expr[i] != '+' {
+			break
+		}
+		i++
 	}
 	return values
+}
+
+func parseStarlarkStringListItems(content string) []string {
+	var values []string
+	parenDepth := 0
+	bracketDepth := 0
+	braceDepth := 0
+	for i := 0; i < len(content); i++ {
+		c := content[i]
+		if isStarlarkQuote(c) {
+			value, end, ok := parseStarlarkStringLiteral(content, i)
+			if !ok {
+				break
+			}
+			if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 {
+				values = append(values, value)
+			}
+			i = end - 1
+			continue
+		}
+		switch c {
+		case '(':
+			parenDepth++
+		case ')':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case '[':
+			bracketDepth++
+		case ']':
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		case '{':
+			braceDepth++
+		case '}':
+			if braceDepth > 0 {
+				braceDepth--
+			}
+		}
+	}
+	return values
+}
+
+func parseStarlarkStringLiteral(content string, start int) (string, int, bool) {
+	if start >= len(content) || !isStarlarkQuote(content[start]) {
+		return "", start, false
+	}
+	end := skipStarlarkStringLiteral(content, start)
+	if end > len(content) {
+		return "", start, false
+	}
+	quote := content[start]
+	triple := start+2 < len(content) && content[start+1] == quote && content[start+2] == quote
+	bodyStart := start + 1
+	bodyEnd := end - 1
+	if triple {
+		bodyStart = start + 3
+		bodyEnd = end - 3
+	}
+	return unescapeStarlarkString(content[bodyStart:bodyEnd]), end, true
+}
+
+func unescapeStarlarkString(s string) string {
+	var out strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\\' || i+1 == len(s) {
+			out.WriteByte(s[i])
+			continue
+		}
+		i++
+		switch s[i] {
+		case 'n':
+			out.WriteByte('\n')
+		case 'r':
+			out.WriteByte('\r')
+		case 't':
+			out.WriteByte('\t')
+		default:
+			out.WriteByte(s[i])
+		}
+	}
+	return out.String()
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 type stringSet map[string]bool

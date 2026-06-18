@@ -352,13 +352,63 @@ func goModuleOverrideBlocks(content string) []string {
 }
 
 func stripStarlarkLineComments(content string) string {
-	lines := strings.Split(content, "\n")
-	for i, line := range lines {
-		if idx := strings.Index(line, "#"); idx >= 0 {
-			lines[i] = line[:idx]
+	var b strings.Builder
+	b.Grow(len(content))
+	for i := 0; i < len(content); {
+		if isStarlarkQuote(content[i]) {
+			end := skipStarlarkStringLiteral(content, i)
+			b.WriteString(content[i:end])
+			i = end
+			continue
+		}
+		if content[i] == '#' {
+			for i < len(content) && content[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		b.WriteByte(content[i])
+		i++
+	}
+	return b.String()
+}
+
+func isStarlarkQuote(c byte) bool {
+	return c == '\'' || c == '"'
+}
+
+func skipStarlarkStringLiteral(content string, start int) int {
+	quote := content[start]
+	triple := start+2 < len(content) && content[start+1] == quote && content[start+2] == quote
+	if triple {
+		for i := start + 3; i < len(content); {
+			if i+2 < len(content) && content[i] == quote && content[i+1] == quote && content[i+2] == quote {
+				return i + 3
+			}
+			if content[i] == '\\' {
+				i += 2
+				continue
+			}
+			i++
+		}
+		return len(content)
+	}
+
+	escaped := false
+	for i := start + 1; i < len(content); i++ {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if content[i] == '\\' {
+			escaped = true
+			continue
+		}
+		if content[i] == quote {
+			return i + 1
 		}
 	}
-	return strings.Join(lines, "\n")
+	return len(content)
 }
 
 func stringValueInBlock(block string, name string) string {
