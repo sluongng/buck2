@@ -1,6 +1,7 @@
 [cells]
 prelude = prelude
 none = none
+buildbuddy_toolchains = buildbuddy/toolchains
 
 [cell_aliases]
 config = prelude
@@ -14,7 +15,9 @@ shim = gh_facebook_buck2_shims_meta
 toolchains = gh_facebook_buck2_shims_meta
 
 [external_cells]
-prelude = bundled
+# Use the checkout prelude so local fork changes under prelude/ are visible
+# before a new Buck2 binary has been bootstrapped with those bundled changes.
+prelude = disabled
 
 [build]
 execution_platforms = prelude//platforms:default
