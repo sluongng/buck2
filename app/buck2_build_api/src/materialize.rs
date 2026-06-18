@@ -22,6 +22,7 @@ use buck2_common::legacy_configs::view::LegacyBuckConfigView;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_error::BuckErrorContext;
+use buck2_error::ErrorTag;
 use buck2_execute::artifact::artifact_dyn::ArtifactDyn;
 use buck2_execute::artifact_utils::ArtifactValueBuilder;
 use buck2_execute::artifact_value::ArtifactValue;
@@ -38,6 +39,7 @@ use futures::FutureExt;
 
 use crate::actions::artifact::get_artifact_fs::GetArtifactFs;
 use crate::actions::artifact::materializer::ArtifactMaterializer;
+use crate::actions::calculation::ActionCalculation;
 use crate::actions::execute::dice_data::GetReClient;
 use crate::actions::impls::run_action_knobs::HasRunActionKnobs;
 use crate::artifact_groups::ArtifactGroup;
@@ -99,75 +101,114 @@ async fn materialize_artifact_group(
             ctx.per_transaction_data().get_materializer(),
         ));
 
-        let mut materialize_futs = Vec::new();
+        let mut retried_lost_output = false;
+        loop {
+            let mut materialize_futs = Vec::new();
 
-        for (artifact, value) in values.iter() {
-            if let BaseArtifactKind::Build(artifact) = artifact.as_parts().0 {
-                if !queue_tracker.insert(artifact.dupe()) {
-                    // We've already requested this artifact, no use requesting it again.
-                    continue;
-                }
+            for (artifact, value) in values.iter() {
+                if let BaseArtifactKind::Build(artifact) = artifact.as_parts().0 {
+                    if !retried_lost_output && !queue_tracker.insert(artifact.dupe()) {
+                        // We've already requested this artifact, no use requesting it again.
+                        continue;
+                    }
 
-                let fut = {
-                    let waiting_data = waiting_data.clone();
-                    let artifact = artifact.dupe();
-                    let value = value.dupe();
-                    let shared_data = shared_data.dupe();
-                    let artifact_group = artifact_group.dupe();
+                    let fut = {
+                        let waiting_data = waiting_data.clone();
+                        let artifact = artifact.dupe();
+                        let value = value.dupe();
+                        let shared_data = shared_data.dupe();
+                        let artifact_group = artifact_group.dupe();
 
-                    async move {
-                        let (data, artifact_fs, materializer) = &*shared_data;
+                        async move {
+                            let (data, artifact_fs, materializer) = &*shared_data;
 
-                        let configuration_hash_path = artifact_fs
-                            .resolve_build_configuration_hash_path(artifact.get_path())?;
+                            let configuration_hash_path = artifact_fs
+                                .resolve_build_configuration_hash_path(artifact.get_path())?;
 
-                        if artifact.get_path().is_content_based_path() {
-                            let content_based_path = artifact_fs.resolve_build(
-                                artifact.get_path(),
-                                Some(&value.content_based_path_hash()),
-                            )?;
-                            let mut builder =
-                                ArtifactValueBuilder::new(artifact_fs.fs(), digest_config);
-                            builder.add_symlinked(
-                                // The materializer doesn't care about the `src_value`.
-                                &ArtifactValue::dir(digest_config.empty_directory()),
-                                content_based_path,
-                                &configuration_hash_path,
-                            )?;
-                            let symlink_value = builder.build(&configuration_hash_path)?;
+                            if artifact.get_path().is_content_based_path() {
+                                let content_based_path = artifact_fs.resolve_build(
+                                    artifact.get_path(),
+                                    Some(&value.content_based_path_hash()),
+                                )?;
+                                let mut builder =
+                                    ArtifactValueBuilder::new(artifact_fs.fs(), digest_config);
+                                builder.add_symlinked(
+                                    // The materializer doesn't care about the `src_value`.
+                                    &ArtifactValue::dir(digest_config.empty_directory()),
+                                    content_based_path,
+                                    &configuration_hash_path,
+                                )?;
+                                let symlink_value = builder.build(&configuration_hash_path)?;
 
-                            materializer
+                                materializer
                             .declare_copy(configuration_hash_path.clone(), symlink_value, Vec::new(), None)
                             .await
                             .buck_error_context(
                                 "Failed to declare configuration path to content-based path symlinks",
                             )?;
-                        }
+                            }
 
-                        data.try_materialize_requested_artifact(
-                            &artifact,
-                            waiting_data,
-                            force,
-                            configuration_hash_path,
-                            &artifact_group,
-                        )
-                        .await
-                        .buck_error_context("Failed to materialize artifacts")?;
-                        buck2_error::Ok(())
-                    }
-                };
-                materialize_futs.push(spawn_dropcancel(
-                    move |_cancellations| fut.boxed(),
-                    &*data.per_transaction_data().spawner,
-                    data.per_transaction_data(),
-                ));
+                            data.try_materialize_requested_artifact(
+                                &artifact,
+                                waiting_data,
+                                force,
+                                configuration_hash_path,
+                                &artifact_group,
+                            )
+                            .await
+                            .buck_error_context("Failed to materialize artifacts")?;
+                            buck2_error::Ok(())
+                        }
+                    };
+                    materialize_futs.push(spawn_dropcancel(
+                        move |_cancellations| fut.boxed(),
+                        &*data.per_transaction_data().spawner,
+                        data.per_transaction_data(),
+                    ));
+                }
+            }
+
+            match buck2_util::future::try_join_all(materialize_futs).await {
+                Ok(_) => break,
+                Err(error)
+                    if force
+                        && !retried_lost_output
+                        && error.tags().contains(&ErrorTag::ReNotFound) =>
+                {
+                    reexecute_materialization_producers(ctx, &values).await?;
+                    retried_lost_output = true;
+                }
+                Err(error) => return Err(error),
             }
         }
-
-        buck2_util::future::try_join_all(materialize_futs).await?;
     }
 
     Ok(values)
+}
+
+async fn reexecute_materialization_producers(
+    ctx: &mut DiceComputations<'_>,
+    values: &ArtifactGroupValues,
+) -> buck2_error::Result<()> {
+    let mut producers = Vec::new();
+
+    for (artifact, _) in values.iter() {
+        if let BaseArtifactKind::Build(artifact) = artifact.as_parts().0 {
+            if !producers.iter().any(|key| key == artifact.key()) {
+                producers.push(artifact.key().dupe());
+            }
+        }
+    }
+
+    for producer in producers {
+        tracing::info!(
+            producer_action = %producer,
+            "Re-executing producer action after a requested output disappeared from remote CAS"
+        );
+        ActionCalculation::reexecute_action_for_lost_cas_output(ctx, &producer).await?;
+    }
+
+    Ok(())
 }
 
 async fn ensure_uploaded(
