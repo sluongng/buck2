@@ -730,6 +730,52 @@ Use a prebuilt or released Buck2 binary instead of target/debug/buck2:
 BUCK2=/path/to/buck2 buildbuddy/run_buck2_test_matrix.sh --mode both
 ~~~
 
+## Friendly-Fork Releases
+
+Use SemVer tags for the sluongng friendly fork so fork releases do not collide
+with upstream Buck2's date-based tags. The tag format is:
+
+~~~text
+v0.YYYYWW.PATCH
+~~~
+
+YYYYWW is the ISO week-numbering year and zero-padded week. PATCH starts at 0
+for the first weekly release and increments for respins in the same week. For
+example, the first release in ISO week 23 of 2026 is v0.202623.0; a respin in
+that same week is v0.202623.1. Keep the fork identity and upstream base in the
+GitHub release title or body rather than in the SemVer core, for example:
+
+~~~text
+Buck2 friendly fork v0.202623.0
+Based on upstream 2026-05-18 plus <commit>
+~~~
+
+Release binaries should follow the repository's Cargo release path. The
+upstream upload workflow builds with cargo build --release and stamps
+BUCK2_SET_EXPLICIT_VERSION; it does not use Buck -c opt as the release path.
+Use Buck -c opt only for Buck-built validation artifacts once a bootstrap
+binary is already available.
+
+For a local linux-x86_64 BuildBuddy bootstrap release, build and package:
+
+~~~bash
+version=v0.202623.0
+export BUCK2_SET_EXPLICIT_VERSION="$version"
+export BUCK2_RELEASE_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+export RUSTFLAGS="--cfg tokio_unstable -C strip=debuginfo -C codegen-units=1"
+cargo build --release --bin buck2 --target x86_64-unknown-linux-gnu
+mkdir -p artifacts
+zstd -f target/x86_64-unknown-linux-gnu/release/buck2 \
+  -o artifacts/buck2-x86_64-unknown-linux-gnu.zst
+b3sum artifacts/buck2-x86_64-unknown-linux-gnu.zst
+~~~
+
+After uploading the asset to the fork release, point the BuildBuddy bootstrap
+manifest or workflow override at that asset and commit the matching BLAKE3
+digest. The BuildBuddy workflow can then use the previous known-good fork
+binary to build the current checkout before running the matrix with the newly
+built Buck2.
+
 Run the current BuildBuddy-backed smoke test:
 
 ~~~bash
