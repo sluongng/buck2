@@ -9,10 +9,12 @@
  */
 
 use std::collections::BTreeMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -665,6 +667,8 @@ static INDUCED_CACHE_MISSES: LazyLock<Option<StdBuckHashMap<String, AtomicBool>>
     });
 
 static TEST_FAIL_RE_EXECUTE_MISSING_INPUTS_ONCE: AtomicBool = AtomicBool::new(false);
+static TEST_FAIL_RE_DOWNLOAD_DIGESTS_ONCE: LazyLock<Mutex<StdBuckHashSet<String>>> =
+    LazyLock::new(|| Mutex::new(StdBuckHashSet::default()));
 
 impl RemoteExecutionClientImpl {
     async fn new(re_config: &RemoteExecutionConfig) -> buck2_error::Result<Self> {
@@ -1123,7 +1127,7 @@ impl RemoteExecutionClientImpl {
     ) -> buck2_error::Result<Option<ActionResultResponse>> {
         if let Some(m) = &*INDUCED_CACHE_MISSES {
             if m.get(&action_digest.to_string())
-                .is_some_and(|b| !b.load(std::sync::atomic::Ordering::Relaxed))
+                .is_some_and(|b| !b.load(Ordering::Relaxed))
             {
                 return Ok(None);
             }
@@ -1599,7 +1603,7 @@ impl RemoteExecutionClientImpl {
 
         let induced_cache_miss = if let Some(m) = &*INDUCED_CACHE_MISSES {
             m.get(&action_digest.to_string())
-                .filter(|v| !v.load(std::sync::atomic::Ordering::Relaxed))
+                .filter(|v| !v.load(Ordering::Relaxed))
         } else {
             None
         };
@@ -1758,8 +1762,7 @@ impl RemoteExecutionClientImpl {
             "BUCK2_TEST_FAIL_RE_EXECUTE_MISSING_INPUTS_ONCE",
             bool,
             applicability = testing
-        )? && !TEST_FAIL_RE_EXECUTE_MISSING_INPUTS_ONCE
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        )? && !TEST_FAIL_RE_EXECUTE_MISSING_INPUTS_ONCE.swap(true, Ordering::Relaxed)
         {
             return Ok(ExecuteResponseOrCancelled::Response(
                 ExecuteResponseWithQueueStats {
@@ -1796,7 +1799,7 @@ impl RemoteExecutionClientImpl {
         .await;
 
         if let Some(induced_cache_miss) = induced_cache_miss {
-            induced_cache_miss.store(true, std::sync::atomic::Ordering::Relaxed);
+            induced_cache_miss.store(true, Ordering::Relaxed);
         }
 
         let trace = match &res {
@@ -2005,6 +2008,13 @@ impl RemoteExecutionClientImpl {
                     }
                 };
 
+                if let Some(digest) = should_fail_re_download(&chunk)? {
+                    return Err(test_re_error(
+                        &format!("Injected missing CAS download for {digest}"),
+                        TCode::NOT_FOUND,
+                    ));
+                }
+
                 let response = with_error_handler(
                     "materialize_files",
                     self.get_session_id(),
@@ -2161,6 +2171,64 @@ impl RemoteExecutionClientImpl {
 
         Ok(response)
     }
+}
+
+fn should_fail_re_download(
+    files: &[NamedDigestWithPermissions],
+) -> buck2_error::Result<Option<TDigest>> {
+    fn convert_digests(val: &str) -> buck2_error::Result<Vec<TDigest>> {
+        val.split_whitespace()
+            .map(|digest| {
+                TDigest::from_str(digest)
+                    .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::InvalidDigest))
+                    .with_buck_error_context(|| format!("Invalid digest: {digest}"))
+            })
+            .collect()
+    }
+
+    let injected_digests_file = buck2_env!(
+        "BUCK2_TEST_FAIL_RE_DOWNLOAD_DIGESTS_ONCE_FILE",
+        applicability = testing
+    )?;
+    if let Some(path) = injected_digests_file {
+        let injected_digests = std::fs::read_to_string(&path)
+            .with_buck_error_context(|| format!("Failed to read `{path}`"))?;
+        for injected_digest in convert_digests(&injected_digests)? {
+            if should_fail_digest_once(files, &injected_digest) {
+                return Ok(Some(injected_digest));
+            }
+        }
+    }
+
+    let injected_digests = buck2_env!(
+        "BUCK2_TEST_FAIL_RE_DOWNLOAD_DIGESTS_ONCE",
+        type=Vec<TDigest>,
+        converter=convert_digests,
+        applicability=testing
+    )?;
+
+    let Some(injected_digests) = injected_digests else {
+        return Ok(None);
+    };
+
+    for injected_digest in injected_digests {
+        if should_fail_digest_once(files, &injected_digest) {
+            return Ok(Some(injected_digest.clone()));
+        }
+    }
+
+    Ok(None)
+}
+
+fn should_fail_digest_once(files: &[NamedDigestWithPermissions], digest: &TDigest) -> bool {
+    if !files.iter().any(|file| file.named_digest.digest == *digest) {
+        return false;
+    }
+
+    TEST_FAIL_RE_DOWNLOAD_DIGESTS_ONCE
+        .lock()
+        .expect("Poisoned lock")
+        .insert(digest.to_string())
 }
 
 /// Drop the REClient on a blocking thread. The REClient destructor does a blocking wait on async
