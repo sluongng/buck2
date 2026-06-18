@@ -527,8 +527,8 @@ impl BazelEventConverter {
             Some(buck2_data::instant_event::Data::ConsoleMessage(message)) => {
                 events.push(self.progress_event(
                     sequence_hint,
-                    Some(message.message.clone()),
                     None,
+                    Some(message.message.clone()),
                 ));
             }
             Some(buck2_data::instant_event::Data::ConsoleWarning(warning)) => {
@@ -539,7 +539,7 @@ impl BazelEventConverter {
                 ));
             }
             Some(buck2_data::instant_event::Data::StreamingOutput(output)) => {
-                events.push(self.progress_event(sequence_hint, None, Some(output.message.clone())));
+                events.push(self.progress_event(sequence_hint, Some(output.message.clone()), None));
             }
             Some(buck2_data::instant_event::Data::ActionError(action_error)) => {
                 events.push(self.progress_event(
@@ -6023,6 +6023,16 @@ mod tests {
         serde_json::from_str(&profile).expect("valid profile json")
     }
 
+    fn progress_payload(events: &[bep::BuildEvent]) -> &bep::Progress {
+        events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::Progress(progress)) => Some(progress),
+                _ => None,
+            })
+            .expect("progress event")
+    }
+
     fn configured_target() -> buck2_data::ConfiguredTargetLabel {
         configured_target_with_package("pkg", "main", "cfg")
     }
@@ -6330,6 +6340,48 @@ mod tests {
             .map(command_line_from_event)
             .expect("original command line");
         assert_eq!(chunk_values(original, "command"), vec!["build"]);
+    }
+
+    #[test]
+    fn console_message_progress_uses_stderr() {
+        let mut converter = BazelEventConverter::default();
+        let events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::Instant(
+                buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::ConsoleMessage(
+                        buck2_data::ConsoleMessage {
+                            message: "stderr chunk".to_owned(),
+                        },
+                    )),
+                },
+            )),
+        );
+
+        let progress = progress_payload(&events);
+        assert_eq!(progress.stdout, "");
+        assert_eq!(progress.stderr, "stderr chunk");
+    }
+
+    #[test]
+    fn streaming_output_progress_uses_stdout() {
+        let mut converter = BazelEventConverter::default();
+        let events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::Instant(
+                buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::StreamingOutput(
+                        buck2_data::StdoutStreamingOutput {
+                            message: "stdout chunk".to_owned(),
+                        },
+                    )),
+                },
+            )),
+        );
+
+        let progress = progress_payload(&events);
+        assert_eq!(progress.stdout, "stdout chunk");
+        assert_eq!(progress.stderr, "");
     }
 
     #[test]
