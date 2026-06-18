@@ -8,7 +8,7 @@
 
 """C/C++ toolchain backed by hermetic-llvm prebuilt minimal LLVM archives."""
 
-load("@prelude//cxx:cxx_toolchain_types.bzl", "BinaryUtilitiesInfo", "CCompilerInfo", "CxxCompilerInfo", "CxxInternalTools", "DepTrackingMode", "LinkerInfo", "LinkerType", "PicBehavior", "ShlibInterfacesMode", "StripFlagsInfo", "cxx_toolchain_infos")
+load("@prelude//cxx:cxx_toolchain_types.bzl", "AsCompilerInfo", "AsmCompilerInfo", "BinaryUtilitiesInfo", "CCompilerInfo", "CxxCompilerInfo", "CxxInternalTools", "DepTrackingMode", "LinkerInfo", "LinkerType", "PicBehavior", "ShlibInterfacesMode", "StripFlagsInfo", "cxx_toolchain_infos")
 load("@prelude//cxx:headers.bzl", "HeaderMode")
 load("@prelude//cxx:linker.bzl", "is_pdb_generated")
 load("@prelude//:native.bzl", _native = "native")
@@ -183,6 +183,18 @@ def _cxx_llvm_toolchain_impl(ctx: AnalysisContext) -> list[Provider]:
     return [ctx.attrs.distribution[DefaultInfo]] + cxx_toolchain_infos(
         platform_name = dist.target,
         internal_tools = ctx.attrs._cxx_internal_tools[CxxInternalTools],
+        as_compiler_info = AsCompilerInfo(
+            compiler = RunInfo(args = cmd_args(clang)),
+            compiler_type = "clang",
+            compiler_flags = cmd_args(target_flags),
+            preprocessor_flags = cmd_args(ctx.attrs.c_preprocessor_flags),
+        ),
+        asm_compiler_info = AsmCompilerInfo(
+            compiler = RunInfo(args = cmd_args(clang)),
+            compiler_type = "clang",
+            compiler_flags = cmd_args(target_flags),
+            preprocessor_flags = cmd_args(ctx.attrs.c_preprocessor_flags),
+        ),
         c_compiler_info = CCompilerInfo(
             compiler = RunInfo(args = cmd_args(clang)),
             compiler_type = "clang",
