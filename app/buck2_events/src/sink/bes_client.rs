@@ -45,6 +45,7 @@ use prost_types::Any;
 use prost_types::Timestamp;
 use sha2::Digest as _;
 use sha2::Sha256;
+use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
@@ -891,10 +892,7 @@ impl BesClient {
         thread::Builder::new()
             .name("buck2-bes-sink".to_owned())
             .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
+                let runtime = match bes_worker_runtime() {
                     Ok(runtime) => runtime,
                     Err(_) => {
                         thread_counters.inc_failures_internal_error();
@@ -1063,6 +1061,16 @@ impl BesClient {
     pub fn export_counters(&self) -> Counters {
         self.counters.snapshot()
     }
+}
+
+fn bes_worker_runtime() -> std::io::Result<Runtime> {
+    // The worker loop blocks on crossbeam while idle. Keep spawned tonic
+    // transport tasks running so BES events can reach the server before close.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("buck2-bes-runtime")
+        .enable_all()
+        .build()
 }
 
 fn process_queued_message(
@@ -2446,6 +2454,16 @@ mod tests {
     fn event_format_rejects_unknown_values() {
         let err = "Bazel".parse::<BesEventFormat>().unwrap_err();
         assert!(err.to_string().contains("expected `buck` or `bazel`"));
+    }
+
+    #[test]
+    fn bes_worker_runtime_drives_spawned_transport_tasks() {
+        let runtime = bes_worker_runtime().expect("runtime should build");
+
+        assert_eq!(
+            runtime.handle().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        );
     }
 
     #[tokio::test]
