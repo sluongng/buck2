@@ -143,8 +143,11 @@ actions:
             remote_only_buck2_build retry
           fi
 
+          # The matrix isolation prefix is already unique per workflow run. Do
+          # not pass --clean-output here because it starts with buck2 killall,
+          # which can stop the previous daemon before its terminal BES events
+          # are flushed to BuildBuddy.
           BUCK2="$built_buck2" buildbuddy/run_buck2_test_matrix.sh \
             --mode remote \
             --remote-config-file .buckconfig.buildbuddy \
-            --isolation-prefix "buildbuddy-rbe-tests-$BUILDBUDDY_INVOCATION_ID" \
-            --clean-output
+            --isolation-prefix "buildbuddy-rbe-tests-$BUILDBUDDY_INVOCATION_ID"
