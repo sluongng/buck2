@@ -119,6 +119,9 @@ def _tar_strip_prefix_flags(strip_prefix: [str, None]) -> list[str]:
         return ["--strip-components=" + str(count), strip_prefix]
     return []
 
+def _shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
 def unarchive(
         ctx: AnalysisContext,
         archive: Artifact | None,
@@ -131,6 +134,8 @@ def unarchive(
         sha256: str | None,
         size_bytes: int | None,
         strip_prefix,
+        patch_args: list[str],
+        patches: list[Artifact],
         exec_deps: HttpArchiveExecDeps,
         prefer_local: bool,
         sub_targets: list[str] | dict[str, list[str]],
@@ -140,6 +145,8 @@ def unarchive(
         fail("remote_download is not supported for Windows http_archive actions")
     if remote_download and excludes:
         fail("remote_download does not support excludes")
+    if exec_is_windows and patches:
+        fail("http_archive patches are not supported on Windows actions")
 
     if exec_is_windows:
         ext = "bat"
@@ -236,14 +243,22 @@ def unarchive(
                 "fi",
             ])
 
+    patch_commands = []
+    if patches:
+        patch_root = strip_prefix if needs_strip_prefix else "."
+        patch_commands.append("cd " + _shell_quote(patch_root))
+        for patch in patches:
+            patch_commands.append(cmd_args(["patch", "--batch"] + patch_args + ["-i", cmd_args(patch, format = "\"$project_root\"/{}")], delimiter = " "))
+
     script, _ = ctx.actions.write(
         "{}_unpack.{}".format(output_name, ext),
         [
             cmd_args(script_output.as_output(), format = mkdir),
+            "project_root=\"$PWD\"",
             cmd_args(script_output.as_output(), format = "cd {}"),
         ] + download + [
             cmd_args([unarchive_cmd] + exclude_flags, delimiter = " ", relative_to = script_output.as_output()),
-        ] + (["rm -f \"$archive\""] if remote_download else []),
+        ] + (["rm -f \"$archive\""] if remote_download else []) + patch_commands,
         is_executable = True,
         allow_args = True,
         has_content_based_path = False,
@@ -252,7 +267,7 @@ def unarchive(
     ctx.actions.run(
         cmd_args(
             interpreter + [script] + download_urls,
-            hidden = exclude_hidden + ([archive] if archive != None else []) + [script_output.as_output()],
+            hidden = exclude_hidden + patches + ([archive] if archive != None else []) + [script_output.as_output()],
         ),
         category = "http_archive",
         identifier = output_name,

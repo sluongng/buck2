@@ -6,7 +6,7 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-load("@prelude//go:toolchain.bzl", "GoToolchainInfo")
+load("@prelude//go:toolchain.bzl", "GoToolchainInfo", "parse_go_version")
 load("@prelude//os_lookup:defs.bzl", "ScriptLanguage")
 load("@prelude//utils:cmd_script.bzl", "cmd_script")
 
@@ -66,16 +66,18 @@ def _system_go_toolchain_impl(ctx):
             env_go_arch = go_arch,
             env_go_os = go_os,
             env_go_root = go_root,
-            external_linker_flags = [],
+            env_go_debug = ctx.attrs.env_go_debug,
+            env_go_experiment = ctx.attrs.env_go_experiment,
+            external_linker_flags = ctx.attrs.external_linker_flags,
             go = RunInfo(cmd_script(ctx.actions, "go", cmd_args(go), script_language)),
             go_wrapper = ctx.attrs.go_wrapper[RunInfo],
             linker = RunInfo(cmd_script(ctx.actions, "link", cmd_args(go, "tool", "link"), script_language)),
             packer = RunInfo(cmd_script(ctx.actions, "pack", cmd_args(go, "tool", "pack"), script_language)),
-            build_tags = [],
-            linker_flags = [],
-            assembler_flags = [],
-            compiler_flags = [],
-            version = None,  # we are unable to run `go version` during analysis time
+            build_tags = ctx.attrs.build_tags,
+            linker_flags = ctx.attrs.linker_flags,
+            assembler_flags = ctx.attrs.assembler_flags,
+            compiler_flags = ctx.attrs.compiler_flags,
+            version = parse_go_version(ctx.attrs.version) if ctx.attrs.version != None else None,
         ),
     ]
 
@@ -87,10 +89,18 @@ system_go_toolchain = rule(
       visibility = ["PUBLIC"],
   )""",
     attrs = {
+        "assembler_flags": attrs.list(attrs.arg(), default = []),
+        "build_tags": attrs.list(attrs.string(), default = []),
         "copy_goroot": attrs.default_only(attrs.dep(providers = [RunInfo], default = "prelude//go/tools:copy_goroot")),
+        "compiler_flags": attrs.list(attrs.arg(), default = []),
+        "env_go_debug": attrs.dict(attrs.string(), attrs.string(), default = {}),
+        "env_go_experiment": attrs.list(attrs.string(), default = []),
+        "external_linker_flags": attrs.list(attrs.arg(), default = []),
         "gen_embedcfg": attrs.default_only(attrs.dep(providers = [RunInfo], default = "prelude//go/tools:gen_embedcfg")),
         "go_wrapper": attrs.default_only(attrs.dep(providers = [RunInfo], default = "prelude//go/tools:go_wrapper")),
+        "linker_flags": attrs.list(attrs.arg(), default = []),
         "pkg_analyzer": attrs.default_only(attrs.dep(providers = [RunInfo], default = "prelude//go/tools:pkg_analyzer")),
+        "version": attrs.option(attrs.string(), default = None),
     },
     is_toolchain_rule = True,
 )
