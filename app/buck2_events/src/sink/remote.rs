@@ -56,3 +56,104 @@ pub fn is_enabled() -> bool {
 pub fn disable() {
     REMOTE_EVENT_SINK_ENABLED.store(false, Ordering::Relaxed);
 }
+
+#[cfg(not(fbcode_build))]
+pub fn expand_bes_config_env_vars(raw: &str) -> String {
+    expand_bes_config_env_vars_with(raw, |name| std::env::var(name).ok())
+}
+
+#[cfg(not(fbcode_build))]
+pub fn expand_bes_config_env_vars_with<F>(raw: &str, mut env: F) -> String
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut expanded = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            expanded.push(ch);
+            continue;
+        }
+
+        match chars.peek().copied() {
+            Some('{') => {
+                chars.next();
+                let mut name = String::new();
+                let mut closed = false;
+                for c in chars.by_ref() {
+                    if c == '}' {
+                        closed = true;
+                        break;
+                    }
+                    name.push(c);
+                }
+
+                if closed && is_env_name(&name) {
+                    expanded.push_str(&env(&name).unwrap_or_default());
+                } else {
+                    expanded.push('$');
+                    expanded.push('{');
+                    expanded.push_str(&name);
+                    if closed {
+                        expanded.push('}');
+                    }
+                }
+            }
+            Some(c) if is_env_name_start(c) => {
+                let mut name = String::new();
+                while let Some(c) = chars.peek().copied() {
+                    if !is_env_name_char(c) {
+                        break;
+                    }
+                    name.push(c);
+                    chars.next();
+                }
+                expanded.push_str(&env(&name).unwrap_or_default());
+            }
+            _ => expanded.push('$'),
+        }
+    }
+
+    expanded
+}
+
+#[cfg(not(fbcode_build))]
+fn is_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(is_env_name_start) && chars.all(is_env_name_char)
+}
+
+#[cfg(not(fbcode_build))]
+fn is_env_name_start(c: char) -> bool {
+    c == '_' || c.is_ascii_alphabetic()
+}
+
+#[cfg(not(fbcode_build))]
+fn is_env_name_char(c: char) -> bool {
+    c == '_' || c.is_ascii_alphanumeric()
+}
+
+#[cfg(all(test, not(fbcode_build)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expands_bes_config_env_vars() {
+        assert_eq!(
+            expand_bes_config_env_vars_with(
+                "key=$BUILDBUDDY_API_KEY,run=${BUILDBUDDY_RUN_ID},missing=$MISSING,literal=$9",
+                test_env,
+            ),
+            "key=secret,run=run-id,missing=,literal=$9",
+        );
+    }
+
+    fn test_env(name: &str) -> Option<String> {
+        match name {
+            "BUILDBUDDY_API_KEY" => Some("secret".to_owned()),
+            "BUILDBUDDY_RUN_ID" => Some("run-id".to_owned()),
+            _ => None,
+        }
+    }
+}

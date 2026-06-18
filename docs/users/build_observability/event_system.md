@@ -113,6 +113,8 @@ build_metadata = PARENT_RUN_ID=workflow-run-id,PARENT_INVOCATION_ID=workflow-inv
 
 These entries are merged into Bazel-format `BuildMetadata` events. Metadata
 already present on the Buck2 command takes precedence over configured defaults.
+`header` and `build_metadata` values support `$VAR` and `${VAR}` environment
+variable expansion before Buck2 parses their `KEY=VALUE` entries.
 
 In `bazel` mode, Buck2 translates the event stream into
 `build_event_stream.BuildEvent` messages. The converter currently maps:
