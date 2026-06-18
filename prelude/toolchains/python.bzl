@@ -21,6 +21,16 @@ load(
     "PythonBootstrapToolchainInfo",
 )
 
+def _python_wheel_toolchain_impl(ctx):
+    return [
+        DefaultInfo(),
+        PythonWheelToolchainInfo(
+            abi = ctx.attrs.abi,
+            platform = ctx.attrs.platform,
+            python = ctx.attrs.python,
+        ),
+    ]
+
 def _system_python_wheel_toolchain_impl(ctx):
     return [
         DefaultInfo(),
@@ -33,6 +43,16 @@ def _system_python_wheel_toolchain_impl(ctx):
 
 system_python_wheel_toolchain = rule(
     impl = _system_python_wheel_toolchain_impl,
+    attrs = {
+        "abi": attrs.string(default = "none"),
+        "platform": attrs.string(default = "linux_x86_64"),
+        "python": attrs.string(default = "py3"),
+    },
+    is_toolchain_rule = True,
+)
+
+python_wheel_toolchain = rule(
+    impl = _python_wheel_toolchain_impl,
     attrs = {
         "abi": attrs.string(default = "none"),
         "platform": attrs.string(default = "linux_x86_64"),
