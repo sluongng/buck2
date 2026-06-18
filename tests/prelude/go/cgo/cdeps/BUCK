@@ -1,0 +1,99 @@
+load("@fbcode//buck2/tests/prelude:py_assertion.bzl", "py_assertion")
+
+oncall("golang")
+
+prelude = native
+
+prelude.cxx_library(
+    name = "base_clib",
+    srcs = ["base.c"],
+    exported_headers = ["base.h"],
+)
+
+prelude.cxx_library(
+    name = "clib",
+    srcs = ["lib.c"],
+    exported_headers = ["lib.h"],
+    deps = [":base_clib"],
+)
+
+prelude.go_library(
+    name = "golib",
+    srcs = ["lib.go"],
+    import_path = "buck2/tests/prelude/go/cgo/cdeps",
+    headers = ["lib.h"],
+    header_namespace = "",
+    cdeps = [":clib"],
+)
+
+prelude.go_library(
+    name = "middle",
+    srcs = ["middle.go"],
+    import_path = "buck2/tests/prelude/go/cgo/cdeps/middle",
+    deps = [":golib"],
+)
+
+prelude.go_binary(
+    name = "bin",
+    srcs = ["main.go"],
+    deps = [":golib"],
+)
+
+prelude.go_binary(
+    name = "transitive_bin",
+    srcs = ["transitive_main.go"],
+    deps = [":middle"],
+)
+
+prelude.go_binary(
+    name = "shared_transitive_bin",
+    srcs = ["transitive_main.go"],
+    deps = [":middle"],
+    link_style = "shared",
+)
+
+prelude.go_test(
+    name = "test",
+    srcs = ["lib_test.go"],
+    target_under_test = ":golib",
+)
+
+py_assertion(
+    name = "check_binary_output",
+    script = """
+import subprocess
+import sys
+assert subprocess.check_output([sys.argv[1]]).decode().strip() == "i = 2"
+""",
+    script_args = ["$(exe_target :bin)"],
+)
+
+py_assertion(
+    name = "check_transitive_binary_output",
+    script = """
+import subprocess
+import sys
+assert subprocess.check_output([sys.argv[1]]).decode().strip() == "i = 3"
+""",
+    script_args = ["$(exe_target :transitive_bin)"],
+)
+
+py_assertion(
+    name = "check_shared_transitive_binary_output",
+    script = """
+import subprocess
+import sys
+assert subprocess.check_output([sys.argv[1]]).decode().strip() == "i = 3"
+""",
+    script_args = ["$(location_exec :shared_transitive_bin)"],
+)
+
+py_assertion(
+    name = "check_test_output",
+    script = """
+import subprocess
+import sys
+assert "PASS" in subprocess.check_output([sys.argv[1]]).decode()
+""",
+    script_args = ["$(location_exec :test)"],
+)
