@@ -80,33 +80,49 @@ actions:
 
           cp shim/third-party/rust/BUCK.reindeer shim/third-party/rust/BUCK
 
-      # Use the bootstrap Buck2 binary to build the current checkout's Buck2.
-      # The resulting binary path is saved so subsequent steps do not rely on
-      # shell variables crossing step boundaries.
+      # Use the bootstrap Buck2 binary to build the current checkout's Buck2
+      # locally. This seeds the remote cache from the workflow runner before
+      # remote-only validation, avoiding cold-cache archive fetches on RBE
+      # workers that may not have reliable external DNS.
       - run: |
           set -euo pipefail
 
-          # Buck2 daemon startup reads static RE metadata before command-level
-          # --config-file values are applied, so expose the checked-in
-          # BuildBuddy profile as an external config for the daemon as well.
-          export BUCK2_TEST_EXTRA_EXTERNAL_CONFIG="$PWD/.buckconfig.buildbuddy"
-
           buck2_bootstrap=$(cat .buildbuddy-workflow/bootstrap-buck2.path)
-          built_buck2_json="$("$buck2_bootstrap" \
-            --isolation-dir "buildbuddy-rbe-build-$BUILDBUDDY_INVOCATION_ID" \
-            build \
-            --show-full-json-output \
-            --config-file .buckconfig.buildbuddy \
-            --remote-only \
-            //:buck2)"
-          built_buck2="$(python3 -c 'import json, sys; outputs = json.load(sys.stdin); output = next(iter(outputs.values())); print(output[0] if isinstance(output, list) else output)' <<< "$built_buck2_json")"
+          built_buck2="$PWD/.buildbuddy-workflow/built-buck2"
+          bootstrap_buckconfig=.buildbuddy-workflow/bootstrap-output.buckconfig
+          sed 's/^materializations = deferred_skip_final_artifacts$/materializations = deferred/' \
+            .buckconfig.buildbuddy > "$bootstrap_buckconfig"
+
+          # Buck2 daemon startup reads static RE metadata before command-level
+          # --config-file values are applied. Use a bootstrap-only profile that
+          # materializes the requested output, since this step runs that binary.
+          export BUCK2_TEST_EXTRA_EXTERNAL_CONFIG="$PWD/$bootstrap_buckconfig"
+
+          local_buck2_build() {
+            local attempt="$1"
+            rm -f "$built_buck2"
+            "$buck2_bootstrap" \
+              --isolation-dir "buildbuddy-rbe-build-$attempt" \
+              build \
+              --config-file "$bootstrap_buckconfig" \
+              --local-only \
+              --out "$built_buck2" \
+              //:buck2
+          }
+
+          if ! local_buck2_build initial; then
+            echo "Local //:buck2 bootstrap build failed; retrying once with fresh Buck2 daemon state" >&2
+            "$buck2_bootstrap" killall >/dev/null 2>&1 || true
+            rm -rf "buck-out/buildbuddy-rbe-build-retry"
+            local_buck2_build retry
+          fi
           printf '%s\n' "$built_buck2" > .buildbuddy-workflow/built-buck2.path
           test -x "$built_buck2"
           "$built_buck2" --version
 
       # Rebuild //:buck2 with the freshly built binary, then run the BuildBuddy
-      # remote matrix. The explicit binary build proves the fork can bootstrap
-      # itself remotely before broader test coverage runs with that binary.
+      # remote matrix. Keep this second build remote-only as well, so the final
+      # validation exercises the same RBE path as the matrix tests.
       - run: |
           set -euo pipefail
 
@@ -115,15 +131,32 @@ actions:
           export BUCK2_TEST_EXTRA_EXTERNAL_CONFIG="$PWD/.buckconfig.buildbuddy"
 
           built_buck2=$(cat .buildbuddy-workflow/built-buck2.path)
-          "$built_buck2" \
-            --isolation-dir "buildbuddy-rbe-selftest-$BUILDBUDDY_INVOCATION_ID" \
-            build \
-            --config-file .buckconfig.buildbuddy \
-            --remote-only \
-            //:buck2
+          remote_matrix_isolation_prefix="buildbuddy-rbe-tests"
+          remote_only_buck2_build() {
+            local isolation_dir="$1"
+            "$built_buck2" \
+              --isolation-dir "$isolation_dir" \
+              build \
+              --config-file .buckconfig.buildbuddy \
+              --remote-only \
+              //:buck2
+          }
 
+          if ! remote_only_buck2_build "$remote_matrix_isolation_prefix-rbe"; then
+            echo "Remote-only //:buck2 build failed; retrying once with fresh Buck2 daemon state" >&2
+            "$built_buck2" killall >/dev/null 2>&1 || true
+            rm -rf "buck-out/$remote_matrix_isolation_prefix-rbe"
+            remote_only_buck2_build "$remote_matrix_isolation_prefix-rbe"
+          fi
+
+          # Keep the matrix isolation prefix stable across workflow runs so
+          # Buck output paths, and therefore remote action keys, remain stable.
+          # Do not pass --clean-output here because it starts with buck2 killall,
+          # which can stop the previous daemon before its terminal BES events
+          # are flushed to BuildBuddy. Reusing the self-test isolation dir lets
+          # the deferred materializer state from the remote //:buck2 build carry
+          # into the matrix command.
           BUCK2="$built_buck2" buildbuddy/run_buck2_test_matrix.sh \
             --mode remote \
             --remote-config-file .buckconfig.buildbuddy \
-            --isolation-prefix "buildbuddy-rbe-tests-$BUILDBUDDY_INVOCATION_ID" \
-            --clean-output
+            --isolation-prefix "$remote_matrix_isolation_prefix"
