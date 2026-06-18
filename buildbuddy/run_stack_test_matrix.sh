@@ -390,7 +390,7 @@ prepare_remote_worktree() {
         return
     fi
 
-    for support_file in buildbuddy/BUCK buildbuddy/defs.bzl; do
+    for support_file in buildbuddy/BUCK buildbuddy/defs.bzl buildbuddy/toolchains/BUCK prelude/toolchains/go/defs.bzl prelude/toolchains/go/releases.bzl; do
         if [[ -f "$ROOT_DIR/$support_file" && ! -f "$worktree/$support_file" ]]; then
             echo "Copying $support_file from $ROOT_DIR"
             mkdir -p "$worktree/$(dirname "$support_file")"
@@ -430,7 +430,13 @@ for commit in "${COMMITS[@]}"; do
             fi
         fi
         if [[ "$USES_REMOTE" == 1 ]]; then
-            printf '(cd %q && [ -f buildbuddy/BUCK ] || { mkdir -p buildbuddy && cp %q buildbuddy/BUCK && cp %q buildbuddy/defs.bzl; })\n' "$worktree" "$ROOT_DIR/buildbuddy/BUCK" "$ROOT_DIR/buildbuddy/defs.bzl"
+            printf 'mkdir -p %q\n' "$worktree/buildbuddy/toolchains"
+            printf 'mkdir -p %q\n' "$worktree/prelude/toolchains/go"
+            printf '[ -f %q ] || cp %q %q\n' "$worktree/buildbuddy/BUCK" "$ROOT_DIR/buildbuddy/BUCK" "$worktree/buildbuddy/BUCK"
+            printf '[ -f %q ] || cp %q %q\n' "$worktree/buildbuddy/defs.bzl" "$ROOT_DIR/buildbuddy/defs.bzl" "$worktree/buildbuddy/defs.bzl"
+            printf '[ -f %q ] || cp %q %q\n' "$worktree/buildbuddy/toolchains/BUCK" "$ROOT_DIR/buildbuddy/toolchains/BUCK" "$worktree/buildbuddy/toolchains/BUCK"
+            printf '[ -f %q ] || cp %q %q\n' "$worktree/prelude/toolchains/go/defs.bzl" "$ROOT_DIR/prelude/toolchains/go/defs.bzl" "$worktree/prelude/toolchains/go/defs.bzl"
+            printf '[ -f %q ] || cp %q %q\n' "$worktree/prelude/toolchains/go/releases.bzl" "$ROOT_DIR/prelude/toolchains/go/releases.bzl" "$worktree/prelude/toolchains/go/releases.bzl"
             if [[ "$STAGE_REMOTE_CONFIG" == 1 ]]; then
                 printf 'cp %q %q\n' "$REMOTE_CONFIG_FILE" "$worktree/.buckconfig.local"
                 printf 'cp %q %q\n' "$ROOT_DIR/.buckconfig.buildbuddy" "$worktree/.buckconfig.buildbuddy"
