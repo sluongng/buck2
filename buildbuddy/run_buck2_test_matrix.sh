@@ -38,8 +38,9 @@ Options:
   --clean-output                Kill Buck2 daemons and remove this script's buck-out dirs first.
   -h, --help                    Show this help.
 
-The remote mode expects BuildBuddy credentials to come from the user's private
-.buckconfig.local or from another config passed with --remote-config-file.
+The remote mode expects BuildBuddy credentials to come from BUILDBUDDY_API_KEY,
+the user's private .buckconfig.local, or another config passed with
+--remote-config-file.
 EOF
 }
 
