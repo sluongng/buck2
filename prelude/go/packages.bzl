@@ -58,9 +58,13 @@ GoStdlib = provider(
 
 def go_attr_pkg_name(ctx: AnalysisContext) -> str:
     """
-    Return the Go package name for the given context corresponding to a rule.
+    Return the Go import path for the given context corresponding to a rule.
     """
-    return value_or(ctx.attrs.package_name, ctx.label.package)
+    import_path = getattr(ctx.attrs, "import_path", None)
+    package_name = getattr(ctx.attrs, "package_name", None)
+    if import_path != None and package_name != None and import_path != package_name:
+        fail("import_path and package_name must match when both are set: {} != {}".format(import_path, package_name))
+    return value_or(import_path, value_or(package_name, ctx.label.package))
 
 def merge_pkgs(pkgss: list[dict[str, GoPkg]]) -> dict[str, GoPkg]:
     """

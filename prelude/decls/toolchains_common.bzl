@@ -9,6 +9,7 @@
 load("@prelude//android:android_toolchain.bzl", "AndroidPlatformInfo", "AndroidToolchainInfo")
 load("@prelude//csharp:toolchain.bzl", "CSharpToolchainInfo")
 load("@prelude//go:toolchain.bzl", "GoToolchainInfo")
+load("@prelude//go:go_proto_toolchain.bzl", "GoProtoToolchainInfo")
 load("@prelude//go_bootstrap:go_bootstrap.bzl", "GoBootstrapToolchainInfo")
 load("@prelude//haskell:toolchain.bzl", "HaskellPlatformInfo", "HaskellToolchainInfo")
 load("@prelude//java:dex_toolchain.bzl", "DexToolchainInfo")
@@ -62,6 +63,9 @@ def _dex_toolchain():
 
 def _go_toolchain():
     return _toolchain("go", [GoToolchainInfo])
+
+def _go_proto_toolchain():
+    return _toolchain("go_proto", [GoProtoToolchainInfo])
 
 def _go_bootstrap_toolchain():
     return _toolchain("go_bootstrap", [GoBootstrapToolchainInfo])
@@ -122,6 +126,7 @@ toolchains_common = struct(
     cython = _cython_toolchain,
     dex = _dex_toolchain,
     go = _go_toolchain,
+    go_proto = _go_proto_toolchain,
     go_bootstrap = _go_bootstrap_toolchain,
     haskell = _haskell_toolchain,
     java = _java_toolchain,

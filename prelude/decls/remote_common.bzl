@@ -85,6 +85,22 @@ def _unarchive_args():
             provided that uses the `name` of the rule.
         """,
         ),
+        "patch_args": attrs.list(
+            attrs.string(),
+            default = ["-p0"],
+            doc = """
+            Arguments passed to `patch` when applying `patches`. The default
+            matches Bazel's `http_archive` behavior.
+        """,
+        ),
+        "patches": attrs.list(
+            attrs.source(),
+            default = [],
+            doc = """
+            Patch files applied to the extracted archive after `strip_prefix`
+            processing.
+        """,
+        ),
         "strip_prefix": attrs.option(
             attrs.string(),
             default = None,
