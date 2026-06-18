@@ -17,6 +17,7 @@ def http_archive_impl(ctx: AnalysisContext) -> list[Provider]:
     expect(len(ctx.attrs.vpnless_urls) < 2, "multiple `vpnless_urls` not supported: {}".format(ctx.attrs.vpnless_urls))
 
     remote_download = ctx.attrs.remote_download or read_root_config("http_archive", "remote_download", "false").lower() == "true"
+    resolve_static_crates = read_root_config("http_archive", "resolve_static_crates", "false").lower() == "true"
     if remote_download:
         expect(ctx.attrs.sha1 != None or ctx.attrs.sha256 != None, "`http_archive.remote_download` requires `sha1` or `sha256`")
 
@@ -67,6 +68,7 @@ def http_archive_impl(ctx: AnalysisContext) -> list[Provider]:
         sub_targets = ctx.attrs.sub_targets,
         exec_deps = ctx.attrs.exec_deps[HttpArchiveExecDeps],
         prefer_local = prefer_local,
+        resolve_static_crates = resolve_static_crates,
         has_content_based_path = ctx.attrs.has_content_based_path,
     )
 
