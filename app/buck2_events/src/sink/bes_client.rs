@@ -45,6 +45,7 @@ use prost_types::Any;
 use prost_types::Timestamp;
 use sha2::Digest as _;
 use sha2::Sha256;
+use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
@@ -891,10 +892,7 @@ impl BesClient {
         thread::Builder::new()
             .name("buck2-bes-sink".to_owned())
             .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
+                let runtime = match bes_worker_runtime() {
                     Ok(runtime) => runtime,
                     Err(_) => {
                         thread_counters.inc_failures_internal_error();
@@ -1063,6 +1061,16 @@ impl BesClient {
     pub fn export_counters(&self) -> Counters {
         self.counters.snapshot()
     }
+}
+
+fn bes_worker_runtime() -> std::io::Result<Runtime> {
+    // The worker loop blocks on crossbeam while idle. Keep spawned tonic
+    // transport tasks running so BES events can reach the server before close.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("buck2-bes-runtime")
+        .enable_all()
+        .build()
 }
 
 fn process_queued_message(
@@ -1270,7 +1278,12 @@ impl WorkerState {
             return Ok(());
         }
         let upload_config = BazelArtifactUploadConfig::from_bes(&self.config, &self.connection)?;
-        let stream = StreamState::new(parsed, &self.config.build_metadata, upload_config);
+        let stream = StreamState::new(
+            parsed,
+            &self.config.build_metadata,
+            upload_config,
+            self.config.upload_successful_action_events,
+        );
         self.streams.insert(parsed.invocation_id.clone(), stream);
         Ok(())
     }
@@ -1562,6 +1575,7 @@ impl StreamState {
         parsed: &ParsedMessage,
         build_metadata: &[(String, String)],
         bazel_artifact_upload_config: Option<BazelArtifactUploadConfig>,
+        upload_successful_action_events: bool,
     ) -> Self {
         Self {
             stream_id: StreamId {
@@ -1575,7 +1589,10 @@ impl StreamState {
             ack_task: None,
             project_id: parsed.project_id.clone(),
             pending_unacked: VecDeque::new(),
-            bazel_converter: BazelEventConverter::new(build_metadata.iter().cloned()),
+            bazel_converter: BazelEventConverter::new_with_options(
+                build_metadata.iter().cloned(),
+                upload_successful_action_events,
+            ),
             bazel_artifact_uploader: bazel_artifact_upload_config.map(BazelArtifactUploader::new),
             last_sent_sequence_number: 0,
             saw_command_end: false,
@@ -2439,6 +2456,16 @@ mod tests {
         assert!(err.to_string().contains("expected `buck` or `bazel`"));
     }
 
+    #[test]
+    fn bes_worker_runtime_drives_spawned_transport_tasks() {
+        let runtime = bes_worker_runtime().expect("runtime should build");
+
+        assert_eq!(
+            runtime.handle().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        );
+    }
+
     #[tokio::test]
     async fn bazel_enqueue_returns_highest_emitted_sequence_number() {
         let message = make_message(
@@ -2447,7 +2474,7 @@ mod tests {
             command_start_data(),
         );
         let parsed = ParsedMessage::from_message(&message).expect("valid message");
-        let mut stream = StreamState::new(&parsed, &[], None);
+        let mut stream = StreamState::new(&parsed, &[], None, true);
 
         let last_sequence = stream.enqueue_event(&parsed, BesEventFormat::Bazel).await;
 

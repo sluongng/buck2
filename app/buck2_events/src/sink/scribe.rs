@@ -261,105 +261,133 @@ impl RemoteEventSink {
     }
 
     fn should_send_event(&self, data: &buck2_data::buck_event::Data) -> bool {
-        use buck2_data::buck_event::Data;
-
-        match data {
-            Data::SpanStart(s) => {
-                use buck2_data::span_start_event::Data;
-
-                match &s.data {
-                    Some(Data::Command(..)) => true,
-                    // Buck2->BuildBuddy OSS integration needs this to capture
-                    // metadata sourced from buckconfigs.
-                    #[cfg(not(fbcode_build))]
-                    Some(Data::CommandCritical(..)) => true,
-                    // Buck2->BuildBuddy target mapping uses analysis start to
-                    // synthesize target configured events.
-                    #[cfg(not(fbcode_build))]
-                    Some(Data::Analysis(..)) => true,
-                    None => false,
-                    _ => false,
-                }
-            }
-            Data::SpanEnd(s) => {
-                use buck2_data::span_end_event::Data;
-
-                match &s.data {
-                    Some(Data::Command(..)) => true,
-                    Some(Data::ActionExecution(a)) => self.should_send_action_execution(a),
-                    Some(Data::Analysis(..)) => !self.schedule_type.is_diff(),
-                    Some(Data::Load(..)) => true,
-                    Some(Data::CacheUpload(..)) => true,
-                    Some(Data::DepFileUpload(..)) => true,
-                    Some(Data::Materialization(..)) => true,
-                    Some(Data::TestDiscovery(..)) => true,
-                    Some(Data::TestRun(..)) => true,
-                    None => false,
-                    _ => false,
-                }
-            }
-            Data::Instant(i) => {
-                use buck2_data::instant_event::Data;
-
-                match i.data {
-                    Some(Data::BuildGraphInfo(..)) => true,
-                    // Required by BuildBuddy Buck2 mapping for target/test
-                    // details and invocation metadata.
-                    #[cfg(not(fbcode_build))]
-                    Some(Data::TestDiscovery(..)) => true,
-                    #[cfg(not(fbcode_build))]
-                    Some(Data::TestResult(..)) => true,
-                    #[cfg(not(fbcode_build))]
-                    Some(Data::TargetPatterns(..)) => true,
-                    #[cfg(not(fbcode_build))]
-                    Some(Data::TargetCfg(..)) => true,
-                    #[cfg(not(fbcode_build))]
-                    Some(Data::CommandOptions(..)) => true,
-                    #[cfg(not(fbcode_build))]
-                    Some(Data::VersionControlRevision(..)) => true,
-                    #[cfg(not(fbcode_build))]
-                    Some(Data::BuckconfigInputValues(..)) => true,
-                    // Required for BuildBuddy build log rendering.
-                    #[cfg(not(fbcode_build))]
-                    Some(Data::ConsoleMessage(..)) => true,
-                    #[cfg(not(fbcode_build))]
-                    Some(Data::ConsoleWarning(..)) => true,
-                    #[cfg(not(fbcode_build))]
-                    Some(Data::StreamingOutput(..)) => true,
-                    #[cfg(not(fbcode_build))]
-                    Some(Data::ActionError(..)) => true,
-                    Some(Data::RageResult(..)) => true,
-                    Some(Data::ReSession(..)) => true,
-                    Some(Data::StructuredError(..)) => true,
-                    Some(Data::PersistEventLogSubprocess(..)) => true,
-                    Some(Data::CleanStaleResult(..)) => true,
-                    Some(Data::ConfigurationCreated(..)) => true,
-                    Some(Data::DetailedAggregatedMetrics(..)) => true,
-                    Some(Data::ResourceControlEvent(..)) => true,
-                    Some(Data::ActionDigestTrace(..)) => true,
-                    None => false,
-                    _ => false,
-                }
-            }
-            Data::Record(r) => {
-                use buck2_data::record_event::Data;
-
-                match r.data {
-                    Some(Data::InvocationRecord(..)) => true,
-                    Some(Data::BuildGraphStats(..)) => true,
-                    None => false,
-                }
-            }
-        }
-    }
-
-    fn should_send_action_execution(&self, action: &ActionExecutionEnd) -> bool {
         #[cfg(not(fbcode_build))]
         let upload_successful_action_events = self.upload_successful_action_events;
         #[cfg(fbcode_build)]
         let upload_successful_action_events = true;
+        #[cfg(not(fbcode_build))]
+        let preserve_bazel_logs = self.preserve_bazel_logs;
+        #[cfg(fbcode_build)]
+        let preserve_bazel_logs = false;
 
-        should_send_action_execution(action, &self.schedule_type, upload_successful_action_events)
+        should_send_event_data(
+            data,
+            &self.schedule_type,
+            upload_successful_action_events,
+            preserve_bazel_logs,
+        )
+    }
+}
+
+fn should_send_event_data(
+    data: &buck2_data::buck_event::Data,
+    schedule_type: &SandcastleScheduleType,
+    upload_successful_action_events: bool,
+    preserve_bazel_logs: bool,
+) -> bool {
+    use buck2_data::buck_event::Data;
+
+    match data {
+        Data::SpanStart(s) => {
+            use buck2_data::span_start_event::Data;
+
+            match &s.data {
+                Some(Data::Command(..)) => true,
+                // Buck2->BuildBuddy OSS integration needs this to capture
+                // metadata sourced from buckconfigs.
+                #[cfg(not(fbcode_build))]
+                Some(Data::CommandCritical(..)) => true,
+                // Buck2->BuildBuddy target mapping uses analysis start to
+                // synthesize target configured events.
+                #[cfg(not(fbcode_build))]
+                Some(Data::Analysis(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(
+                    Data::ActionExecution(..)
+                    | Data::AnalysisStage(..)
+                    | Data::ExecutorStage(..)
+                    | Data::Load(..),
+                ) if preserve_bazel_logs => true,
+                None => false,
+                _ => false,
+            }
+        }
+        Data::SpanEnd(s) => {
+            use buck2_data::span_end_event::Data;
+
+            match &s.data {
+                Some(Data::Command(..)) => true,
+                Some(Data::ActionExecution(a)) => {
+                    if preserve_bazel_logs {
+                        return true;
+                    }
+                    should_send_action_execution(a, schedule_type, upload_successful_action_events)
+                }
+                Some(Data::Analysis(..)) => preserve_bazel_logs || !schedule_type.is_diff(),
+                Some(Data::Load(..)) => true,
+                Some(Data::CacheUpload(..)) => true,
+                Some(Data::DepFileUpload(..)) => true,
+                Some(Data::Materialization(..)) => true,
+                Some(Data::TestDiscovery(..)) => true,
+                Some(Data::TestRun(..)) => true,
+                None => false,
+                _ => false,
+            }
+        }
+        Data::Instant(i) => {
+            use buck2_data::instant_event::Data;
+
+            match i.data {
+                Some(Data::BuildGraphInfo(..)) => true,
+                // Required by BuildBuddy Buck2 mapping for target/test
+                // details and invocation metadata.
+                #[cfg(not(fbcode_build))]
+                Some(Data::TestDiscovery(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::TestResult(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::TargetPatterns(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::TargetCfg(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::CommandOptions(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::VersionControlRevision(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::BuckconfigInputValues(..)) => true,
+                // Required for BuildBuddy build log rendering.
+                #[cfg(not(fbcode_build))]
+                Some(Data::ConsoleMessage(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::ConsoleWarning(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::StreamingOutput(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::ActionError(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::DiceStateSnapshot(..)) if preserve_bazel_logs => true,
+                Some(Data::RageResult(..)) => true,
+                Some(Data::ReSession(..)) => true,
+                Some(Data::StructuredError(..)) => true,
+                Some(Data::PersistEventLogSubprocess(..)) => true,
+                Some(Data::CleanStaleResult(..)) => true,
+                Some(Data::ConfigurationCreated(..)) => true,
+                Some(Data::DetailedAggregatedMetrics(..)) => true,
+                Some(Data::ResourceControlEvent(..)) => true,
+                Some(Data::ActionDigestTrace(..)) => true,
+                None => false,
+                _ => false,
+            }
+        }
+        Data::Record(r) => {
+            use buck2_data::record_event::Data;
+
+            match r.data {
+                Some(Data::InvocationRecord(..)) => true,
+                Some(Data::BuildGraphStats(..)) => true,
+                None => false,
+            }
+        }
     }
 }
 
@@ -670,6 +698,66 @@ mod tests {
         assert!(!should_send_action_execution(
             &successful_remote,
             &schedule_type,
+            false
+        ));
+    }
+
+    #[cfg(not(fbcode_build))]
+    #[test]
+    fn bazel_progress_keeps_successful_action_events_for_converter() {
+        let schedule_type = SandcastleScheduleType::testing_empty();
+        let data = buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+            data: Some(buck2_data::span_end_event::Data::ActionExecution(Box::new(
+                ActionExecutionEnd {
+                    failed: false,
+                    execution_kind: ActionExecutionKind::Remote as i32,
+                    ..Default::default()
+                },
+            ))),
+            ..Default::default()
+        });
+
+        assert!(should_send_event_data(&data, &schedule_type, false, true));
+        assert!(!should_send_event_data(&data, &schedule_type, false, false));
+    }
+
+    #[cfg(not(fbcode_build))]
+    #[test]
+    fn bazel_progress_keeps_progress_source_events() {
+        let schedule_type = SandcastleScheduleType::testing_empty();
+        let action_start = buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+            data: Some(buck2_data::span_start_event::Data::ActionExecution(
+                buck2_data::ActionExecutionStart::default(),
+            )),
+        });
+        let dice_snapshot = buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
+            data: Some(buck2_data::instant_event::Data::DiceStateSnapshot(
+                buck2_data::DiceStateSnapshot::default(),
+            )),
+        });
+
+        assert!(should_send_event_data(
+            &action_start,
+            &schedule_type,
+            false,
+            true
+        ));
+        assert!(should_send_event_data(
+            &dice_snapshot,
+            &schedule_type,
+            false,
+            true
+        ));
+        assert!(!should_send_event_data(
+            &action_start,
+            &schedule_type,
+            false,
+            false
+        ));
+        assert!(!should_send_event_data(
+            &dice_snapshot,
+            &schedule_type,
+            false,
             false
         ));
     }
