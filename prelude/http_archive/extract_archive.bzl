@@ -38,6 +38,7 @@ def _impl(ctx: AnalysisContext) -> list[Provider]:
         exec_deps = ctx.attrs.exec_deps[HttpArchiveExecDeps],
         # no need -- no http involved
         prefer_local = False,
+        resolve_static_crates = False,
     )
 
     return [
