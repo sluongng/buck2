@@ -74,6 +74,7 @@ go_binary = prelude_rule(
         | go_common.import_path_arg()
         | go_common.srcs_arg()
         | go_common.deps_arg()
+        | go_common.cdeps_arg()
         | go_common.link_style_arg()
         | go_common.link_mode_arg()
         | go_common.compiler_flags_arg()
@@ -179,6 +180,7 @@ go_exported_library = prelude_rule(
         | go_common.import_path_arg()
         | go_common.srcs_arg()
         | go_common.deps_arg()
+        | go_common.cdeps_arg()
         | {
             "build_mode": attrs.option(
                 attrs.enum(BuildMode),
@@ -251,6 +253,7 @@ go_library = prelude_rule(
         | go_common.package_name_arg()
         | go_common.import_path_arg()
         | go_common.deps_arg()
+        | go_common.cdeps_arg()
         | go_common.compiler_flags_arg()
         | go_common.assembler_flags_arg()
         | go_common.embed_srcs_arg()
@@ -371,6 +374,7 @@ go_test = prelude_rule(
             ),
         }
         | go_common.deps_arg()
+        | go_common.cdeps_arg()
         | go_common.link_style_arg()
         | go_common.coverage_enabled_arg()
         | go_common.link_mode_arg()
