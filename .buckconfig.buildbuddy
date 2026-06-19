@@ -47,6 +47,9 @@ remote_cache_chunk_cache_dir = buck-out/buildbuddy-re-chunks
 [build]
 execution_platforms = root//buildbuddy:buildbuddy-rbe
 
+[cells]
+buildbuddy_toolchains = buildbuddy/toolchains
+
 [http_archive]
 # Download and extract archives inside remote actions so BuildBuddy RBE owns
 # toolchain preparation instead of depending on the workflow runner's host.
