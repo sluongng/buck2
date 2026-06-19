@@ -38,6 +38,20 @@ def kotlincd_toolchain(name, java_binary_for_kotlincd = None, visibility = None)
         visibility = visibility,
     )
 
+def kotlin_bootstrap_toolchain(name, visibility = None):
+    _kotlin_toolchain_rule(
+        name = name,
+        annotation_processing_jar = "prelude//toolchains/android/third-party:kotlin-annotation-processing-embeddable",
+        compile_kotlin = "prelude//kotlin/tools/compile_kotlin:compile_kotlin",
+        dep_files = "none",
+        kapt_base64_encoder = "prelude//kotlin/tools/kapt_base64_encoder:kapt_base64_encoder",
+        kotlin_stdlib = "prelude//toolchains/android/third-party:kotlin-stdlib",
+        kotlin_version = read_config("kotlin", "kotlin_version", "2.0.0"),
+        kotlinc = "prelude//toolchains/android/third-party:kotlin-compiler-binary",
+        kotlinc_protocol = "classic",
+        visibility = visibility,
+    )
+
 def system_kotlin_bootstrap_toolchain(name, visibility = None):
     _kotlin_toolchain_rule(
         name = name,
