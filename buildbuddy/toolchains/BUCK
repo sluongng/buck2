@@ -7,24 +7,26 @@
 # above-listed licenses.
 
 load("@prelude//tests:test_toolchain.bzl", "noop_test_toolchain")
-load("@prelude//toolchains:dex.bzl", "system_noop_dex_toolchain")
-load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
-load("@prelude//toolchains:haskell.bzl", "system_haskell_toolchain")
+load("@prelude//toolchains:dex.bzl", "noop_dex_toolchain")
+load("@prelude//toolchains:genrule.bzl", "genrule_toolchain")
+load(
+    "@prelude//toolchains:haskell.bzl",
+    "download_ghc_tools",
+    "haskell_toolchain",
+)
 load(
     "@prelude//toolchains:java.bzl",
+    "download_jdk_tools",
+    "java_bootstrap_toolchain",
     "java_test_toolchain",
-    "system_java_bootstrap_toolchain",
-    "system_java_lib",
-    "system_java_tool",
-    "system_prebuilt_jar_bootstrap_toolchain",
+    "prebuilt_jar_bootstrap_toolchain",
 )
-load("@prelude//toolchains:kotlin.bzl", "system_kotlin_bootstrap_toolchain")
-load("@prelude//toolchains:ocaml.bzl", "system_ocaml_toolchain")
+load("@prelude//toolchains:kotlin.bzl", "kotlin_bootstrap_toolchain")
+load("@prelude//toolchains:ocaml.bzl", "ocaml_toolchain")
 load(
     "@prelude//toolchains:python.bzl",
-    "system_python_bootstrap_toolchain",
-    "system_python_toolchain",
-    "system_python_wheel_toolchain",
+    "python_wheel_toolchain",
+    "remote_python_toolchain",
 )
 load("@prelude//toolchains:remote_test_execution.bzl", "remote_test_execution_toolchain")
 load("@prelude//toolchains:rust.bzl", "downloaded_rust_toolchain")
@@ -58,13 +60,19 @@ alias(
     visibility = ["PUBLIC"],
 )
 
-system_genrule_toolchain(
+genrule_toolchain(
     name = "genrule",
+    zip_scrubber = "prelude//toolchains/android/src/com/facebook/buck/util/zip:zip_scrubber_main",
     visibility = ["PUBLIC"],
 )
 
-system_noop_dex_toolchain(
+noop_dex_toolchain(
     name = "empty_dex",
+    visibility = ["PUBLIC"],
+)
+
+noop_dex_toolchain(
+    name = "dex",
     visibility = ["PUBLIC"],
 )
 
@@ -80,85 +88,62 @@ remote_go_proto_toolchain(
     visibility = ["PUBLIC"],
 )
 
-system_haskell_toolchain(
+download_ghc_tools(
+    name = "ghc",
+    visibility = ["PUBLIC"],
+)
+
+haskell_toolchain(
     name = "haskell",
+    compiler = ":ghc_tool",
+    haddock = ":haddock_tool",
+    linker = ":ghc_tool",
+    packager = ":ghc_pkg_tool",
     visibility = ["PUBLIC"],
 )
 
-java_home = read_root_config("java", "java_home", "/usr/lib/jvm/default")
-
-system_java_tool(
-    name = "java_tool",
-    tool_name = java_home + "/bin/java",
+download_jdk_tools(
+    name = "jdk",
     visibility = ["PUBLIC"],
 )
 
-system_java_tool(
-    name = "javac_tool",
-    tool_name = java_home + "/bin/javac",
-    visibility = ["PUBLIC"],
-)
-
-system_java_tool(
-    name = "jar_tool",
-    tool_name = java_home + "/bin/jar",
-    visibility = ["PUBLIC"],
-)
-
-system_java_tool(
-    name = "jlink_tool",
-    tool_name = java_home + "/bin/jlink",
-    visibility = ["PUBLIC"],
-)
-
-system_java_tool(
-    name = "jmod_tool",
-    tool_name = java_home + "/bin/jmod",
-    visibility = ["PUBLIC"],
-)
-
-system_java_lib(
-    name = "jrt_fs_jar",
-    jar = java_home + "/lib/jrt-fs.jar",
-)
-
-system_java_bootstrap_toolchain(
+java_bootstrap_toolchain(
     name = "java",
     java = ":java_tool",
     javac = ":javac_tool",
     jlink = ":jlink_tool",
     jmod = ":jmod_tool",
-    jrt_fs_jar = ":jrt_fs_jar",
+    jrt_fs_jar = ":jdk_archive[jrt_fs_jar]",
     visibility = ["PUBLIC"],
 )
 
-system_java_bootstrap_toolchain(
+java_bootstrap_toolchain(
     name = "java_bootstrap",
     java = ":java_tool",
     javac = ":javac_tool",
     jlink = ":jlink_tool",
     jmod = ":jmod_tool",
-    jrt_fs_jar = ":jrt_fs_jar",
+    jrt_fs_jar = ":jdk_archive[jrt_fs_jar]",
     visibility = ["PUBLIC"],
 )
 
-system_java_bootstrap_toolchain(
+java_bootstrap_toolchain(
     name = "java_for_android",
     java = ":java_tool",
     javac = ":javac_tool",
     jlink = ":jlink_tool",
     jmod = ":jmod_tool",
-    jrt_fs_jar = ":jrt_fs_jar",
+    jrt_fs_jar = ":jdk_archive[jrt_fs_jar]",
     visibility = ["PUBLIC"],
 )
 
-system_java_bootstrap_toolchain(
+java_bootstrap_toolchain(
     name = "java_for_host_test",
     java = ":java_tool",
     javac = ":javac_tool",
     jlink = ":jlink_tool",
     jmod = ":jmod_tool",
-    jrt_fs_jar = ":jrt_fs_jar",
+    jrt_fs_jar = ":jdk_archive[jrt_fs_jar]",
     visibility = ["PUBLIC"],
 )
 
@@ -167,45 +152,63 @@ java_test_toolchain(
     visibility = ["PUBLIC"],
 )
 
-system_prebuilt_jar_bootstrap_toolchain(
+prebuilt_jar_bootstrap_toolchain(
     name = "prebuilt_jar",
     java = ":java_tool",
     visibility = ["PUBLIC"],
 )
 
-system_prebuilt_jar_bootstrap_toolchain(
+prebuilt_jar_bootstrap_toolchain(
     name = "prebuilt_jar_bootstrap",
     java = ":java_tool",
     visibility = ["PUBLIC"],
 )
 
-system_prebuilt_jar_bootstrap_toolchain(
+prebuilt_jar_bootstrap_toolchain(
     name = "prebuilt_jar_bootstrap_no_snapshot",
     java = ":java_tool",
     visibility = ["PUBLIC"],
 )
 
-system_kotlin_bootstrap_toolchain(
+kotlin_bootstrap_toolchain(
+    name = "kotlin",
+    visibility = ["PUBLIC"],
+)
+
+kotlin_bootstrap_toolchain(
     name = "kotlin_bootstrap",
     visibility = ["PUBLIC"],
 )
 
-system_ocaml_toolchain(
+write_file(
+    name = "unsupported_ocaml_tool",
+    content = [
+        "#!/usr/bin/env bash",
+        "echo 'BuildBuddy OCaml toolchain is not pinned yet' >&2",
+        "echo 'Add a hermetic opam switch archive before building OCaml remotely.' >&2",
+        "exit 1",
+    ],
+    is_executable = True,
+    out = "unsupported_ocaml_tool.sh",
+)
+
+ocaml_toolchain(
     name = "ocaml",
+    dep_tool = ":unsupported_ocaml_tool",
+    lex_compiler = ":unsupported_ocaml_tool",
+    menhir_compiler = ":unsupported_ocaml_tool",
+    ocaml_bytecode_compiler = ":unsupported_ocaml_tool",
+    ocaml_compiler = ":unsupported_ocaml_tool",
+    yacc_compiler = ":unsupported_ocaml_tool",
     visibility = ["PUBLIC"],
 )
 
-system_python_toolchain(
+remote_python_toolchain(
     name = "python",
     visibility = ["PUBLIC"],
 )
 
-system_python_bootstrap_toolchain(
-    name = "python_bootstrap",
-    visibility = ["PUBLIC"],
-)
-
-system_python_wheel_toolchain(
+python_wheel_toolchain(
     name = "python_wheel",
     visibility = ["PUBLIC"],
 )
