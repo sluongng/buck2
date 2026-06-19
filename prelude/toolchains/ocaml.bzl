@@ -12,6 +12,34 @@ load(
     "OCamlToolchainInfo",
 )
 
+def _optional_run_info(value):
+    return value[RunInfo] if value != None else None
+
+def _ocaml_toolchain_impl(ctx):
+    return [
+        DefaultInfo(),
+        OCamlToolchainInfo(
+            ocaml_compiler = ctx.attrs.ocaml_compiler[RunInfo],
+            binutils_ld = _optional_run_info(ctx.attrs.binutils_ld),
+            binutils_as = _optional_run_info(ctx.attrs.binutils_as),
+            dep_tool = ctx.attrs.dep_tool[RunInfo],
+            yacc_compiler = ctx.attrs.yacc_compiler[RunInfo],
+            interop_includes = None,
+            menhir_compiler = ctx.attrs.menhir_compiler[RunInfo],
+            lex_compiler = ctx.attrs.lex_compiler[RunInfo],
+            libc = None,
+            ocaml_bytecode_compiler = ctx.attrs.ocaml_bytecode_compiler[RunInfo],
+            debug = _optional_run_info(ctx.attrs.debug),
+            warnings_flags = ctx.attrs.warnings_flags,
+            ocaml_compiler_flags = ctx.attrs.ocaml_compiler_flags,
+            ocamlc_flags = ctx.attrs.ocamlc_flags,
+            ocamlopt_flags = ctx.attrs.ocamlopt_flags,
+            runtime_dep_link_flags = ctx.attrs.runtime_dep_link_flags,
+            runtime_dep_link_extras = ctx.attrs.runtime_dep_link_extras,
+        ),
+        OCamlPlatformInfo(name = ctx.attrs.platform_name),
+    ]
+
 def _system_ocaml_toolchain_impl(_ctx):
     """
     A very simple toolchain that is hardcoded to the current environment.
@@ -58,5 +86,28 @@ def _system_ocaml_toolchain_impl(_ctx):
 system_ocaml_toolchain = rule(
     impl = _system_ocaml_toolchain_impl,
     attrs = {},
+    is_toolchain_rule = True,
+)
+
+ocaml_toolchain = rule(
+    impl = _ocaml_toolchain_impl,
+    attrs = {
+        "binutils_as": attrs.option(attrs.dep(providers = [RunInfo]), default = None),
+        "binutils_ld": attrs.option(attrs.dep(providers = [RunInfo]), default = None),
+        "debug": attrs.option(attrs.dep(providers = [RunInfo]), default = None),
+        "dep_tool": attrs.dep(providers = [RunInfo]),
+        "lex_compiler": attrs.dep(providers = [RunInfo]),
+        "menhir_compiler": attrs.dep(providers = [RunInfo]),
+        "ocaml_bytecode_compiler": attrs.dep(providers = [RunInfo]),
+        "ocaml_compiler": attrs.dep(providers = [RunInfo]),
+        "ocaml_compiler_flags": attrs.list(attrs.arg(), default = []),
+        "ocamlc_flags": attrs.list(attrs.arg(), default = []),
+        "ocamlopt_flags": attrs.list(attrs.arg(), default = []),
+        "platform_name": attrs.string(default = "x86_64"),
+        "runtime_dep_link_extras": attrs.list(attrs.arg(), default = []),
+        "runtime_dep_link_flags": attrs.list(attrs.arg(), default = ["-ldl", "-lpthread", "-lzstd"]),
+        "warnings_flags": attrs.string(default = "-4-29-35-41-42-44-45-48-50-58-70"),
+        "yacc_compiler": attrs.dep(providers = [RunInfo]),
+    },
     is_toolchain_rule = True,
 )
