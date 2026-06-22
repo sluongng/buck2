@@ -26,6 +26,19 @@ def _deps_arg():
         ),
     }
 
+def _cdeps_arg():
+    return {
+        "cdeps": attrs.list(
+            attrs.dep(),
+            default = [],
+            doc = """
+    The set of C/C++ dependencies needed by this rule's cgo sources. These dependencies provide
+     headers, preprocessor flags, linker inputs, and runtime shared libraries, but are not treated as
+     Go package dependencies.
+""",
+        ),
+    }
+
 def _srcs_arg():
     return {
         "srcs": attrs.list(
@@ -85,8 +98,22 @@ def _package_name_arg():
             attrs.string(),
             default = None,
             doc = """
-    Sets the full name of the package being compiled. This defaults to the path from the buck root.
+    Sets the import path of the package being compiled. This defaults to the path from the buck root.
      (e.g. given a ./.buckconfig, a rule in ./a/b/BUCK defaults to package "a/b")
+
+     Prefer import_path for new targets. package_name is kept for compatibility.
+""",
+        ),
+    }
+
+def _import_path_arg():
+    return {
+        "import_path": attrs.option(
+            attrs.string(),
+            default = None,
+            doc = """
+    Sets the Go import path of the package being compiled. This defaults to the path from the buck
+     root. If both import_path and package_name are set, they must be equal.
 """,
         ),
     }
@@ -244,11 +271,13 @@ def _coverage_enabled():
 
 go_common = struct(
     deps_arg = _deps_arg,
+    cdeps_arg = _cdeps_arg,
     srcs_arg = _srcs_arg,
     package_root_arg = _package_root_arg,
     link_style_arg = _link_style_arg,
     link_mode_arg = _link_mode_arg,
     package_name_arg = _package_name_arg,
+    import_path_arg = _import_path_arg,
     compiler_flags_arg = _compiler_flags_arg,
     assembler_flags_arg = _assembler_flags_arg,
     linker_flags_arg = _linker_flags_arg,
