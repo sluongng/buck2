@@ -15,7 +15,7 @@ prelude.go_binary(
     srcs = ["main.go"],
     headers = ["lib.h"],
     header_namespace = "",
-    deps = [":clib"],
+    cdeps = [":clib"],
 )
 
 py_assertion(
