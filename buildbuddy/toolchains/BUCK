@@ -1,0 +1,236 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is dual-licensed under either the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree or the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree. You may select, at your option, one of the
+# above-listed licenses.
+
+load("@prelude//tests:test_toolchain.bzl", "noop_test_toolchain")
+load("@prelude//toolchains:dex.bzl", "noop_dex_toolchain")
+load("@prelude//toolchains:genrule.bzl", "genrule_toolchain")
+load(
+    "@prelude//toolchains:haskell.bzl",
+    "download_ghc_tools",
+    "haskell_toolchain",
+)
+load(
+    "@prelude//toolchains:java.bzl",
+    "download_jdk_tools",
+    "java_bootstrap_toolchain",
+    "java_test_toolchain",
+    "prebuilt_jar_bootstrap_toolchain",
+)
+load("@prelude//toolchains:kotlin.bzl", "kotlin_bootstrap_toolchain")
+load("@prelude//toolchains:ocaml.bzl", "ocaml_toolchain")
+load(
+    "@prelude//toolchains:python.bzl",
+    "python_wheel_toolchain",
+    "remote_python_toolchain",
+)
+load("@prelude//toolchains:remote_test_execution.bzl", "remote_test_execution_toolchain")
+load("@prelude//toolchains:rust.bzl", "downloaded_rust_toolchain")
+load("@prelude//toolchains:zip_file.bzl", "zip_file_toolchain")
+load("@prelude//toolchains/cxx/llvm:defs.bzl", "cxx_llvm_toolchain", "download_llvm_distribution")
+load("@prelude//toolchains/go:defs.bzl", "download_go_toolchains")
+load("@prelude//toolchains/go:remote_go_proto_toolchain.bzl", "remote_go_proto_toolchain")
+
+oncall("build_infra")
+
+download_llvm_distribution(
+    name = "llvm_dist",
+    # BuildBuddy RBE images have tar/gzip but do not provide a zstd CLI.
+    archive_type = "tar.gz",
+    sha256 = "3590e82cd56ff58cdf71732b0fbc3eb8f21d4fc00b8592d1329af522381f08cc",
+    target = "linux-amd64-musl",
+    url = "https://github.com/sluongng/buck2/releases/download/v0.202624.0/llvm-toolchain-minimal-22.1.7-linux-amd64-musl.tar.gz",
+)
+
+cxx_llvm_toolchain(
+    name = "cxx",
+    cxx_compiler_flags = ["-std=c++20"],
+    distribution = ":llvm_dist",
+    target = "x86_64-unknown-linux-gnu",
+    visibility = ["PUBLIC"],
+)
+
+alias(
+    name = "cxx_no_default_deps",
+    actual = ":cxx",
+    visibility = ["PUBLIC"],
+)
+
+genrule_toolchain(
+    name = "genrule",
+    zip_scrubber = "prelude//toolchains/android/src/com/facebook/buck/util/zip:zip_scrubber_main",
+    visibility = ["PUBLIC"],
+)
+
+noop_dex_toolchain(
+    name = "empty_dex",
+    visibility = ["PUBLIC"],
+)
+
+noop_dex_toolchain(
+    name = "dex",
+    visibility = ["PUBLIC"],
+)
+
+download_go_toolchains(
+    version = "1.24.4",
+    remote_download = True,
+    visibility = ["PUBLIC"],
+)
+
+remote_go_proto_toolchain(
+    name = "go_proto",
+    remote_download = True,
+    visibility = ["PUBLIC"],
+)
+
+download_ghc_tools(
+    name = "ghc",
+    visibility = ["PUBLIC"],
+)
+
+haskell_toolchain(
+    name = "haskell",
+    compiler = ":ghc_tool",
+    haddock = ":haddock_tool",
+    linker = ":ghc_tool",
+    packager = ":ghc_pkg_tool",
+    visibility = ["PUBLIC"],
+)
+
+download_jdk_tools(
+    name = "jdk",
+    visibility = ["PUBLIC"],
+)
+
+java_bootstrap_toolchain(
+    name = "java",
+    java = ":java_tool",
+    javac = ":javac_tool",
+    jlink = ":jlink_tool",
+    jmod = ":jmod_tool",
+    jrt_fs_jar = ":jdk_archive[jrt_fs_jar]",
+    visibility = ["PUBLIC"],
+)
+
+java_bootstrap_toolchain(
+    name = "java_bootstrap",
+    java = ":java_tool",
+    javac = ":javac_tool",
+    jlink = ":jlink_tool",
+    jmod = ":jmod_tool",
+    jrt_fs_jar = ":jdk_archive[jrt_fs_jar]",
+    visibility = ["PUBLIC"],
+)
+
+java_bootstrap_toolchain(
+    name = "java_for_android",
+    java = ":java_tool",
+    javac = ":javac_tool",
+    jlink = ":jlink_tool",
+    jmod = ":jmod_tool",
+    jrt_fs_jar = ":jdk_archive[jrt_fs_jar]",
+    visibility = ["PUBLIC"],
+)
+
+java_bootstrap_toolchain(
+    name = "java_for_host_test",
+    java = ":java_tool",
+    javac = ":javac_tool",
+    jlink = ":jlink_tool",
+    jmod = ":jmod_tool",
+    jrt_fs_jar = ":jdk_archive[jrt_fs_jar]",
+    visibility = ["PUBLIC"],
+)
+
+java_test_toolchain(
+    name = "java_test",
+    visibility = ["PUBLIC"],
+)
+
+prebuilt_jar_bootstrap_toolchain(
+    name = "prebuilt_jar",
+    java = ":java_tool",
+    visibility = ["PUBLIC"],
+)
+
+prebuilt_jar_bootstrap_toolchain(
+    name = "prebuilt_jar_bootstrap",
+    java = ":java_tool",
+    visibility = ["PUBLIC"],
+)
+
+prebuilt_jar_bootstrap_toolchain(
+    name = "prebuilt_jar_bootstrap_no_snapshot",
+    java = ":java_tool",
+    visibility = ["PUBLIC"],
+)
+
+kotlin_bootstrap_toolchain(
+    name = "kotlin",
+    visibility = ["PUBLIC"],
+)
+
+kotlin_bootstrap_toolchain(
+    name = "kotlin_bootstrap",
+    visibility = ["PUBLIC"],
+)
+
+write_file(
+    name = "unsupported_ocaml_tool",
+    content = [
+        "#!/usr/bin/env bash",
+        "echo 'BuildBuddy OCaml toolchain is not pinned yet' >&2",
+        "echo 'Add a hermetic opam switch archive before building OCaml remotely.' >&2",
+        "exit 1",
+    ],
+    is_executable = True,
+    out = "unsupported_ocaml_tool.sh",
+)
+
+ocaml_toolchain(
+    name = "ocaml",
+    dep_tool = ":unsupported_ocaml_tool",
+    lex_compiler = ":unsupported_ocaml_tool",
+    menhir_compiler = ":unsupported_ocaml_tool",
+    ocaml_bytecode_compiler = ":unsupported_ocaml_tool",
+    ocaml_compiler = ":unsupported_ocaml_tool",
+    yacc_compiler = ":unsupported_ocaml_tool",
+    visibility = ["PUBLIC"],
+)
+
+remote_python_toolchain(
+    name = "python",
+    visibility = ["PUBLIC"],
+)
+
+python_wheel_toolchain(
+    name = "python_wheel",
+    visibility = ["PUBLIC"],
+)
+
+downloaded_rust_toolchain(
+    name = "rust",
+    default_edition = "2024",
+    rust_toolchain = "root//:rust-toolchain",
+    visibility = ["PUBLIC"],
+)
+
+remote_test_execution_toolchain(
+    name = "remote_test_execution",
+    visibility = ["PUBLIC"],
+)
+
+noop_test_toolchain(
+    name = "test",
+    visibility = ["PUBLIC"],
+)
+
+zip_file_toolchain(
+    name = "zip_file",
+    visibility = ["PUBLIC"],
+)
