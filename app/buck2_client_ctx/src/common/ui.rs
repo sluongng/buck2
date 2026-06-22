@@ -74,6 +74,7 @@ pub fn get_console_with_root(
     command_name: &str,
     config: SuperConsoleConfig,
     health_check_display_reports_receiver: Option<Receiver<Vec<DisplayReport>>>,
+    bes_results_url: Option<String>,
 ) -> (Box<dyn EventSubscriber>, bool) {
     let result: buck2_error::Result<(Box<dyn EventSubscriber>, bool)> = match console_type {
         ConsoleType::Simple => Ok((
@@ -82,6 +83,7 @@ pub fn get_console_with_root(
                 verbosity,
                 expect_spans,
                 health_check_display_reports_receiver,
+                bes_results_url,
             )),
             false,
         )),
@@ -91,6 +93,7 @@ pub fn get_console_with_root(
                 verbosity,
                 expect_spans,
                 health_check_display_reports_receiver,
+                bes_results_url,
             )),
             false,
         )),
@@ -100,6 +103,7 @@ pub fn get_console_with_root(
                 verbosity,
                 expect_spans,
                 health_check_display_reports_receiver,
+                bes_results_url,
             )),
             false,
         )),
@@ -112,6 +116,7 @@ pub fn get_console_with_root(
             None,
             config,
             health_check_display_reports_receiver,
+            bes_results_url,
         )
         .map(|c| (Box::new(c) as Box<dyn EventSubscriber>, true)),
         ConsoleType::Auto => match StatefulSuperConsole::console_builder().build() {
@@ -124,6 +129,7 @@ pub fn get_console_with_root(
                 timekeeper,
                 config,
                 health_check_display_reports_receiver,
+                bes_results_url.clone(),
             )
             .map(|c| (Box::new(c) as Box<dyn EventSubscriber>, true)),
             _ => Ok((
@@ -132,6 +138,7 @@ pub fn get_console_with_root(
                     verbosity,
                     expect_spans,
                     health_check_display_reports_receiver,
+                    bes_results_url,
                 )),
                 false,
             )),
@@ -150,6 +157,7 @@ pub fn get_console_with_root(
                     verbosity,
                     expect_spans,
                     // Maybe refactor and set this.
+                    None,
                     None,
                 )),
                 false,
