@@ -1422,7 +1422,7 @@ impl BazelEventConverter {
 
         match span_end.data.as_ref() {
             Some(buck2_data::span_end_event::Data::Command(command)) => {
-                self.emit_pending_pattern_expanded(&[], events);
+                self.emit_pending_pattern_expanded(&[], events, true);
                 self.emit_completed_updates_for_actions(events);
                 self.push_convenience_symlinks_identified(&[], events);
                 self.push_finished(finished_event_from_command_end(event, command), events);
@@ -1712,7 +1712,7 @@ impl BazelEventConverter {
             Some(buck2_data::record_event::Data::InvocationRecord(record)) => {
                 self.remember_invocation_target_patterns(record);
                 self.emit_invocation_command_context(event, record, events);
-                self.emit_pending_pattern_expanded(&[], events);
+                self.emit_pending_pattern_expanded(&[], events, true);
                 self.emit_completed_updates_for_actions(events);
                 events.push(self.build_metadata_event(&build_metadata_from_invocation(record)));
                 self.push_convenience_symlinks_identified(&[], events);
@@ -1737,7 +1737,7 @@ impl BazelEventConverter {
                 );
             }
             Some(buck2_data::record_event::Data::BuildGraphStats(stats)) => {
-                self.emit_pending_pattern_expanded(&stats.build_targets, events);
+                self.emit_pending_pattern_expanded(&stats.build_targets, events, false);
                 for target in &stats.build_targets {
                     if let Some(key) = target_key_from_build_target(target) {
                         self.top_level_targets.insert(key);
@@ -1934,6 +1934,7 @@ impl BazelEventConverter {
         &mut self,
         targets: &[buck2_data::BuildTarget],
         events: &mut Vec<bep::BuildEvent>,
+        force: bool,
     ) {
         if self.pattern_expanded_emitted {
             self.flush_pending_target_setup(events);
@@ -1948,6 +1949,9 @@ impl BazelEventConverter {
         } else {
             configured_target_children_from_build_targets(targets)
         };
+        if !force && self.should_defer_target_setup() && children.is_empty() {
+            return;
+        }
         events.push(pattern_expanded_event(patterns, children));
         self.pattern_expanded_emitted = true;
         self.flush_pending_target_setup(events);
@@ -1986,7 +1990,7 @@ impl BazelEventConverter {
             return;
         }
         let mut setup = Vec::new();
-        self.emit_pending_pattern_expanded(&[], &mut setup);
+        self.emit_pending_pattern_expanded(&[], &mut setup, true);
         events.splice(0..0, setup);
     }
 
@@ -9298,8 +9302,26 @@ mod tests {
             Some(build_event::Payload::WorkspaceStatus(_))
         )));
 
-        let discovery_events = converter.convert(
+        let build_graph_events = converter.convert(
             2,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::BuildGraphStats(
+                        buck2_data::BuildGraphStats {
+                            build_targets: Vec::new(),
+                        },
+                    )),
+                },
+            )),
+        );
+        assert!(
+            !build_graph_events
+                .iter()
+                .any(|event| matches!(event.payload, Some(build_event::Payload::Expanded(_))))
+        );
+
+        let discovery_events = converter.convert(
+            3,
             &trace_event(buck2_data::buck_event::Data::SpanStart(
                 buck2_data::SpanStartEvent {
                     data: Some(buck2_data::span_start_event::Data::TestDiscovery(
@@ -9319,7 +9341,7 @@ mod tests {
         );
 
         let test_events = converter.convert(
-            3,
+            4,
             &trace_event(buck2_data::buck_event::Data::SpanEnd(
                 buck2_data::SpanEndEvent {
                     data: Some(buck2_data::span_end_event::Data::TestRun(
