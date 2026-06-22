@@ -1230,6 +1230,9 @@ pub(crate) struct BazelEventConverter {
     posted_event_ids: BTreeSet<Vec<u8>>,
     pending_patterns: Option<Vec<String>>,
     pattern_expanded_emitted: bool,
+    defer_target_setup_until_first_result: bool,
+    pending_workspace_status: Option<bep::BuildEvent>,
+    pending_configured_events: Vec<bep::BuildEvent>,
     final_progress_emitted: bool,
     emitted_build_tool_logs: bool,
     emitted_convenience_symlinks: bool,
@@ -1308,6 +1311,8 @@ impl BazelEventConverter {
             events.push(self.progress_event(sequence_hint, None, Some(progress)));
         }
 
+        self.emit_pending_target_setup_before_target_events(&mut events);
+
         if !self.saw_started {
             if should_buffer_before_started(event) {
                 self.pending_pre_start_events.extend(events);
@@ -1355,6 +1360,9 @@ impl BazelEventConverter {
                     self.saw_started = true;
                 }
                 self.remember_cli_target_patterns(command);
+                self.defer_target_setup_until_first_result =
+                    is_test_or_coverage_command(&command_name(command))
+                        && self.pending_patterns.is_some();
                 events.push(unstructured_command_line_event(command));
                 events.push(original_structured_command_line_event(command));
                 events.push(canonical_structured_command_line_event(command));
@@ -1362,7 +1370,10 @@ impl BazelEventConverter {
                 events.push(options_parsed_event(command));
                 events.push(default_configuration_event());
                 events.push(workspace_info_event(command));
-                events.push(workspace_status_event(command, event.timestamp.as_ref()));
+                self.push_or_defer_workspace_status(
+                    workspace_status_event(command, event.timestamp.as_ref()),
+                    events,
+                );
                 events.push(build_metadata_event(&build_metadata_from_command(
                     command,
                     &self.build_metadata,
@@ -1411,8 +1422,8 @@ impl BazelEventConverter {
 
         match span_end.data.as_ref() {
             Some(buck2_data::span_end_event::Data::Command(command)) => {
-                self.emit_completed_updates_for_actions(events);
                 self.emit_pending_pattern_expanded(&[], events);
+                self.emit_completed_updates_for_actions(events);
                 self.push_convenience_symlinks_identified(&[], events);
                 self.push_finished(finished_event_from_command_end(event, command), events);
                 self.push_final_progress(events);
@@ -1831,6 +1842,8 @@ impl BazelEventConverter {
 
         let command_name = invocation_command_name(record);
         let metadata = invocation_metadata(record);
+        self.defer_target_setup_until_first_result =
+            is_test_or_coverage_command(&command_name) && self.pending_patterns.is_some();
         self.push_unposted_event(
             unstructured_command_line_event_from_args(&record.cli_args),
             events,
@@ -1854,7 +1867,7 @@ impl BazelEventConverter {
         );
         self.push_unposted_event(default_configuration_event(), events);
         self.push_unposted_event(workspace_info_event_from_metadata(metadata), events);
-        self.push_unposted_event(
+        self.push_or_defer_workspace_status(
             workspace_status_event_from_invocation(record, event.timestamp.as_ref()),
             events,
         );
@@ -1923,16 +1936,58 @@ impl BazelEventConverter {
         events: &mut Vec<bep::BuildEvent>,
     ) {
         if self.pattern_expanded_emitted {
+            self.flush_pending_target_setup(events);
             return;
         }
         let Some(patterns) = self.pending_patterns.clone() else {
+            self.flush_pending_target_setup(events);
             return;
         };
-        events.push(pattern_expanded_event(
-            patterns,
-            configured_target_children_from_build_targets(targets),
-        ));
+        let children = if targets.is_empty() {
+            configured_target_children_from_events(&self.pending_configured_events)
+        } else {
+            configured_target_children_from_build_targets(targets)
+        };
+        events.push(pattern_expanded_event(patterns, children));
         self.pattern_expanded_emitted = true;
+        self.flush_pending_target_setup(events);
+    }
+
+    fn push_or_defer_workspace_status(
+        &mut self,
+        event: bep::BuildEvent,
+        events: &mut Vec<bep::BuildEvent>,
+    ) {
+        if self.should_defer_target_setup() {
+            self.pending_workspace_status = Some(event);
+        } else {
+            self.push_unposted_event(event, events);
+        }
+    }
+
+    fn flush_pending_target_setup(&mut self, events: &mut Vec<bep::BuildEvent>) {
+        events.extend(std::mem::take(&mut self.pending_configured_events));
+        if let Some(event) = self.pending_workspace_status.take() {
+            events.push(event);
+        }
+    }
+
+    fn emit_pending_target_setup_before_target_events(
+        &mut self,
+        events: &mut Vec<bep::BuildEvent>,
+    ) {
+        if !self.defer_target_setup_until_first_result {
+            return;
+        }
+        if self.pending_configured_events.is_empty() {
+            return;
+        }
+        if !events.iter().any(is_target_lifecycle_event) {
+            return;
+        }
+        let mut setup = Vec::new();
+        self.emit_pending_pattern_expanded(&[], &mut setup);
+        events.splice(0..0, setup);
     }
 
     fn push_configured_event(
@@ -1959,7 +2014,17 @@ impl BazelEventConverter {
         }
         self.emitted_configured_targets
             .insert(id.label.clone(), signature);
+        if self.should_defer_target_setup() {
+            self.pending_configured_events.push(event);
+            return;
+        }
         events.push(event);
+    }
+
+    fn should_defer_target_setup(&self) -> bool {
+        self.defer_target_setup_until_first_result
+            && self.pending_patterns.is_some()
+            && !self.pattern_expanded_emitted
     }
 
     fn started_event(
@@ -3192,6 +3257,10 @@ fn command_name(command: &buck2_data::CommandStart) -> String {
 
 fn command_end_name(command: &buck2_data::CommandEnd) -> &'static str {
     command_end_name_opt(command).unwrap_or("unknown")
+}
+
+fn is_test_or_coverage_command(command_name: &str) -> bool {
+    matches!(command_name, "test" | "coverage")
 }
 
 fn command_end_name_opt(command: &buck2_data::CommandEnd) -> Option<&'static str> {
@@ -5739,6 +5808,19 @@ fn configured_target_children_from_build_targets(
         .collect()
 }
 
+fn configured_target_children_from_events(events: &[bep::BuildEvent]) -> Vec<bep::BuildEventId> {
+    events
+        .iter()
+        .filter_map(|event| match event.id.as_ref()?.id.as_ref()? {
+            build_event_id::Id::TargetConfigured(id) => Some(id.label.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(target_configured_id)
+        .collect()
+}
+
 fn pattern_expanded_event(
     patterns: Vec<String>,
     children: Vec<bep::BuildEventId>,
@@ -6105,6 +6187,19 @@ fn finished_event(
 
 fn is_build_finished_event(event: &bep::BuildEvent) -> bool {
     matches!(event.payload, Some(build_event::Payload::Finished(_)))
+}
+
+fn is_target_lifecycle_event(event: &bep::BuildEvent) -> bool {
+    matches!(
+        event.payload,
+        Some(
+            build_event::Payload::Action(_)
+                | build_event::Payload::Completed(_)
+                | build_event::Payload::TestResult(_)
+                | build_event::Payload::TestSummary(_)
+                | build_event::Payload::Aborted(_)
+        )
+    )
 }
 
 fn finished_event_signature(event: &bep::BuildEvent) -> Option<FinishedEventSignature> {
@@ -9169,6 +9264,132 @@ mod tests {
                     Some(build_event::Payload::Aborted(_))
                 )
         }));
+    }
+
+    #[test]
+    fn test_command_patterns_expand_before_test_results() {
+        let mut converter = BazelEventConverter::default();
+        let target = configured_target();
+        let pattern_id = pattern_expanded_id(vec!["//pkg:main".to_owned()]);
+        let target_id = target_configured_id("//pkg:main".to_owned());
+
+        let start_events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanStart(
+                buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::Command(
+                        buck2_data::CommandStart {
+                            cli_args: vec![
+                                "buck2".to_owned(),
+                                "test".to_owned(),
+                                "//pkg:main".to_owned(),
+                            ],
+                            data: Some(buck2_data::command_start::Data::Test(
+                                buck2_data::TestCommandStart {},
+                            )),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )),
+        );
+        assert!(!start_events.iter().any(|event| matches!(
+            event.payload,
+            Some(build_event::Payload::WorkspaceStatus(_))
+        )));
+
+        let discovery_events = converter.convert(
+            2,
+            &trace_event(buck2_data::buck_event::Data::SpanStart(
+                buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::TestDiscovery(
+                        buck2_data::TestDiscoveryStart {
+                            suite_name: "suite".to_owned(),
+                            target_label: Some(target.clone()),
+                            labels: vec!["ci".to_owned()],
+                        },
+                    )),
+                },
+            )),
+        );
+        assert!(
+            !discovery_events
+                .iter()
+                .any(|event| matches!(event.payload, Some(build_event::Payload::Configured(_))))
+        );
+
+        let test_events = converter.convert(
+            3,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::TestRun(
+                        buck2_data::TestRunEnd {
+                            suite: Some(buck2_data::TestSuite {
+                                suite_name: "suite".to_owned(),
+                                test_names: vec!["test_passes".to_owned()],
+                                target_label: Some(target),
+                                labels: vec!["ci".to_owned()],
+                            }),
+                            command_report: Some(buck2_data::CommandExecution {
+                                details: Some(buck2_data::CommandExecutionDetails {
+                                    signed_exit_code: Some(0),
+                                    cmd_stdout: "test stdout".to_owned(),
+                                    command_kind: Some(buck2_data::CommandExecutionKind {
+                                        command: Some(
+                                            buck2_data::command_execution_kind::Command::LocalCommand(
+                                                buck2_data::LocalCommand {
+                                                    argv: vec!["test-binary".to_owned()],
+                                                    ..Default::default()
+                                                },
+                                            ),
+                                        ),
+                                    }),
+                                    ..Default::default()
+                                }),
+                                status: Some(buck2_data::command_execution::Status::Success(
+                                    buck2_data::command_execution::Success {},
+                                )),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+        );
+
+        let expanded_index = test_events
+            .iter()
+            .position(|event| event.id.as_ref() == Some(&pattern_id))
+            .expect("PatternExpanded event");
+        assert!(test_events[expanded_index].children.contains(&target_id));
+        let configured_index = test_events
+            .iter()
+            .position(|event| matches!(event.payload, Some(build_event::Payload::Configured(_))))
+            .expect("TargetConfigured event");
+        let workspace_status_index = test_events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event.payload,
+                    Some(build_event::Payload::WorkspaceStatus(_))
+                )
+            })
+            .expect("WorkspaceStatus event");
+        let test_result_index = test_events
+            .iter()
+            .position(|event| matches!(event.payload, Some(build_event::Payload::TestResult(_))))
+            .expect("TestResult event");
+        let test_summary_index = test_events
+            .iter()
+            .position(|event| matches!(event.payload, Some(build_event::Payload::TestSummary(_))))
+            .expect("TestSummary event");
+
+        assert!(expanded_index < configured_index);
+        assert!(configured_index < workspace_status_index);
+        assert!(workspace_status_index < test_result_index);
+        assert!(test_result_index < test_summary_index);
     }
 
     #[test]
