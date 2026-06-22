@@ -1518,6 +1518,11 @@ impl BazelEventConverter {
                 );
             }
             Some(buck2_data::span_end_event::Data::TestRun(test_end)) => {
+                if self.should_defer_target_setup()
+                    && let Some(suite) = test_end.suite.as_ref()
+                {
+                    self.push_configured_event(configured_event_from_test_suite(suite), events);
+                }
                 if let Some(result) =
                     self.test_result_event_from_test_end(event, span_end, test_end)
                 {
@@ -9560,6 +9565,126 @@ mod tests {
             .expect("TestResult event");
 
         assert!(expanded_index < workspace_status_index);
+        assert!(workspace_status_index < test_result_index);
+    }
+
+    #[test]
+    fn test_command_patterns_expand_from_first_test_result_without_discovery() {
+        let mut converter = BazelEventConverter::default();
+        let target = configured_target();
+        let pattern_id = pattern_expanded_id(vec!["//pkg:main".to_owned()]);
+        let target_id = target_configured_id("//pkg:main".to_owned());
+
+        converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanStart(
+                buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::Command(
+                        buck2_data::CommandStart {
+                            cli_args: vec!["buck2".to_owned(), "test".to_owned()],
+                            data: Some(buck2_data::command_start::Data::Test(
+                                buck2_data::TestCommandStart {},
+                            )),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )),
+        );
+
+        converter.convert(
+            2,
+            &trace_event(buck2_data::buck_event::Data::Instant(
+                buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::TargetPatterns(
+                        buck2_data::ParsedTargetPatterns {
+                            target_patterns: vec![buck2_data::TargetPattern {
+                                value: "//pkg:main".to_owned(),
+                            }],
+                        },
+                    )),
+                },
+            )),
+        );
+
+        converter.convert(
+            3,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::BuildGraphStats(
+                        buck2_data::BuildGraphStats {
+                            build_targets: Vec::new(),
+                        },
+                    )),
+                },
+            )),
+        );
+
+        let test_events = converter.convert(
+            4,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::TestRun(
+                        buck2_data::TestRunEnd {
+                            suite: Some(buck2_data::TestSuite {
+                                suite_name: "suite".to_owned(),
+                                test_names: vec!["test_passes".to_owned()],
+                                target_label: Some(target),
+                                labels: vec!["ci".to_owned()],
+                            }),
+                            command_report: Some(buck2_data::CommandExecution {
+                                details: Some(buck2_data::CommandExecutionDetails {
+                                    signed_exit_code: Some(0),
+                                    command_kind: Some(buck2_data::CommandExecutionKind {
+                                        command: Some(
+                                            buck2_data::command_execution_kind::Command::LocalCommand(
+                                                buck2_data::LocalCommand {
+                                                    argv: vec!["test-binary".to_owned()],
+                                                    ..Default::default()
+                                                },
+                                            ),
+                                        ),
+                                    }),
+                                    ..Default::default()
+                                }),
+                                status: Some(buck2_data::command_execution::Status::Success(
+                                    buck2_data::command_execution::Success {},
+                                )),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+        );
+
+        let expanded_index = test_events
+            .iter()
+            .position(|event| event.id.as_ref() == Some(&pattern_id))
+            .expect("PatternExpanded event");
+        assert!(test_events[expanded_index].children.contains(&target_id));
+        let configured_index = test_events
+            .iter()
+            .position(|event| matches!(event.payload, Some(build_event::Payload::Configured(_))))
+            .expect("TargetConfigured event");
+        let workspace_status_index = test_events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event.payload,
+                    Some(build_event::Payload::WorkspaceStatus(_))
+                )
+            })
+            .expect("WorkspaceStatus event");
+        let test_result_index = test_events
+            .iter()
+            .position(|event| matches!(event.payload, Some(build_event::Payload::TestResult(_))))
+            .expect("TestResult event");
+
+        assert!(expanded_index < configured_index);
+        assert!(configured_index < workspace_status_index);
         assert!(workspace_status_index < test_result_index);
     }
 
