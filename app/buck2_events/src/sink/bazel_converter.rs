@@ -1228,6 +1228,7 @@ pub(crate) struct BazelEventConverter {
     test_timeouts: BTreeMap<TargetKey, prost_types::Duration>,
     announced_event_ids: BTreeMap<Vec<u8>, bep::BuildEventId>,
     posted_event_ids: BTreeSet<Vec<u8>>,
+    configured_target_labels: BTreeSet<String>,
     pending_patterns: Option<Vec<String>>,
     pattern_expanded_emitted: bool,
     defer_target_setup_until_first_result: bool,
@@ -1361,8 +1362,7 @@ impl BazelEventConverter {
                 }
                 self.remember_cli_target_patterns(command);
                 self.defer_target_setup_until_first_result =
-                    is_test_or_coverage_command(&command_name(command))
-                        && self.pending_patterns.is_some();
+                    is_test_or_coverage_command(&command_name(command));
                 events.push(unstructured_command_line_event(command));
                 events.push(original_structured_command_line_event(command));
                 events.push(canonical_structured_command_line_event(command));
@@ -1842,8 +1842,7 @@ impl BazelEventConverter {
 
         let command_name = invocation_command_name(record);
         let metadata = invocation_metadata(record);
-        self.defer_target_setup_until_first_result =
-            is_test_or_coverage_command(&command_name) && self.pending_patterns.is_some();
+        self.defer_target_setup_until_first_result = is_test_or_coverage_command(&command_name);
         self.push_unposted_event(
             unstructured_command_line_event_from_args(&record.cli_args),
             events,
@@ -1944,11 +1943,14 @@ impl BazelEventConverter {
             self.flush_pending_target_setup(events);
             return;
         };
-        let children = if targets.is_empty() {
+        let mut children = if targets.is_empty() {
             configured_target_children_from_events(&self.pending_configured_events)
         } else {
             configured_target_children_from_build_targets(targets)
         };
+        if children.is_empty() && self.should_defer_target_setup() {
+            children = configured_target_children_from_labels(&self.configured_target_labels);
+        }
         if !force && self.should_defer_target_setup() && children.is_empty() {
             return;
         }
@@ -1962,7 +1964,7 @@ impl BazelEventConverter {
         event: bep::BuildEvent,
         events: &mut Vec<bep::BuildEvent>,
     ) {
-        if self.should_defer_target_setup() {
+        if self.should_defer_workspace_status() {
             self.pending_workspace_status = Some(event);
         } else {
             self.push_unposted_event(event, events);
@@ -2016,6 +2018,7 @@ impl BazelEventConverter {
         {
             return;
         }
+        self.configured_target_labels.insert(id.label.clone());
         self.emitted_configured_targets
             .insert(id.label.clone(), signature);
         if self.should_defer_target_setup() {
@@ -2029,6 +2032,10 @@ impl BazelEventConverter {
         self.defer_target_setup_until_first_result
             && self.pending_patterns.is_some()
             && !self.pattern_expanded_emitted
+    }
+
+    fn should_defer_workspace_status(&self) -> bool {
+        self.defer_target_setup_until_first_result && !self.pattern_expanded_emitted
     }
 
     fn started_event(
@@ -5813,16 +5820,18 @@ fn configured_target_children_from_build_targets(
 }
 
 fn configured_target_children_from_events(events: &[bep::BuildEvent]) -> Vec<bep::BuildEventId> {
-    events
+    let labels = events
         .iter()
         .filter_map(|event| match event.id.as_ref()?.id.as_ref()? {
             build_event_id::Id::TargetConfigured(id) => Some(id.label.clone()),
             _ => None,
         })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .map(target_configured_id)
-        .collect()
+        .collect::<BTreeSet<_>>();
+    configured_target_children_from_labels(&labels)
+}
+
+fn configured_target_children_from_labels(labels: &BTreeSet<String>) -> Vec<bep::BuildEventId> {
+    labels.iter().cloned().map(target_configured_id).collect()
 }
 
 fn pattern_expanded_event(
@@ -9412,6 +9421,146 @@ mod tests {
         assert!(configured_index < workspace_status_index);
         assert!(workspace_status_index < test_result_index);
         assert!(test_result_index < test_summary_index);
+    }
+
+    #[test]
+    fn test_command_late_patterns_expand_before_test_results() {
+        let mut converter = BazelEventConverter::default();
+        let target = configured_target();
+        let pattern_id = pattern_expanded_id(vec!["//pkg:main".to_owned()]);
+        let target_id = target_configured_id("//pkg:main".to_owned());
+
+        let start_events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanStart(
+                buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::Command(
+                        buck2_data::CommandStart {
+                            cli_args: vec!["buck2".to_owned(), "test".to_owned()],
+                            data: Some(buck2_data::command_start::Data::Test(
+                                buck2_data::TestCommandStart {},
+                            )),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )),
+        );
+        assert!(!start_events.iter().any(|event| matches!(
+            event.payload,
+            Some(build_event::Payload::WorkspaceStatus(_))
+        )));
+
+        let pattern_events = converter.convert(
+            2,
+            &trace_event(buck2_data::buck_event::Data::Instant(
+                buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::TargetPatterns(
+                        buck2_data::ParsedTargetPatterns {
+                            target_patterns: vec![buck2_data::TargetPattern {
+                                value: "//pkg:main".to_owned(),
+                            }],
+                        },
+                    )),
+                },
+            )),
+        );
+        assert!(pattern_events.is_empty());
+
+        let build_graph_events = converter.convert(
+            3,
+            &trace_event(buck2_data::buck_event::Data::Record(
+                buck2_data::RecordEvent {
+                    data: Some(buck2_data::record_event::Data::BuildGraphStats(
+                        buck2_data::BuildGraphStats {
+                            build_targets: Vec::new(),
+                        },
+                    )),
+                },
+            )),
+        );
+        assert!(
+            !build_graph_events
+                .iter()
+                .any(|event| matches!(event.payload, Some(build_event::Payload::Expanded(_))))
+        );
+
+        converter.convert(
+            4,
+            &trace_event(buck2_data::buck_event::Data::SpanStart(
+                buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::TestDiscovery(
+                        buck2_data::TestDiscoveryStart {
+                            suite_name: "suite".to_owned(),
+                            target_label: Some(target.clone()),
+                            labels: vec!["ci".to_owned()],
+                        },
+                    )),
+                },
+            )),
+        );
+
+        let test_events = converter.convert(
+            5,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::TestRun(
+                        buck2_data::TestRunEnd {
+                            suite: Some(buck2_data::TestSuite {
+                                suite_name: "suite".to_owned(),
+                                test_names: vec!["test_passes".to_owned()],
+                                target_label: Some(target),
+                                labels: vec!["ci".to_owned()],
+                            }),
+                            command_report: Some(buck2_data::CommandExecution {
+                                details: Some(buck2_data::CommandExecutionDetails {
+                                    signed_exit_code: Some(0),
+                                    command_kind: Some(buck2_data::CommandExecutionKind {
+                                        command: Some(
+                                            buck2_data::command_execution_kind::Command::LocalCommand(
+                                                buck2_data::LocalCommand {
+                                                    argv: vec!["test-binary".to_owned()],
+                                                    ..Default::default()
+                                                },
+                                            ),
+                                        ),
+                                    }),
+                                    ..Default::default()
+                                }),
+                                status: Some(buck2_data::command_execution::Status::Success(
+                                    buck2_data::command_execution::Success {},
+                                )),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+        );
+
+        let expanded_index = test_events
+            .iter()
+            .position(|event| event.id.as_ref() == Some(&pattern_id))
+            .expect("PatternExpanded event");
+        assert!(test_events[expanded_index].children.contains(&target_id));
+        let workspace_status_index = test_events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event.payload,
+                    Some(build_event::Payload::WorkspaceStatus(_))
+                )
+            })
+            .expect("WorkspaceStatus event");
+        let test_result_index = test_events
+            .iter()
+            .position(|event| matches!(event.payload, Some(build_event::Payload::TestResult(_))))
+            .expect("TestResult event");
+
+        assert!(expanded_index < workspace_status_index);
+        assert!(workspace_status_index < test_result_index);
     }
 
     #[test]
