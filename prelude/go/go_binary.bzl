@@ -31,9 +31,12 @@ def go_binary_impl(ctx: AnalysisContext) -> list[Provider]:
     pkg_import_path = go_attr_pkg_name(ctx)
     cgo_enabled = evaluate_cgo_enabled(ctx.attrs._cgo_enabled)
     coverage_mode = GoCoverageMode(ctx.attrs._coverage_mode) if ctx.attrs._coverage_mode else None
-    cgo_build_context = get_cgo_build_context(ctx)
+    cgo_deps = ctx.attrs.deps + ctx.attrs.cdeps
+    cgo_build_context = get_cgo_build_context(ctx, cgo_deps)
 
-    lib, pkg_info, _ = declare_package_build(
+    header_namespace = cgo_build_context.header_namespace if cgo_build_context != None else (ctx.attrs.header_namespace if ctx.attrs.header_namespace != None else ctx.label.package)
+
+    lib, pkg_info, _, _ = declare_package_build(
         ctx = ctx,
         pkg_import_path = pkg_import_path,
         main = True,
@@ -57,6 +60,7 @@ def go_binary_impl(ctx: AnalysisContext) -> list[Provider]:
         lib,
         cgo_enabled = cgo_enabled,
         deps = ctx.attrs.deps,
+        native_deps = ctx.attrs.cdeps,
         link_style = value_or(map_val(LinkStyle, ctx.attrs.link_style), LinkStyle("static")),
         build_mode = GoBuildMode(value_or(ctx.attrs.build_mode, "exe")),
         linker_flags = ctx.attrs.linker_flags,
@@ -92,8 +96,10 @@ def go_binary_impl(ctx: AnalysisContext) -> list[Provider]:
         DistInfo(nondebug_runtime_files = runtime_files),
         GoTestInfo(
             deps = ctx.attrs.deps,
-            srcs = ctx.attrs.srcs,
+            cdeps = ctx.attrs.cdeps,
+            srcs = ctx.attrs.srcs + ctx.attrs.headers,
             pkg_import_path = pkg_import_path,
+            header_namespace = header_namespace,
             coverage_enabled = ctx.attrs.coverage_enabled,
         ),
         pkg_info,

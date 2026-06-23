@@ -17,12 +17,15 @@ use buck2_data::ActionExecutionEnd;
 use buck2_data::InstantEvent;
 use buck2_data::Location;
 use buck2_data::StructuredError;
+#[cfg(fbcode_build)]
 use buck2_error::ErrorTag;
+#[cfg(fbcode_build)]
 use buck2_error::conversion::from_any_with_tag;
 use buck2_util::truncate::truncate;
 use fbinit::FacebookInit;
 use prost::Message;
-pub use scribe_client::ScribeConfig;
+#[cfg(fbcode_build)]
+pub use scribe_client::ScribeConfig as RemoteEventConfig;
 
 use crate::BuckEvent;
 use crate::Event;
@@ -33,34 +36,58 @@ use crate::TraceId;
 use crate::daemon_id::get_daemon_id_for_panics;
 use crate::metadata;
 use crate::schedule_type::SandcastleScheduleType;
+#[cfg(not(fbcode_build))]
+pub use crate::sink::bes_client::BesConfig as RemoteEventConfig;
+#[cfg(not(fbcode_build))]
+pub use crate::sink::bes_client::BesEventFormat;
 use crate::sink::smart_truncate_event::smart_truncate_event;
+#[cfg(not(fbcode_build))]
+use crate::sink::smart_truncate_event::smart_truncate_event_preserving_logs;
 
 // 1 MiB limit
 static SCRIBE_MESSAGE_SIZE_LIMIT: usize = 1024 * 1024;
 // 50k characters
 static TRUNCATED_SCRIBE_MESSAGE_SIZE: usize = 50000;
 
-/// RemoteEventSink is a ScribeSink backed by the Thrift-based client in the `buck2_scribe_client` crate.
+/// RemoteEventSink forwards events to a remote backend.
 pub struct RemoteEventSink {
     category: String,
+    #[cfg(fbcode_build)]
     client: scribe_client::ScribeClient,
+    #[cfg(not(fbcode_build))]
+    client: crate::sink::bes_client::BesClient,
+    #[cfg(not(fbcode_build))]
+    upload_successful_action_events: bool,
+    #[cfg(not(fbcode_build))]
+    preserve_bazel_logs: bool,
     schedule_type: SandcastleScheduleType,
 }
 
 impl RemoteEventSink {
-    /// Creates a new RemoteEventSink that forwards messages onto the Thrift-backed Scribe client.
+    /// Creates a new RemoteEventSink that forwards messages onto a remote backend.
     pub fn new(
         fb: FacebookInit,
         category: String,
-        config: ScribeConfig,
+        config: RemoteEventConfig,
     ) -> buck2_error::Result<RemoteEventSink> {
+        #[cfg(fbcode_build)]
         let client = scribe_client::ScribeClient::new(fb, config)
             .map_err(|e| from_any_with_tag(e, ErrorTag::Tier0))?;
+        #[cfg(not(fbcode_build))]
+        let upload_successful_action_events = config.upload_successful_action_events;
+        #[cfg(not(fbcode_build))]
+        let preserve_bazel_logs = config.event_format == BesEventFormat::Bazel;
+        #[cfg(not(fbcode_build))]
+        let client = crate::sink::bes_client::BesClient::new(fb, config)?;
 
         let schedule_type = SandcastleScheduleType::new()?;
         Ok(RemoteEventSink {
             category,
             client,
+            #[cfg(not(fbcode_build))]
+            upload_successful_action_events,
+            #[cfg(not(fbcode_build))]
+            preserve_bazel_logs,
             schedule_type,
         })
     }
@@ -72,36 +99,87 @@ impl RemoteEventSink {
 
     // Send multiple events now, bypassing internal message queue.
     pub async fn send_messages_now(&self, events: Vec<BuckEvent>) -> buck2_error::Result<()> {
-        let messages = events
-            .into_iter()
-            .map(|e| {
-                let message_key = e.trace_id().unwrap().hash();
-                scribe_client::Message {
-                    category: self.category.clone(),
-                    message: Self::encode_message(e),
-                    message_key: Some(message_key),
-                }
-            })
-            .collect();
-        self.client
-            .send_messages_now(messages)
-            .await
-            .map_err(|e| from_any_with_tag(e, ErrorTag::Tier0))
+        #[cfg(fbcode_build)]
+        {
+            let messages = events
+                .into_iter()
+                .map(|e| {
+                    let message_key = e.trace_id().unwrap().hash();
+                    scribe_client::Message {
+                        category: self.category.clone(),
+                        message: Self::encode_message(e, false),
+                        message_key: Some(message_key),
+                    }
+                })
+                .collect();
+            self.client
+                .send_messages_now(messages)
+                .await
+                .map_err(|e| from_any_with_tag(e, ErrorTag::Tier0))
+        }
+        #[cfg(not(fbcode_build))]
+        {
+            let messages = events
+                .into_iter()
+                .map(|e| {
+                    let message_key = e.trace_id().unwrap().hash();
+                    crate::sink::bes_client::Message {
+                        category: self.category.clone(),
+                        message: Self::encode_message(e, self.preserve_bazel_logs),
+                        message_key: Some(message_key),
+                    }
+                })
+                .collect();
+            self.client.send_messages_now(messages).await
+        }
+    }
+
+    #[cfg(not(fbcode_build))]
+    fn send_now_without_waiting_for_acks(&self, event: &BuckEvent) -> buck2_error::Result<()> {
+        let message_key = event.trace_id()?.hash();
+        let message = crate::sink::bes_client::Message {
+            category: self.category.clone(),
+            message: Self::encode_message(event.clone(), self.preserve_bazel_logs),
+            message_key: Some(message_key),
+        };
+        futures::executor::block_on(
+            self.client
+                .send_messages_without_waiting_for_acks(vec![message]),
+        )
+    }
+
+    #[cfg(not(fbcode_build))]
+    fn should_send_before_client_output(&self, event: &BuckEvent) -> bool {
+        self.preserve_bazel_logs && is_command_start_event(event)
     }
 
     // Send this event by placing it on the internal message queue.
     pub fn offer(&self, event: BuckEvent) {
         let message_key = event.trace_id().unwrap().hash();
+        #[cfg(fbcode_build)]
         self.client.offer(scribe_client::Message {
             category: self.category.clone(),
-            message: Self::encode_message(event),
+            message: Self::encode_message(event, false),
+            message_key: Some(message_key),
+        });
+        #[cfg(not(fbcode_build))]
+        self.client.offer(crate::sink::bes_client::Message {
+            category: self.category.clone(),
+            message: Self::encode_message(event, self.preserve_bazel_logs),
             message_key: Some(message_key),
         });
     }
 
-    // Encodes message into something scribe understands.
-    fn encode_message(mut event: BuckEvent) -> Vec<u8> {
-        smart_truncate_event(event.data_mut());
+    // Encodes message for transport.
+    fn encode_message(mut event: BuckEvent, preserve_logs: bool) -> Vec<u8> {
+        if preserve_logs {
+            #[cfg(not(fbcode_build))]
+            smart_truncate_event_preserving_logs(event.data_mut());
+            #[cfg(fbcode_build)]
+            smart_truncate_event(event.data_mut());
+        } else {
+            smart_truncate_event(event.data_mut());
+        }
         let mut proto: Box<buck2_data::BuckEvent> = event.into();
 
         Self::prepare_event(&mut proto);
@@ -149,6 +227,16 @@ impl RemoteEventSink {
     fn prepare_event(event: &mut buck2_data::BuckEvent) {
         use buck2_data::buck_event::Data;
 
+        #[cfg(not(fbcode_build))]
+        {
+            if let Some(Data::Instant(i)) = &mut event.data
+                && let Some(buck2_data::instant_event::Data::BuckconfigInputValues(values)) =
+                    &mut i.data
+            {
+                redact_sensitive_buckconfig_values(values);
+            }
+        }
+
         if let Some(Data::SpanEnd(s)) = &mut event.data
             && let Some(buck2_data::span_end_event::Data::ActionExecution(action)) = &mut s.data
         {
@@ -173,76 +261,172 @@ impl RemoteEventSink {
     }
 
     fn should_send_event(&self, data: &buck2_data::buck_event::Data) -> bool {
-        use buck2_data::buck_event::Data;
+        #[cfg(not(fbcode_build))]
+        let upload_successful_action_events = self.upload_successful_action_events;
+        #[cfg(fbcode_build)]
+        let upload_successful_action_events = true;
+        #[cfg(not(fbcode_build))]
+        let preserve_bazel_logs = self.preserve_bazel_logs;
+        #[cfg(fbcode_build)]
+        let preserve_bazel_logs = false;
 
-        match data {
-            Data::SpanStart(s) => {
-                use buck2_data::span_start_event::Data;
+        should_send_event_data(
+            data,
+            &self.schedule_type,
+            upload_successful_action_events,
+            preserve_bazel_logs,
+        )
+    }
+}
 
-                match &s.data {
-                    Some(Data::Command(..)) => true,
-                    None => false,
-                    _ => false,
-                }
-            }
-            Data::SpanEnd(s) => {
-                use buck2_data::ActionExecutionKind;
-                use buck2_data::span_end_event::Data;
+fn should_send_event_data(
+    data: &buck2_data::buck_event::Data,
+    schedule_type: &SandcastleScheduleType,
+    upload_successful_action_events: bool,
+    preserve_bazel_logs: bool,
+) -> bool {
+    use buck2_data::buck_event::Data;
 
-                match &s.data {
-                    Some(Data::Command(..)) => true,
-                    Some(Data::ActionExecution(a)) => {
-                        a.failed
-                            || match ActionExecutionKind::try_from(a.execution_kind) {
-                                // Those kinds are not used in downstreams
-                                Ok(ActionExecutionKind::Simple) => false,
-                                Ok(ActionExecutionKind::Deferred) => false,
-                                Ok(ActionExecutionKind::NotSet) => false,
-                                _ => !matches!(
-                                    (action_has_cache_hit(a), self.schedule_type.is_diff()),
-                                    (true, true)
-                                ),
-                            }
-                    }
-                    Some(Data::Analysis(..)) => !self.schedule_type.is_diff(),
-                    Some(Data::Load(..)) => true,
-                    Some(Data::CacheUpload(..)) => true,
-                    Some(Data::DepFileUpload(..)) => true,
-                    Some(Data::Materialization(..)) => true,
-                    Some(Data::TestDiscovery(..)) => true,
-                    Some(Data::TestRun(..)) => true,
-                    None => false,
-                    _ => false,
-                }
-            }
-            Data::Instant(i) => {
-                use buck2_data::instant_event::Data;
+    match data {
+        Data::SpanStart(s) => {
+            use buck2_data::span_start_event::Data;
 
-                match i.data {
-                    Some(Data::BuildGraphInfo(..)) => true,
-                    Some(Data::RageResult(..)) => true,
-                    Some(Data::ReSession(..)) => true,
-                    Some(Data::StructuredError(..)) => true,
-                    Some(Data::PersistEventLogSubprocess(..)) => true,
-                    Some(Data::CleanStaleResult(..)) => true,
-                    Some(Data::ConfigurationCreated(..)) => true,
-                    Some(Data::DetailedAggregatedMetrics(..)) => true,
-                    Some(Data::ResourceControlEvent(..)) => true,
-                    Some(Data::ActionDigestTrace(..)) => true,
-                    None => false,
-                    _ => false,
-                }
-            }
-            Data::Record(r) => {
-                use buck2_data::record_event::Data;
-
-                match r.data {
-                    Some(Data::InvocationRecord(..)) => true,
-                    Some(Data::BuildGraphStats(..)) => true,
-                    None => false,
-                }
+            match &s.data {
+                Some(Data::Command(..)) => true,
+                // Buck2->BuildBuddy OSS integration needs this to capture
+                // metadata sourced from buckconfigs.
+                #[cfg(not(fbcode_build))]
+                Some(Data::CommandCritical(..)) => true,
+                // Buck2->BuildBuddy target mapping uses analysis start to
+                // synthesize target configured events.
+                #[cfg(not(fbcode_build))]
+                Some(Data::Analysis(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(
+                    Data::ActionExecution(..)
+                    | Data::AnalysisStage(..)
+                    | Data::CacheUpload(..)
+                    | Data::DepFileUpload(..)
+                    | Data::ExecutorStage(..)
+                    | Data::Load(..)
+                    | Data::Materialization(..)
+                    | Data::RemoteRequest(..)
+                    | Data::ReUpload(..),
+                ) if preserve_bazel_logs => true,
+                None => false,
+                _ => false,
             }
         }
+        Data::SpanEnd(s) => {
+            use buck2_data::span_end_event::Data;
+
+            match &s.data {
+                Some(Data::Command(..)) => true,
+                Some(Data::ActionExecution(a)) => {
+                    if preserve_bazel_logs {
+                        return true;
+                    }
+                    should_send_action_execution(a, schedule_type, upload_successful_action_events)
+                }
+                #[cfg(not(fbcode_build))]
+                Some(
+                    Data::AnalysisStage(..)
+                    | Data::ExecutorStage(..)
+                    | Data::RemoteRequest(..)
+                    | Data::ReUpload(..),
+                ) if preserve_bazel_logs => true,
+                Some(Data::Analysis(..)) => preserve_bazel_logs || !schedule_type.is_diff(),
+                Some(Data::Load(..)) => true,
+                Some(Data::CacheUpload(..)) => true,
+                Some(Data::DepFileUpload(..)) => true,
+                Some(Data::Materialization(..)) => true,
+                Some(Data::TestDiscovery(..)) => true,
+                Some(Data::TestRun(..)) => true,
+                None => false,
+                _ => false,
+            }
+        }
+        Data::Instant(i) => {
+            use buck2_data::instant_event::Data;
+
+            match i.data {
+                Some(Data::BuildGraphInfo(..)) => true,
+                // Required by BuildBuddy Buck2 mapping for target/test
+                // details and invocation metadata.
+                #[cfg(not(fbcode_build))]
+                Some(Data::TestDiscovery(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::TestResult(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::TargetPatterns(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::TargetCfg(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::CommandOptions(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::VersionControlRevision(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::BuckconfigInputValues(..)) => true,
+                // Required for BuildBuddy build log rendering.
+                #[cfg(not(fbcode_build))]
+                Some(Data::ConsoleMessage(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::ConsoleWarning(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::StreamingOutput(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::ActionError(..)) => true,
+                #[cfg(not(fbcode_build))]
+                Some(Data::DiceStateSnapshot(..)) if preserve_bazel_logs => true,
+                Some(Data::RageResult(..)) => true,
+                Some(Data::ReSession(..)) => true,
+                Some(Data::StructuredError(..)) => true,
+                Some(Data::PersistEventLogSubprocess(..)) => true,
+                Some(Data::CleanStaleResult(..)) => true,
+                Some(Data::ConfigurationCreated(..)) => true,
+                Some(Data::DetailedAggregatedMetrics(..)) => true,
+                Some(Data::ResourceControlEvent(..)) => true,
+                Some(Data::ActionDigestTrace(..)) => true,
+                None => false,
+                _ => false,
+            }
+        }
+        Data::Record(r) => {
+            use buck2_data::record_event::Data;
+
+            match r.data {
+                Some(Data::InvocationRecord(..)) => true,
+                Some(Data::BuildGraphStats(..)) => true,
+                None => false,
+            }
+        }
+    }
+}
+
+fn should_send_action_execution(
+    action: &ActionExecutionEnd,
+    schedule_type: &SandcastleScheduleType,
+    upload_successful_action_events: bool,
+) -> bool {
+    use buck2_data::ActionExecutionKind;
+
+    if action.failed {
+        return true;
+    }
+
+    if !upload_successful_action_events {
+        return false;
+    }
+
+    match ActionExecutionKind::try_from(action.execution_kind) {
+        // Those kinds are not used in downstreams.
+        Ok(ActionExecutionKind::Simple) => false,
+        Ok(ActionExecutionKind::Deferred) => false,
+        Ok(ActionExecutionKind::NotSet) => false,
+        _ => !matches!(
+            (action_has_cache_hit(action), schedule_type.is_diff()),
+            (true, true)
+        ),
     }
 }
 
@@ -252,6 +436,18 @@ impl EventSink for RemoteEventSink {
         match event {
             Event::Buck(event) => {
                 if self.should_send_event(event.data()) {
+                    #[cfg(not(fbcode_build))]
+                    if self.should_send_before_client_output(&event) {
+                        // BuildBuddy creates the invocation row from the BEP
+                        // Started/OptionsParsed batch generated from
+                        // CommandStart. Send that batch before the local client
+                        // sees CommandStart and prints the BuildBuddy URL. This
+                        // waits for local send, not for a BuildBuddy ACK.
+                        if self.send_now_without_waiting_for_acks(&event).is_err() {
+                            self.offer(event);
+                        }
+                        return;
+                    }
                     self.offer(event);
                 }
             }
@@ -271,6 +467,62 @@ impl EventSink for RemoteEventSink {
             Event::PartialResult(..) => {}
         }
     }
+}
+
+#[cfg(not(fbcode_build))]
+fn is_command_start_event(event: &BuckEvent) -> bool {
+    matches!(
+        event.data(),
+        buck2_data::buck_event::Data::SpanStart(span)
+            if matches!(
+                span.data.as_ref(),
+                Some(buck2_data::span_start_event::Data::Command(_))
+            )
+    )
+}
+
+#[cfg(not(fbcode_build))]
+fn redact_sensitive_buckconfig_values(values: &mut buck2_data::BuckconfigInputValues) {
+    use buck2_data::buckconfig_component::Data;
+
+    for component in &mut values.components {
+        let Some(data) = component.data.as_mut() else {
+            continue;
+        };
+        let config_values = match data {
+            Data::ConfigValue(value) => std::slice::from_mut(value),
+            Data::ConfigFile(config_file) => match config_file.data.as_mut() {
+                Some(buck2_data::config_file::Data::GlobalExternalConfig(config)) => {
+                    config.values.as_mut_slice()
+                }
+                _ => continue,
+            },
+            Data::GlobalExternalConfigFile(config) => config.values.as_mut_slice(),
+        };
+
+        for value in config_values {
+            if is_sensitive_buckconfig_value(value) {
+                value.value = "<redacted>".to_owned();
+            }
+        }
+    }
+}
+
+#[cfg(not(fbcode_build))]
+fn is_sensitive_buckconfig_value(value: &buck2_data::ConfigValue) -> bool {
+    let section = value.section.to_ascii_lowercase();
+    let key = value.key.to_ascii_lowercase();
+    section.contains("credential")
+        || section.contains("secret")
+        || section.contains("token")
+        || key.contains("credential")
+        || key.contains("password")
+        || key.contains("secret")
+        || key.contains("token")
+        || key.contains("api_key")
+        || key.contains("api-key")
+        || key == "header"
+        || key == "http_headers"
 }
 
 fn action_has_cache_hit(action: &ActionExecutionEnd) -> bool {
@@ -334,6 +586,8 @@ pub(crate) fn scribe_category() -> buck2_error::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use buck2_data::ActionExecutionEnd;
+    use buck2_data::ActionExecutionKind;
     use buck2_data::CommandExecutionDetails;
     use buck2_data::CommandExecutionKind;
     use buck2_data::RemoteCommand;
@@ -359,7 +613,7 @@ mod tests {
             }),
         );
 
-        let res = RemoteEventSink::encode_message(event);
+        let res = RemoteEventSink::encode_message(event, false);
         let size_approx = res.len() * 8;
         assert!(size_approx > TRUNCATED_SCRIBE_MESSAGE_SIZE);
         assert!(size_approx < SCRIBE_MESSAGE_SIZE_LIMIT);
@@ -390,5 +644,210 @@ mod tests {
             ..Default::default()
         };
         assert!(!get_is_cache_hit(&details_no_cache_hit));
+    }
+
+    #[cfg(not(fbcode_build))]
+    #[test]
+    fn command_start_events_are_sent_before_client_output() {
+        let command_start = BuckEvent::new(
+            SystemTime::now(),
+            TraceId::new(),
+            None,
+            None,
+            buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                data: Some(buck2_data::CommandStart::default().into()),
+            }),
+        );
+        assert!(is_command_start_event(&command_start));
+
+        let console_message = BuckEvent::new(
+            SystemTime::now(),
+            TraceId::new(),
+            None,
+            None,
+            buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
+                data: Some(
+                    buck2_data::ConsoleMessage {
+                        message: "hello".to_owned(),
+                    }
+                    .into(),
+                ),
+            }),
+        );
+        assert!(!is_command_start_event(&console_message));
+    }
+
+    #[test]
+    fn upload_successful_action_events_keeps_failures() {
+        let schedule_type = SandcastleScheduleType::testing_empty();
+        let failed_remote = ActionExecutionEnd {
+            failed: true,
+            execution_kind: ActionExecutionKind::Remote as i32,
+            ..Default::default()
+        };
+
+        assert!(should_send_action_execution(
+            &failed_remote,
+            &schedule_type,
+            false
+        ));
+    }
+
+    #[test]
+    fn upload_successful_action_events_filters_successes() {
+        let schedule_type = SandcastleScheduleType::testing_empty();
+        let successful_remote = ActionExecutionEnd {
+            failed: false,
+            execution_kind: ActionExecutionKind::Remote as i32,
+            ..Default::default()
+        };
+
+        assert!(should_send_action_execution(
+            &successful_remote,
+            &schedule_type,
+            true
+        ));
+        assert!(!should_send_action_execution(
+            &successful_remote,
+            &schedule_type,
+            false
+        ));
+    }
+
+    #[cfg(not(fbcode_build))]
+    #[test]
+    fn bazel_progress_keeps_successful_action_events_for_converter() {
+        let schedule_type = SandcastleScheduleType::testing_empty();
+        let data = buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+            data: Some(buck2_data::span_end_event::Data::ActionExecution(Box::new(
+                ActionExecutionEnd {
+                    failed: false,
+                    execution_kind: ActionExecutionKind::Remote as i32,
+                    ..Default::default()
+                },
+            ))),
+            ..Default::default()
+        });
+
+        assert!(should_send_event_data(&data, &schedule_type, false, true));
+        assert!(!should_send_event_data(&data, &schedule_type, false, false));
+    }
+
+    #[cfg(not(fbcode_build))]
+    #[test]
+    fn bazel_progress_keeps_progress_source_events() {
+        let schedule_type = SandcastleScheduleType::testing_empty();
+        let action_start = buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+            data: Some(buck2_data::span_start_event::Data::ActionExecution(
+                buck2_data::ActionExecutionStart::default(),
+            )),
+        });
+        let dice_snapshot = buck2_data::buck_event::Data::Instant(buck2_data::InstantEvent {
+            data: Some(buck2_data::instant_event::Data::DiceStateSnapshot(
+                buck2_data::DiceStateSnapshot::default(),
+            )),
+        });
+        let executor_stage_end = buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+            data: Some(buck2_data::span_end_event::Data::ExecutorStage(
+                buck2_data::ExecutorStageEnd::default(),
+            )),
+            ..Default::default()
+        });
+        let remote_request_start =
+            buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                data: Some(buck2_data::span_start_event::Data::RemoteRequest(
+                    buck2_data::RemoteRequestStart::default(),
+                )),
+            });
+        let remote_request_end = buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+            data: Some(buck2_data::span_end_event::Data::RemoteRequest(
+                buck2_data::RemoteRequestEnd::default(),
+            )),
+            ..Default::default()
+        });
+        let re_upload_start = buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+            data: Some(buck2_data::span_start_event::Data::ReUpload(
+                buck2_data::ReUploadStart::default(),
+            )),
+        });
+        let re_upload_end = buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+            data: Some(buck2_data::span_end_event::Data::ReUpload(
+                buck2_data::ReUploadEnd::default(),
+            )),
+            ..Default::default()
+        });
+
+        assert!(should_send_event_data(
+            &action_start,
+            &schedule_type,
+            false,
+            true
+        ));
+        assert!(should_send_event_data(
+            &dice_snapshot,
+            &schedule_type,
+            false,
+            true
+        ));
+        assert!(should_send_event_data(
+            &executor_stage_end,
+            &schedule_type,
+            false,
+            true
+        ));
+        assert!(should_send_event_data(
+            &remote_request_start,
+            &schedule_type,
+            false,
+            true
+        ));
+        assert!(should_send_event_data(
+            &remote_request_end,
+            &schedule_type,
+            false,
+            true
+        ));
+        assert!(should_send_event_data(
+            &re_upload_start,
+            &schedule_type,
+            false,
+            true
+        ));
+        assert!(should_send_event_data(
+            &re_upload_end,
+            &schedule_type,
+            false,
+            true
+        ));
+        assert!(!should_send_event_data(
+            &action_start,
+            &schedule_type,
+            false,
+            false
+        ));
+        assert!(!should_send_event_data(
+            &dice_snapshot,
+            &schedule_type,
+            false,
+            false
+        ));
+        assert!(!should_send_event_data(
+            &executor_stage_end,
+            &schedule_type,
+            false,
+            false
+        ));
+        assert!(!should_send_event_data(
+            &remote_request_start,
+            &schedule_type,
+            false,
+            false
+        ));
+        assert!(!should_send_event_data(
+            &remote_request_end,
+            &schedule_type,
+            false,
+            false
+        ));
     }
 }

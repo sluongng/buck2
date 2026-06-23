@@ -20,8 +20,27 @@ import (
 )
 
 func main() {
+	if len(os.Args[1:]) < 1 {
+		fmt.Println("Usage: gobuckify <path-third-party-dir> | gobuckify gomod <module-dir> [patterns...]")
+		os.Exit(1)
+	}
+
+	if os.Args[1] == "gomod" {
+		if len(os.Args[2:]) < 1 {
+			fmt.Println("Usage: gobuckify gomod <module-dir> [patterns...]")
+			os.Exit(1)
+		}
+		moduleDir := os.Args[2]
+		patterns := os.Args[3:]
+		if err := lib.GenerateGoModBuckFiles(moduleDir, patterns); err != nil {
+			slog.Error("Error generating gomod BUCK files", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if len(os.Args[1:]) != 1 {
-		fmt.Println("Usage: gobuckify <path-third-party-dir>")
+		fmt.Println("Usage: gobuckify <path-third-party-dir> | gobuckify gomod <module-dir> [patterns...]")
 		os.Exit(1)
 	}
 

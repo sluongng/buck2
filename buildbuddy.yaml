@@ -1,0 +1,157 @@
+actions:
+  - name: Buck2 Stack Test
+    container_image: ubuntu-24.04
+    visibility: "PUBLIC"
+    user: root
+    resource_requests:
+      disk: 64GB
+    triggers:
+      push:
+        branches: ["main"]
+    steps:
+      # Install the small set of OS tools needed before Buck2 can drive the rest
+      # of the workflow: package verification, downloads, Watchman, and zstd.
+      - run: |
+          set -euo pipefail
+
+          : "${BUILDBUDDY_API_KEY:?BuildBuddy should inject BUILDBUDDY_API_KEY for trusted workflows}"
+          : "${BUILDBUDDY_RUN_ID:?BuildBuddy should inject BUILDBUDDY_RUN_ID for trusted workflows}"
+          : "${BUILDBUDDY_INVOCATION_ID:?BuildBuddy should inject BUILDBUDDY_INVOCATION_ID for trusted workflows}"
+          : "${GIT_COMMIT:?BuildBuddy should inject GIT_COMMIT for trusted workflows}"
+          : "${GIT_BRANCH:?BuildBuddy should inject GIT_BRANCH for trusted workflows}"
+          export DEBIAN_FRONTEND=noninteractive
+          mkdir -p .buildbuddy-workflow
+
+          apt-get update
+          apt-get install -y \
+            b3sum \
+            ca-certificates \
+            curl \
+            git \
+            python3 \
+            watchman \
+            zstd
+          watchman version
+
+      # Resolve the DotSlash bootstrap entry for this runner architecture,
+      # verify its BLAKE3 digest, and persist the executable for later steps.
+      - run: |
+          set -euo pipefail
+
+          mkdir -p .buildbuddy-workflow
+
+          platform=$(uname -m)
+          case "$platform" in
+            x86_64)
+              dotslash_platform=linux-x86_64
+              ;;
+            aarch64 | arm64)
+              dotslash_platform=linux-aarch64
+              ;;
+            *)
+              echo "Unsupported workflow runner architecture: $platform" >&2
+              exit 2
+              ;;
+          esac
+
+          python3 - "$dotslash_platform" > .buildbuddy-workflow/bootstrap-buck2.tsv <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          manifest = json.loads(Path("bootstrap/buck2").read_text().split("\n", 1)[1])
+          platform = manifest["platforms"][sys.argv[1]]
+          print(platform["providers"][0]["url"], platform["digest"], platform["path"])
+          PY
+          read -r buck2_url buck2_digest buck2_path < .buildbuddy-workflow/bootstrap-buck2.tsv
+
+          curl -fsSL "$buck2_url" -o /tmp/bootstrap-buck2.zst
+          echo "$buck2_digest  /tmp/bootstrap-buck2.zst" | b3sum --check
+          buck2_bootstrap=.buildbuddy-workflow/bootstrap-buck2
+          zstd -q -dc /tmp/bootstrap-buck2.zst > "$buck2_bootstrap"
+          chmod 0755 "$buck2_bootstrap"
+          printf '%s\n' "$buck2_bootstrap" > .buildbuddy-workflow/bootstrap-buck2.path
+          "$buck2_bootstrap" --version
+
+      # Prepare the generated Rust shim that the clean workflow checkout needs
+      # before the bootstrap Buck2 can analyze //:buck2.
+      - run: |
+          set -euo pipefail
+
+          cp shim/third-party/rust/BUCK.reindeer shim/third-party/rust/BUCK
+
+      # Use the bootstrap Buck2 binary to build the current checkout's Buck2
+      # locally. This seeds the remote cache from the workflow runner before
+      # remote-only validation, avoiding cold-cache archive fetches on RBE
+      # workers that may not have reliable external DNS.
+      - run: |
+          set -euo pipefail
+
+          # Buck2 daemon startup reads static RE metadata before command-level
+          # --config-file values are applied, so expose the checked-in
+          # BuildBuddy profile as an external config for the daemon as well.
+          export BUCK2_TEST_EXTRA_EXTERNAL_CONFIG="$PWD/.buckconfig.buildbuddy"
+
+          buck2_bootstrap=$(cat .buildbuddy-workflow/bootstrap-buck2.path)
+          local_buck2_build() {
+            local attempt="$1"
+            "$buck2_bootstrap" \
+              --isolation-dir "buildbuddy-rbe-build-$attempt" \
+              build \
+              --show-full-json-output \
+              --config-file .buckconfig.buildbuddy \
+              --local-only \
+              //:buck2
+          }
+
+          if ! built_buck2_json="$(local_buck2_build initial)"; then
+            echo "Local //:buck2 bootstrap build failed; retrying once with fresh Buck2 daemon state" >&2
+            "$buck2_bootstrap" killall >/dev/null 2>&1 || true
+            rm -rf "buck-out/buildbuddy-rbe-build-retry"
+            built_buck2_json="$(local_buck2_build retry)"
+          fi
+          built_buck2="$(python3 -c 'import json, sys; outputs = json.load(sys.stdin); output = next(iter(outputs.values())); print(output[0] if isinstance(output, list) else output)' <<< "$built_buck2_json")"
+          printf '%s\n' "$built_buck2" > .buildbuddy-workflow/built-buck2.path
+          test -x "$built_buck2"
+          "$built_buck2" --version
+
+      # Rebuild //:buck2 with the freshly built binary, then run the BuildBuddy
+      # remote matrix. Keep this second build remote-only as well, so the final
+      # validation exercises the same RBE path as the matrix tests.
+      - run: |
+          set -euo pipefail
+
+          # Keep the freshly built Buck2 daemon on the same checked-in
+          # BuildBuddy profile used by the bootstrap daemon.
+          export BUCK2_TEST_EXTRA_EXTERNAL_CONFIG="$PWD/.buckconfig.buildbuddy"
+
+          built_buck2=$(cat .buildbuddy-workflow/built-buck2.path)
+          remote_matrix_isolation_prefix="buildbuddy-rbe-tests"
+          remote_only_buck2_build() {
+            local isolation_dir="$1"
+            "$built_buck2" \
+              --isolation-dir "$isolation_dir" \
+              build \
+              --config-file .buckconfig.buildbuddy \
+              --remote-only \
+              //:buck2
+          }
+
+          if ! remote_only_buck2_build "$remote_matrix_isolation_prefix-rbe"; then
+            echo "Remote-only //:buck2 build failed; retrying once with fresh Buck2 daemon state" >&2
+            "$built_buck2" killall >/dev/null 2>&1 || true
+            rm -rf "buck-out/$remote_matrix_isolation_prefix-rbe"
+            remote_only_buck2_build "$remote_matrix_isolation_prefix-rbe"
+          fi
+
+          # Keep the matrix isolation prefix stable across workflow runs so
+          # Buck output paths, and therefore remote action keys, remain stable.
+          # Do not pass --clean-output here because it starts with buck2 killall,
+          # which can stop the previous daemon before its terminal BES events
+          # are flushed to BuildBuddy. Reusing the self-test isolation dir lets
+          # the deferred materializer state from the remote //:buck2 build carry
+          # into the matrix command.
+          BUCK2="$built_buck2" buildbuddy/run_buck2_test_matrix.sh \
+            --mode remote \
+            --remote-config-file .buckconfig.buildbuddy \
+            --isolation-prefix "$remote_matrix_isolation_prefix"
