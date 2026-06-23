@@ -728,6 +728,7 @@ impl LocalExecutor {
             hashing_duration: Duration::ZERO, // We fill hashing info in later if available.
             hashed_artifacts_count: 0,
             queue_duration: None,
+            remote_execution_timing: None,
             suspend_duration: None,
             suspend_count: None,
         });
