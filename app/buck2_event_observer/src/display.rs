@@ -471,6 +471,20 @@ pub fn display_event(
             }
             Data::CacheUpload(_) => Ok(EventDisplay::bare("upload (action)")),
             Data::DepFileUpload(_) => Ok(EventDisplay::bare("upload (dep_file)")),
+            Data::RemoteRequest(request) => {
+                let name = if request.service.is_empty() {
+                    request.method.clone()
+                } else if request.method.is_empty() {
+                    request.service.clone()
+                } else {
+                    format!("{} {}", request.service, request.method)
+                };
+                Ok(EventDisplay::bare(if name.is_empty() {
+                    "remote request".to_owned()
+                } else {
+                    name
+                }))
+            }
             Data::CreateOutputSymlinks(..) => Ok(EventDisplay::bare("Creating output symlinks")),
             Data::InstallEventInfo(info) => Ok(EventDisplay::bare(format!(
                 "Sending {} at path {}",

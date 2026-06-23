@@ -8,6 +8,8 @@
  * above-listed licenses.
  */
 
+#![allow(clippy::large_enum_variant)]
+
 pub mod blaze {
     tonic::include_proto!("blaze");
 

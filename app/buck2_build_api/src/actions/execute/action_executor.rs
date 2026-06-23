@@ -895,6 +895,24 @@ mod tests {
 
         let tracker = Arc::new(Mutex::new(Vec::new()));
 
+        let blocking_executor = Arc::new(DummyBlockingExecutor {
+            fs: project_fs.dupe(),
+        });
+        let materializer = Arc::new(NoDiskMaterializer);
+        let events = EventDispatcher::null();
+        let re_client = UnconfiguredRemoteExecutionClient::testing_new_dummy();
+        let run_action_knobs = RunActionKnobs::default();
+        let io_provider = Arc::new(FsIoProvider::new(
+            project_fs,
+            CasDigestConfig::testing_default(),
+            false,
+        ));
+        let http_client = HttpClientBuilder::https_with_system_roots()
+            .await
+            .unwrap()
+            .build();
+        let mergebase = Mergebase::default();
+
         let executor = BuckActionExecutor::new(
             CommandExecutor::new(
                 Arc::new(DryRunExecutor::new(tracker, artifact_fs.clone())),
@@ -910,24 +928,15 @@ mod tests {
                 },
                 Default::default(),
             ),
-            Arc::new(DummyBlockingExecutor {
-                fs: project_fs.dupe(),
-            }),
-            Arc::new(NoDiskMaterializer),
-            EventDispatcher::null(),
-            UnconfiguredRemoteExecutionClient::testing_new_dummy(),
+            blocking_executor.as_ref(),
+            materializer.as_ref(),
+            &events,
+            &re_client,
             DigestConfig::testing_default(),
-            Default::default(),
-            Arc::new(FsIoProvider::new(
-                project_fs,
-                CasDigestConfig::testing_default(),
-                false,
-            )),
-            HttpClientBuilder::https_with_system_roots()
-                .await
-                .unwrap()
-                .build(),
-            Default::default(),
+            &run_action_knobs,
+            io_provider.as_ref(),
+            &http_client,
+            &mergebase,
             true,
             OutputTreesDownloadConfig::new(None, true),
         );

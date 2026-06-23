@@ -1079,7 +1079,7 @@ fn process_queued_message(
     message: Message,
 ) {
     worker.counters.dec_queue_depth();
-    let _ = runtime.block_on(worker.send_message_with_retry(&message, false));
+    drop(runtime.block_on(worker.send_message_with_retry(&message, false)));
 }
 
 fn process_send_now_request(
@@ -1130,7 +1130,7 @@ fn process_send_now_request(
             ));
         }
     }
-    let _ = request.done.send(result);
+    drop(request.done.send(result));
 }
 
 struct WorkerState {
@@ -1630,7 +1630,7 @@ impl StreamState {
                         uploader.upload_event_files(&mut event).await;
                     }
                     last_sequence_number = Some(self.enqueue_raw_event(BuildEvent {
-                        event_time: parsed.event_time.clone(),
+                        event_time: parsed.event_time,
                         event: Some(build_event::Event::BazelEvent(encode_bep_event(&event))),
                     }));
                 }
@@ -1795,7 +1795,7 @@ impl ParsedMessage {
             uuid::Uuid::new_v4().to_string()
         };
 
-        let event_time = event.timestamp.clone();
+        let event_time = event.timestamp;
         let is_command_end = is_command_end(&event);
         let is_invocation_record = is_invocation_record(&event);
 

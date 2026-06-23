@@ -5,9 +5,7 @@ actions:
     user: root
     resource_requests:
       disk: 64GB
-    triggers:
-      push:
-        branches: ["main"]
+    triggers: {}
     steps:
       # Install the small set of OS tools needed before Buck2 can drive the rest
       # of the workflow: package verification, downloads, Watchman, and zstd.

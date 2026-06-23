@@ -26,6 +26,8 @@ use remote_execution::TTimestamp;
 use crate::digest_config::DigestConfig;
 use crate::execute::kind::CommandExecutionKind;
 use crate::execute::kind::RemoteCommandExecutionDetails;
+use crate::execute::result::RemoteExecutionTimestamp;
+use crate::execute::result::RemoteExecutionTiming;
 use crate::re::manager::ManagedRemoteExecutionClient;
 use crate::re::queue_stats::QueueStats;
 use crate::re::streams::RemoteCommandStdStreams;
@@ -147,6 +149,7 @@ impl RemoteActionResult for ActionCacheResult {
         let mut timing = timing_from_re_metadata(&self.0.action_result.execution_metadata);
         timing.input_materialization_duration = Duration::ZERO;
         timing.queue_duration = None;
+        timing.remote_execution_timing = None;
         timing
     }
 
@@ -169,6 +172,7 @@ pub struct ReMetadataTiming {
     pub execution_stats: Option<buck2_data::CommandExecutionStats>,
     pub input_materialization_duration: Duration,
     pub queue_duration: Option<Duration>,
+    pub remote_execution_timing: Option<RemoteExecutionTiming>,
 }
 
 fn timing_from_re_metadata(meta: &TExecutedActionMetadata) -> ReMetadataTiming {
@@ -203,6 +207,57 @@ fn timing_from_re_metadata(meta: &TExecutedActionMetadata) -> ReMetadataTiming {
         execution_stats,
         input_materialization_duration: fetch_input_time,
         queue_duration: Some(queue_duration),
+        remote_execution_timing: remote_execution_timing_from_re_metadata(meta),
+    }
+}
+
+fn remote_execution_timing_from_re_metadata(
+    meta: &TExecutedActionMetadata,
+) -> Option<RemoteExecutionTiming> {
+    let timing = RemoteExecutionTiming {
+        queued_timestamp: timestamp_from_ttimestamp(&meta.queued_timestamp),
+        worker_start_timestamp: timestamp_from_ttimestamp(&meta.worker_start_timestamp),
+        worker_completed_timestamp: timestamp_from_ttimestamp(&meta.worker_completed_timestamp),
+        input_fetch_start_timestamp: timestamp_from_ttimestamp(&meta.input_fetch_start_timestamp),
+        input_fetch_completed_timestamp: timestamp_from_ttimestamp(
+            &meta.input_fetch_completed_timestamp,
+        ),
+        execution_start_timestamp: timestamp_from_ttimestamp(&meta.execution_start_timestamp),
+        execution_completed_timestamp: timestamp_from_ttimestamp(
+            &meta.execution_completed_timestamp,
+        ),
+        output_upload_start_timestamp: timestamp_from_ttimestamp(
+            &meta.output_upload_start_timestamp,
+        ),
+        output_upload_completed_timestamp: timestamp_from_ttimestamp(
+            &meta.output_upload_completed_timestamp,
+        ),
+    };
+
+    if timing.queued_timestamp.is_none()
+        && timing.worker_start_timestamp.is_none()
+        && timing.worker_completed_timestamp.is_none()
+        && timing.input_fetch_start_timestamp.is_none()
+        && timing.input_fetch_completed_timestamp.is_none()
+        && timing.execution_start_timestamp.is_none()
+        && timing.execution_completed_timestamp.is_none()
+        && timing.output_upload_start_timestamp.is_none()
+        && timing.output_upload_completed_timestamp.is_none()
+    {
+        None
+    } else {
+        Some(timing)
+    }
+}
+
+fn timestamp_from_ttimestamp(timestamp: &TTimestamp) -> Option<RemoteExecutionTimestamp> {
+    if timestamp.seconds == 0 && timestamp.nanos == 0 {
+        None
+    } else {
+        Some(RemoteExecutionTimestamp {
+            seconds: timestamp.seconds,
+            nanos: timestamp.nanos,
+        })
     }
 }
 

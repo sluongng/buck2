@@ -1755,7 +1755,7 @@ impl RemoteExecutionClientImpl {
             },
             ..Default::default()
         };
-        let re_action = format!("Execute with digest {}", &action_digest);
+        let re_action = format!("Execute with digest {}", action_digest);
         if buck2_env!(
             "BUCK2_TEST_FAIL_RE_EXECUTE_MISSING_INPUTS_ONCE",
             bool,
