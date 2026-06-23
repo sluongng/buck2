@@ -68,7 +68,7 @@ remote_download = true
 backend = grpcs://remote.buildbuddy.io
 event_format = bazel
 header = x-buildbuddy-api-key=$BUILDBUDDY_API_KEY
-build_metadata = PARENT_RUN_ID=$BUILDBUDDY_RUN_ID,PARENT_INVOCATION_ID=$BUILDBUDDY_INVOCATION_ID,COMMIT_SHA=$GIT_COMMIT,REPO_URL=https://github.com/sluongng/buck2,BRANCH_NAME=$GIT_BRANCH,ROLE=CI,VISIBILITY=PUBLIC,DISABLE_COMMIT_STATUS_REPORTING=true
+build_metadata = PARENT_RUN_ID=$BUILDBUDDY_RUN_ID,PARENT_INVOCATION_ID=$BUILDBUDDY_INVOCATION_ID,COMMIT_SHA=$GIT_COMMIT,REPO_URL=https://github.com/sluongng/buck2,BRANCH_NAME=$GIT_BRANCH,ROLE=CI,VISIBILITY=PUBLIC
 # Keep failed-action diagnostics while avoiding a long tail of successful
 # action events before the terminal BES events on fully remote no-cache builds.
 upload_successful_action_events = false
