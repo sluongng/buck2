@@ -6081,16 +6081,36 @@ fn configured_event_with_tags(
     target_kind: String,
     tag: Vec<String>,
 ) -> bep::BuildEvent {
+    let test_size = test_size_for_target_kind_and_tags(&target_kind, &tag);
     bep::BuildEvent {
         id: Some(target_configured_id(label.clone())),
         children: vec![target_completed_id(label, configuration)],
         payload: Some(build_event::Payload::Configured(bep::TargetConfigured {
             target_kind,
-            test_size: bep::TestSize::Unknown as i32,
+            test_size,
             tag,
         })),
         last_message: false,
     }
+}
+
+fn test_size_for_target_kind_and_tags(target_kind: &str, tags: &[String]) -> i32 {
+    let target_kind = target_kind
+        .trim()
+        .trim_end_matches(" rule")
+        .to_ascii_lowercase();
+    if !target_kind.ends_with("test") {
+        return bep::TestSize::Unknown as i32;
+    }
+    tags.iter()
+        .find_map(|tag| match tag.as_str() {
+            "small" => Some(bep::TestSize::Small as i32),
+            "medium" => Some(bep::TestSize::Medium as i32),
+            "large" => Some(bep::TestSize::Large as i32),
+            "enormous" => Some(bep::TestSize::Enormous as i32),
+            _ => None,
+        })
+        .unwrap_or(bep::TestSize::Medium as i32)
 }
 
 fn completed_event(label: String, configuration: String, success: bool) -> bep::BuildEvent {
@@ -12415,6 +12435,37 @@ mod tests {
     }
 
     #[test]
+    fn test_rule_configured_targets_have_default_test_size() {
+        let mut converter = BazelEventConverter::default();
+        let target = configured_target();
+        let events = converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanStart(
+                buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::Analysis(
+                        buck2_data::AnalysisStart {
+                            rule: "prelude//rules.bzl:rust_test".to_owned(),
+                            target: Some(buck2_data::analysis_start::Target::StandardTarget(
+                                target,
+                            )),
+                        },
+                    )),
+                },
+            )),
+        );
+
+        let configured = events
+            .iter()
+            .find_map(|event| match event.payload.as_ref() {
+                Some(build_event::Payload::Configured(configured)) => Some(configured),
+                _ => None,
+            })
+            .expect("configured target event");
+        assert_eq!(configured.target_kind, "prelude//rules.bzl:rust_test rule");
+        assert_eq!(configured.test_size, bep::TestSize::Medium as i32);
+    }
+
+    #[test]
     fn test_discovery_labels_update_configured_tags() {
         let mut converter = BazelEventConverter::default();
         let target = configured_target();
@@ -12459,6 +12510,7 @@ mod tests {
             })
             .expect("updated configured target event");
         assert_eq!(configured.tag, vec!["ci", "small"]);
+        assert_eq!(configured.test_size, bep::TestSize::Small as i32);
     }
 
     #[test]
