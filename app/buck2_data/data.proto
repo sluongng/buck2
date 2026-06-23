@@ -91,6 +91,7 @@ message SpanStartEvent {
     DepFileUploadStart dep_file_upload = 88;
     ComputeDetailedAggregatedMetricsStart compute_detailed_aggregated_metrics =
         89;
+    RemoteRequestStart remote_request = 91;
     // Used in Buck unit tests.
     FakeStart fake = 999;
   }
@@ -144,6 +145,7 @@ message SpanEndEvent {
     DepFileUploadEnd dep_file_upload = 88;
     ComputeDetailedAggregatedMetricsEnd compute_detailed_aggregated_metrics =
         89;
+    RemoteRequestEnd remote_request = 91;
     // Used in Buck unit tests.
     FakeEnd fake = 999;
   }
@@ -341,6 +343,14 @@ message InstantEvent {
     // recorder) can accumulate rule types without the producing command
     // having to thread them through its response.
     TargetRuleTypeName target_rule_type_name = 59;
+
+    // The final request constructed by a successful `buck2 run` build before
+    // the client executes, prints, or writes the requested command line.
+    RunExecRequest run_exec_request = 60;
+
+    // A non-action external resource fetch, such as a git-backed external
+    // cell population.
+    ExternalResourceFetch external_resource_fetch = 61;
   }
 }
 
@@ -1225,6 +1235,7 @@ message TestSuite {
   string suite_name = 1;
   repeated string test_names = 2;
   ConfiguredTargetLabel target_label = 3;
+  repeated string labels = 4;
 }
 
 // An event that marks the beginning of a command.
@@ -1688,6 +1699,22 @@ message CommandExecutionMetadata {
   /// The number of times this action was suspended. None indicates that
   /// resource control was not enabled.
   optional uint64 suspend_count = 11;
+
+  /// Worker-side timing metadata reported by remote execution.
+  RemoteExecutionTiming remote_execution_timing = 12;
+}
+
+message RemoteExecutionTiming {
+  string worker = 1;
+  google.protobuf.Timestamp queued_timestamp = 2;
+  google.protobuf.Timestamp worker_start_timestamp = 3;
+  google.protobuf.Timestamp worker_completed_timestamp = 4;
+  google.protobuf.Timestamp input_fetch_start_timestamp = 5;
+  google.protobuf.Timestamp input_fetch_completed_timestamp = 6;
+  google.protobuf.Timestamp execution_start_timestamp = 7;
+  google.protobuf.Timestamp execution_completed_timestamp = 8;
+  google.protobuf.Timestamp output_upload_start_timestamp = 9;
+  google.protobuf.Timestamp output_upload_completed_timestamp = 10;
 }
 
 message CommandOutputsMissing {
@@ -1748,6 +1775,10 @@ message CommandExecutionError {}
 
 message ActionOutput {
   string tiny_digest = 1;
+  string path = 2;
+  string digest = 3;
+  uint64 size = 4;
+  bool is_directory = 5;
 }
 
 message ActionExecutionEnd {
@@ -2231,6 +2262,7 @@ message ReLogStreamAvailable {
   string stderr_stream_name = 3;
   optional string action_key = 4;
   string use_case = 5;
+  ActionKey key = 6;
 }
 
 message LocalStage {
@@ -2287,6 +2319,7 @@ message TestDiscoveryStart {
   // Trying to find the test suite(s) associated with this binary.
   string suite_name = 1;
   ConfiguredTargetLabel target_label = 2;
+  repeated string labels = 3;
 }
 
 message TestDiscoveryEnd {
@@ -2296,6 +2329,7 @@ message TestDiscoveryEnd {
   optional buck.host_sharing.HostSharingRequirements
       command_host_sharing_requirements = 4;
   ConfiguredTargetLabel target_label = 5;
+  repeated string labels = 6;
 }
 
 message TestRunStart {
@@ -2307,6 +2341,7 @@ message TestRunEnd {
   CommandExecution command_report = 2;
   optional buck.host_sharing.HostSharingRequirements
       command_host_sharing_requirements = 3;
+  google.protobuf.Duration timeout = 4;
 }
 
 message FileWatcherStart {
@@ -2467,6 +2502,26 @@ message EnvironmentEntry {
   string key = 1;
   // The environment value.
   string value = 2;
+}
+
+message RunExecRequest {
+  string working_directory = 1;
+  repeated string argv = 2;
+  repeated EnvironmentEntry env = 3;
+  repeated string env_to_clear = 4;
+  bool should_exec = 5;
+}
+
+enum ExternalResourceDownloader {
+  UNKNOWN_DOWNLOADER = 0;
+  HTTP_DOWNLOADER = 1;
+  GRPC_DOWNLOADER = 2;
+}
+
+message ExternalResourceFetch {
+  string url = 1;
+  ExternalResourceDownloader downloader = 2;
+  bool success = 3;
 }
 
 /// A representation of a command that we executed locally.
@@ -3038,8 +3093,14 @@ message DepFileUploadEnd {
 
 message CreateOutputSymlinksStart {};
 
+message OutputSymlink {
+  string path = 1;
+  string target = 2;
+}
+
 message CreateOutputSymlinksEnd {
   uint64 created = 1;
+  repeated OutputSymlink symlinks = 2;
 };
 
 message InstallEventInfoStart {
@@ -3081,6 +3142,8 @@ message MaterializationEnd {
 
   // The type of entry that was materialized
   optional MaterializationMethod method = 7;
+  // The URL fetched for HTTP downloads.
+  optional string url = 8;
 };
 
 message ExclusiveCommandWaitStart {
@@ -3282,6 +3345,32 @@ message ReUploadEnd {
   optional uint64 digests_uploaded = 1;
   optional uint64 bytes_uploaded = 2;
   map<string, ReUploadMetrics> stats_by_extension = 3;
+}
+
+message RemoteRequestStart {
+  string service = 1;
+  string method = 2;
+  optional string action_digest = 3;
+  optional string action_id = 4;
+  optional string target = 5;
+  optional string action_mnemonic = 6;
+  string use_case = 7;
+  optional uint64 digest_count = 8;
+  optional uint64 bytes = 9;
+  optional bool upload_only_missing = 10;
+  optional bool skip_cache_lookup = 11;
+  map<string, string> details = 12;
+}
+
+message RemoteRequestEnd {
+  bool success = 1;
+  optional string error = 2;
+  optional string re_error_code = 3;
+  optional uint64 digest_count = 4;
+  optional uint64 bytes = 5;
+  optional bool cache_hit = 6;
+  optional uint64 ttl_seconds = 7;
+  map<string, string> details = 8;
 }
 
 message ConnectToInstallerStart {
