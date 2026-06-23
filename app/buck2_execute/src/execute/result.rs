@@ -136,6 +136,68 @@ impl Display for CommandExecutionStatus {
     }
 }
 
+#[derive(Debug, Copy, Clone, Dupe, Allocative)]
+pub struct RemoteExecutionTimestamp {
+    pub seconds: i64,
+    pub nanos: i32,
+}
+
+impl RemoteExecutionTimestamp {
+    pub fn to_system_time(self) -> SystemTime {
+        let seconds = u64::try_from(self.seconds).unwrap_or_default();
+        let nanos = u32::try_from(self.nanos).unwrap_or_default();
+        SystemTime::UNIX_EPOCH + Duration::new(seconds, nanos)
+    }
+}
+
+#[derive(Debug, Copy, Clone, Dupe, Allocative)]
+pub struct RemoteExecutionTiming {
+    pub queued_timestamp: Option<RemoteExecutionTimestamp>,
+    pub worker_start_timestamp: Option<RemoteExecutionTimestamp>,
+    pub worker_completed_timestamp: Option<RemoteExecutionTimestamp>,
+    pub input_fetch_start_timestamp: Option<RemoteExecutionTimestamp>,
+    pub input_fetch_completed_timestamp: Option<RemoteExecutionTimestamp>,
+    pub execution_start_timestamp: Option<RemoteExecutionTimestamp>,
+    pub execution_completed_timestamp: Option<RemoteExecutionTimestamp>,
+    pub output_upload_start_timestamp: Option<RemoteExecutionTimestamp>,
+    pub output_upload_completed_timestamp: Option<RemoteExecutionTimestamp>,
+}
+
+impl RemoteExecutionTiming {
+    pub fn to_proto(self) -> buck2_data::RemoteExecutionTiming {
+        buck2_data::RemoteExecutionTiming {
+            worker: String::new(),
+            queued_timestamp: self
+                .queued_timestamp
+                .map(|timestamp| timestamp.to_system_time().into()),
+            worker_start_timestamp: self
+                .worker_start_timestamp
+                .map(|timestamp| timestamp.to_system_time().into()),
+            worker_completed_timestamp: self
+                .worker_completed_timestamp
+                .map(|timestamp| timestamp.to_system_time().into()),
+            input_fetch_start_timestamp: self
+                .input_fetch_start_timestamp
+                .map(|timestamp| timestamp.to_system_time().into()),
+            input_fetch_completed_timestamp: self
+                .input_fetch_completed_timestamp
+                .map(|timestamp| timestamp.to_system_time().into()),
+            execution_start_timestamp: self
+                .execution_start_timestamp
+                .map(|timestamp| timestamp.to_system_time().into()),
+            execution_completed_timestamp: self
+                .execution_completed_timestamp
+                .map(|timestamp| timestamp.to_system_time().into()),
+            output_upload_start_timestamp: self
+                .output_upload_start_timestamp
+                .map(|timestamp| timestamp.to_system_time().into()),
+            output_upload_completed_timestamp: self
+                .output_upload_completed_timestamp
+                .map(|timestamp| timestamp.to_system_time().into()),
+        }
+    }
+}
+
 /// Unlike action where we only really have just 1 time, commands can have slightly richer timing
 /// data.
 #[derive(Debug, Copy, Clone, Dupe, Allocative)]
@@ -166,6 +228,8 @@ pub struct CommandExecutionMetadata {
     /// How long this command spent waiting to run
     pub queue_duration: Option<Duration>,
 
+    pub remote_execution_timing: Option<RemoteExecutionTiming>,
+
     pub suspend_duration: Option<Duration>,
 
     pub suspend_count: Option<u64>,
@@ -182,6 +246,7 @@ impl CommandExecutionMetadata {
             hashing_duration: Duration::default(),
             hashed_artifacts_count: 0,
             queue_duration: None,
+            remote_execution_timing: None,
             suspend_count: None,
             suspend_duration: None,
         }
@@ -195,6 +260,7 @@ impl CommandExecutionMetadata {
             execution_stats: re_timing.execution_stats,
             input_materialization_duration: re_timing.input_materialization_duration,
             queue_duration: re_timing.queue_duration,
+            remote_execution_timing: re_timing.remote_execution_timing,
             hashing_duration: Default::default(),
             hashed_artifacts_count: 0,
             suspend_duration: None,
@@ -217,6 +283,9 @@ impl CommandExecutionMetadata {
             hashing_duration: metadata.hashing_duration.try_into().ok(),
             hashed_artifacts_count: metadata.hashed_artifacts_count,
             queue_duration: metadata.queue_duration.and_then(|d| d.try_into().ok()),
+            remote_execution_timing: metadata
+                .remote_execution_timing
+                .map(RemoteExecutionTiming::to_proto),
             suspend_duration: metadata.suspend_duration.and_then(|d| d.try_into().ok()),
             suspend_count: metadata.suspend_count,
         }
@@ -492,6 +561,7 @@ mod tests {
             hashing_duration: Duration::from_secs(7),
             hashed_artifacts_count: 8,
             queue_duration: Some(Duration::from_secs(9)),
+            remote_execution_timing: None,
             suspend_duration: None,
             suspend_count: None,
         };
@@ -569,6 +639,7 @@ mod tests {
                 seconds: 9,
                 nanos: 0,
             }),
+            remote_execution_timing: None,
             suspend_duration: None,
             suspend_count: None,
         };
