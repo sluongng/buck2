@@ -76,14 +76,14 @@
       ]
     },
     "linux-x86_64": {
-      "size": 40741212,
+      "size": 28088915,
       "hash": "blake3",
-      "digest": "ba10bc5e96f07274b5909bc0daee68f96aa7566e45d7f0a329c04967c3174c78",
+      "digest": "333f3c37da98f0ca00babe56469d4e6ce10eed1096deb989e328c49df57a6dc0",
       "format": "zst",
       "path": "buck2-x86_64-unknown-linux-gnu",
       "providers": [
         {
-          "url": "https://github.com/sluongng/buck2/releases/download/v0.202626.1/buck2-x86_64-unknown-linux-gnu.zst"
+          "url": "https://github.com/sluongng/buck2/releases/download/v0.202626.2/buck2-x86_64-unknown-linux-gnu.zst"
         }
       ]
     }
