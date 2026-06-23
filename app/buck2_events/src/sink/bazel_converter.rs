@@ -1956,6 +1956,14 @@ impl BazelEventConverter {
         if children.is_empty() && self.should_defer_target_setup() {
             children = configured_target_children_from_labels(&self.configured_target_labels);
         }
+        if children.is_empty()
+            && self.should_defer_target_setup()
+            && (force
+                || !self.pending_configured_events.is_empty()
+                || !self.configured_target_labels.is_empty())
+        {
+            children = configured_target_children_from_exact_patterns(&patterns);
+        }
         if !force && self.should_defer_target_setup() && children.is_empty() {
             return;
         }
@@ -5839,6 +5847,28 @@ fn configured_target_children_from_labels(labels: &BTreeSet<String>) -> Vec<bep:
     labels.iter().cloned().map(target_configured_id).collect()
 }
 
+fn configured_target_children_from_exact_patterns(patterns: &[String]) -> Vec<bep::BuildEventId> {
+    patterns
+        .iter()
+        .filter_map(|pattern| exact_target_label_from_pattern(pattern))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(target_configured_id)
+        .collect()
+}
+
+fn exact_target_label_from_pattern(pattern: &str) -> Option<String> {
+    let pattern = pattern.trim();
+    if pattern.contains("...") {
+        return None;
+    }
+    let (_, name) = pattern.rsplit_once(':')?;
+    if name.is_empty() {
+        return None;
+    }
+    normalize_buck_label(pattern)
+}
+
 fn pattern_expanded_event(
     patterns: Vec<String>,
     children: Vec<bep::BuildEventId>,
@@ -9686,6 +9716,71 @@ mod tests {
         assert!(expanded_index < configured_index);
         assert!(configured_index < workspace_status_index);
         assert!(workspace_status_index < test_result_index);
+    }
+
+    #[test]
+    fn test_command_exact_patterns_expand_without_configured_events() {
+        let mut converter = BazelEventConverter::default();
+        let pattern_id = pattern_expanded_id(vec!["//pkg:main".to_owned()]);
+        let target_id = target_configured_id("//pkg:main".to_owned());
+
+        converter.convert(
+            1,
+            &trace_event(buck2_data::buck_event::Data::SpanStart(
+                buck2_data::SpanStartEvent {
+                    data: Some(buck2_data::span_start_event::Data::Command(
+                        buck2_data::CommandStart {
+                            cli_args: vec!["buck2".to_owned(), "test".to_owned()],
+                            data: Some(buck2_data::command_start::Data::Test(
+                                buck2_data::TestCommandStart {},
+                            )),
+                            ..Default::default()
+                        },
+                    )),
+                },
+            )),
+        );
+
+        converter.convert(
+            2,
+            &trace_event(buck2_data::buck_event::Data::Instant(
+                buck2_data::InstantEvent {
+                    data: Some(buck2_data::instant_event::Data::TargetPatterns(
+                        buck2_data::ParsedTargetPatterns {
+                            target_patterns: vec![buck2_data::TargetPattern {
+                                value: "//pkg:main".to_owned(),
+                            }],
+                        },
+                    )),
+                },
+            )),
+        );
+
+        let end_events = converter.convert(
+            3,
+            &trace_event(buck2_data::buck_event::Data::SpanEnd(
+                buck2_data::SpanEndEvent {
+                    data: Some(buck2_data::span_end_event::Data::Command(
+                        buck2_data::CommandEnd {
+                            data: Some(buck2_data::command_end::Data::Test(
+                                buck2_data::TestCommandEnd::default(),
+                            )),
+                            is_success: true,
+                            build_result: Some(buck2_data::BuildResult {
+                                build_completed: true,
+                            }),
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+        );
+
+        let expanded = end_events
+            .iter()
+            .find(|event| event.id.as_ref() == Some(&pattern_id))
+            .expect("PatternExpanded event");
+        assert!(expanded.children.contains(&target_id));
     }
 
     #[test]
