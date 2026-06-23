@@ -294,20 +294,18 @@ prepare_worktree() {
         return
     fi
 
-    if [[ "$PREPARE_RUST_SHIMS" == "auto" && -f "$worktree/shim/third-party/rust/BUCK.reindeer" ]]; then
-        return
-    fi
-
     if [[ -n "$RUST_SHIM_SOURCE" ]]; then
         echo "Copying shim/third-party/rust/BUCK.reindeer from $RUST_SHIM_SOURCE"
         mkdir -p "$worktree/shim/third-party/rust"
         cp "$RUST_SHIM_SOURCE" "$worktree/shim/third-party/rust/BUCK.reindeer"
-        for support_file in shim/git_fetch.bzl; do
-            if [[ -f "$ROOT_DIR/$support_file" && ( "$PREPARE_RUST_SHIMS" == "always" || ! -f "$worktree/$support_file" ) ]]; then
-                echo "Copying $support_file from $ROOT_DIR"
-                mkdir -p "$worktree/$(dirname "$support_file")"
-                cp "$ROOT_DIR/$support_file" "$worktree/$support_file"
+        cp "$RUST_SHIM_SOURCE" "$worktree/shim/third-party/rust/BUCK"
+        for support_file in shim/BUCK shim/git_fetch.bzl shim/rust-toolchain.toml shim/rust_toolchain.bzl; do
+            if [[ ! -e "$ROOT_DIR/$support_file" ]]; then
+                continue
             fi
+            echo "Copying $support_file from $ROOT_DIR"
+            mkdir -p "$worktree/$(dirname "$support_file")"
+            cp -P "$ROOT_DIR/$support_file" "$worktree/$support_file"
         done
         return
     fi
@@ -319,6 +317,7 @@ prepare_worktree() {
 
     echo "Generating shim/third-party/rust/BUCK.reindeer with Reindeer"
     (cd "$worktree" && ./bootstrap/reindeer --third-party-dir shim/third-party/rust buckify)
+    cp "$worktree/shim/third-party/rust/BUCK.reindeer" "$worktree/shim/third-party/rust/BUCK"
 }
 
 prepare_matrix_worktree() {

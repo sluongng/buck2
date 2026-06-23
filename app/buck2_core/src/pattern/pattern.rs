@@ -1633,7 +1633,9 @@ mod tests {
             ParsedPattern::<TargetPatternExtra>::parse_not_relaxed(
                 "path",
                 TargetParsingRel::AllowRelative(
-                    &CellPathWithAllowedRelativeDir::backwards_relative_not_supported(package.clone()),
+                    &CellPathWithAllowedRelativeDir::backwards_relative_not_supported(
+                        package.clone()
+                    ),
                     Some(&NoAliases),
                 ),
                 &resolver(),

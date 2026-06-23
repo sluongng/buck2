@@ -7573,6 +7573,8 @@ dependencies = [
  "anyhow",
  "async-compression",
  "blake3",
+ "buck2_data",
+ "buck2_events",
  "buck2_re_configuration",
  "buck2_util",
  "dupe",

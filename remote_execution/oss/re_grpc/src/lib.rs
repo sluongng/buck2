@@ -8,6 +8,8 @@
  * above-listed licenses.
  */
 
+#![allow(clippy::needless_update)]
+
 mod client;
 mod digest;
 mod error;
