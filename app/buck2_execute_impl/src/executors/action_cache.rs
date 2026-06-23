@@ -406,6 +406,7 @@ fn is_remote_cache_unavailable(error: &buck2_error::Error) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use buck2_execute::re::error::test_re_error;
 

@@ -67,6 +67,7 @@ use crate::re::paranoid_download::ParanoidDownloader;
 use crate::sqlite::incremental_state_db::IncrementalDbState;
 use crate::storage_resource_exhausted::is_storage_resource_exhausted;
 
+#[allow(clippy::large_enum_variant)]
 enum ReExecuteOutcome {
     Executed(ExecuteResponseWithQueueStats),
     MissingCasInputs(remote_execution::TStatus),

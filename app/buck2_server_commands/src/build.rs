@@ -740,10 +740,10 @@ async fn apply_action_rewind(
     let ctx = ctx
         .update_to_latest(
             action_keys
-            .iter()
-            .cloned()
-            .map(BuildKey)
-            .collect::<Vec<_>>(),
+                .iter()
+                .cloned()
+                .map(BuildKey)
+                .collect::<Vec<_>>(),
         )
         .await?;
     ctx.per_transaction_data().set_rewound_actions(&action_keys);

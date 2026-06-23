@@ -949,12 +949,8 @@ impl TestOrchestrator for BuckTestOrchestrator<'_> {
     ) -> buck2_error::Result<()> {
         let test_target = self.session.get(test_target)?;
         let mut dice = self.dice.ctx();
-        let test_info = Self::get_test_info(
-            &mut dice,
-            &test_target,
-            &self.internal_runner_config,
-        )
-        .await?;
+        let test_info =
+            Self::get_test_info(&mut dice, &test_target, &self.internal_runner_config).await?;
         let labels = test_labels(&test_info);
 
         self.events.instant_event(TestDiscovery {

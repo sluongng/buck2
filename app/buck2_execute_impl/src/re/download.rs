@@ -658,6 +658,7 @@ struct ExtractedArtifacts {
 }
 
 /// Did this download work out?
+#[allow(clippy::large_enum_variant)]
 pub enum DownloadResult {
     /// Got a result: might be a success, might be a failure. Caller needs to deal with this
     /// result.
