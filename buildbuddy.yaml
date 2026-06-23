@@ -96,7 +96,7 @@ actions:
           local_buck2_build() {
             local attempt="$1"
             "$buck2_bootstrap" \
-              --isolation-dir "buildbuddy-rbe-build-$BUILDBUDDY_INVOCATION_ID-$attempt" \
+              --isolation-dir "buildbuddy-rbe-build-$attempt" \
               build \
               --show-full-json-output \
               --config-file .buckconfig.buildbuddy \
@@ -107,7 +107,7 @@ actions:
           if ! built_buck2_json="$(local_buck2_build initial)"; then
             echo "Local //:buck2 bootstrap build failed; retrying once with fresh Buck2 daemon state" >&2
             "$buck2_bootstrap" killall >/dev/null 2>&1 || true
-            rm -rf "buck-out/buildbuddy-rbe-build-$BUILDBUDDY_INVOCATION_ID-retry"
+            rm -rf "buck-out/buildbuddy-rbe-build-retry"
             built_buck2_json="$(local_buck2_build retry)"
           fi
           built_buck2="$(python3 -c 'import json, sys; outputs = json.load(sys.stdin); output = next(iter(outputs.values())); print(output[0] if isinstance(output, list) else output)' <<< "$built_buck2_json")"
@@ -126,7 +126,7 @@ actions:
           export BUCK2_TEST_EXTRA_EXTERNAL_CONFIG="$PWD/.buckconfig.buildbuddy"
 
           built_buck2=$(cat .buildbuddy-workflow/built-buck2.path)
-          remote_matrix_isolation_prefix="buildbuddy-rbe-tests-$BUILDBUDDY_INVOCATION_ID"
+          remote_matrix_isolation_prefix="buildbuddy-rbe-tests"
           remote_only_buck2_build() {
             local isolation_dir="$1"
             "$built_buck2" \
@@ -144,8 +144,9 @@ actions:
             remote_only_buck2_build "$remote_matrix_isolation_prefix-rbe"
           fi
 
-          # The matrix isolation prefix is already unique per workflow run. Do
-          # not pass --clean-output here because it starts with buck2 killall,
+          # Keep the matrix isolation prefix stable across workflow runs so
+          # Buck output paths, and therefore remote action keys, remain stable.
+          # Do not pass --clean-output here because it starts with buck2 killall,
           # which can stop the previous daemon before its terminal BES events
           # are flushed to BuildBuddy. Reusing the self-test isolation dir lets
           # the deferred materializer state from the remote //:buck2 build carry
