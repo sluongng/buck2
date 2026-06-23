@@ -290,6 +290,42 @@ fn main() -> io::Result<()> {
             "buck.data.CommandExecutionMetadata.queue_duration",
             "#[serde(rename = \"queue_duration_us\", with = \"crate::serialize_duration_as_micros\")]",
         )
+        .field_attribute(
+            "RemoteExecutionTiming.queued_timestamp",
+            "#[serde(default, with = \"crate::serialize_timestamp\")]",
+        )
+        .field_attribute(
+            "RemoteExecutionTiming.worker_start_timestamp",
+            "#[serde(default, with = \"crate::serialize_timestamp\")]",
+        )
+        .field_attribute(
+            "RemoteExecutionTiming.worker_completed_timestamp",
+            "#[serde(default, with = \"crate::serialize_timestamp\")]",
+        )
+        .field_attribute(
+            "RemoteExecutionTiming.input_fetch_start_timestamp",
+            "#[serde(default, with = \"crate::serialize_timestamp\")]",
+        )
+        .field_attribute(
+            "RemoteExecutionTiming.input_fetch_completed_timestamp",
+            "#[serde(default, with = \"crate::serialize_timestamp\")]",
+        )
+        .field_attribute(
+            "RemoteExecutionTiming.execution_start_timestamp",
+            "#[serde(default, with = \"crate::serialize_timestamp\")]",
+        )
+        .field_attribute(
+            "RemoteExecutionTiming.execution_completed_timestamp",
+            "#[serde(default, with = \"crate::serialize_timestamp\")]",
+        )
+        .field_attribute(
+            "RemoteExecutionTiming.output_upload_start_timestamp",
+            "#[serde(default, with = \"crate::serialize_timestamp\")]",
+        )
+        .field_attribute(
+            "RemoteExecutionTiming.output_upload_completed_timestamp",
+            "#[serde(default, with = \"crate::serialize_timestamp\")]",
+        )
         .boxed("RecordEvent.data.invocation_record")
         .boxed("SpanEndEvent.data.action_execution")
         .boxed("SpanEndEvent.data.cache_upload")

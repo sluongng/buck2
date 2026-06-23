@@ -339,6 +339,20 @@ pub fn display_event(event: &BuckEvent, opts: TargetDisplayOptions) -> buck2_err
             )),
             Data::CacheUpload(_) => Ok("upload (action)".to_owned()),
             Data::DepFileUpload(_) => Ok("upload (dep_file)".to_owned()),
+            Data::RemoteRequest(request) => {
+                let name = if request.service.is_empty() {
+                    request.method.clone()
+                } else if request.method.is_empty() {
+                    request.service.clone()
+                } else {
+                    format!("{} {}", request.service, request.method)
+                };
+                Ok(if name.is_empty() {
+                    "remote request".to_owned()
+                } else {
+                    name
+                })
+            }
             Data::CreateOutputSymlinks(..) => Ok("Creating output symlinks".to_owned()),
             Data::InstallEventInfo(info) => Ok(format!(
                 "Sending {} at path {}",

@@ -175,6 +175,7 @@ struct CommandProfileBuilder {
     command_name: Option<String>,
     open_spans: BTreeMap<u64, ProfileOpenSpan>,
     completed_spans: Vec<ProfileCompletedSpan>,
+    next_synthetic_span_id: u64,
     dropped_spans: usize,
 }
 
@@ -2673,6 +2674,9 @@ impl CommandProfileBuilder {
             .max(1);
         if let Some(mut open) = self.open_spans.remove(&event.span_id) {
             extend_json_map(&mut open.args, profile_span_end_args(data));
+            let parent_id = open.span_id;
+            let parent_start_us = open.start_us;
+            let parent_end_us = open.start_us.saturating_add(duration_us);
             self.push_completed(ProfileCompletedSpan {
                 span_id: open.span_id,
                 parent_id: open.parent_id,
@@ -2683,6 +2687,14 @@ impl CommandProfileBuilder {
                 duration_us,
                 args: open.args,
             });
+            if let buck2_data::span_end_event::Data::ActionExecution(action) = data {
+                self.record_remote_execution_timing_spans(
+                    parent_id,
+                    parent_start_us,
+                    parent_end_us,
+                    action,
+                );
+            }
             return;
         }
 
@@ -2694,16 +2706,26 @@ impl CommandProfileBuilder {
         };
         let mut args = details.args;
         extend_json_map(&mut args, profile_span_end_args(data));
+        let start_us = end_us.saturating_sub(duration_us);
+        let parent_end_us = start_us.saturating_add(duration_us);
         self.push_completed(ProfileCompletedSpan {
             span_id: event.span_id,
             parent_id: event.parent_id,
             name: details.name,
             lane: details.lane,
             category: details.category,
-            start_us: end_us.saturating_sub(duration_us),
+            start_us,
             duration_us,
             args,
         });
+        if let buck2_data::span_end_event::Data::ActionExecution(action) = data {
+            self.record_remote_execution_timing_spans(
+                event.span_id,
+                start_us,
+                parent_end_us,
+                action,
+            );
+        }
     }
 
     fn push_completed(&mut self, span: ProfileCompletedSpan) {
@@ -2712,6 +2734,45 @@ impl CommandProfileBuilder {
             return;
         }
         self.completed_spans.push(span);
+    }
+
+    fn record_remote_execution_timing_spans(
+        &mut self,
+        parent_id: u64,
+        parent_start_us: i64,
+        parent_end_us: i64,
+        action: &buck2_data::ActionExecutionEnd,
+    ) {
+        for command in &action.commands {
+            let Some(details) = command.details.as_ref() else {
+                continue;
+            };
+            let Some(metadata) = details.metadata.as_ref() else {
+                continue;
+            };
+            let Some(timing) = metadata.remote_execution_timing.as_ref() else {
+                continue;
+            };
+            for phase in remote_execution_phase_profile_spans(
+                parent_id,
+                parent_start_us,
+                parent_end_us,
+                action,
+                command,
+                timing,
+            ) {
+                let mut phase = phase;
+                phase.span_id = self.next_synthetic_profile_span_id();
+                self.push_completed(phase);
+            }
+        }
+    }
+
+    fn next_synthetic_profile_span_id(&mut self) -> u64 {
+        const SYNTHETIC_SPAN_ID_BASE: u64 = 1 << 63;
+        let id = SYNTHETIC_SPAN_ID_BASE.saturating_add(self.next_synthetic_span_id);
+        self.next_synthetic_span_id = self.next_synthetic_span_id.saturating_add(1);
+        id
     }
 
     fn command_end_profile_gzip(
@@ -4909,8 +4970,7 @@ fn profile_span_start_details(
             Some(profile_action_start_details(action))
         }
         buck2_data::span_start_event::Data::ExecutorStage(stage) => {
-            profile_executor_stage_name(stage.stage.as_ref())
-                .map(|name| profile_details(name, ProfileLane::ActionStages, "action_stage"))
+            profile_executor_stage_details(stage)
         }
         buck2_data::span_start_event::Data::TestDiscovery(test) => {
             let target = test
@@ -4979,10 +5039,13 @@ fn profile_span_start_details(
             profile_cache_upload_details(&upload.key, &upload.name, &upload.remote_dep_file_key),
         ),
         buck2_data::span_start_event::Data::ReUpload(_) => Some(profile_details(
-            "remote upload",
-            ProfileLane::Cache,
+            "remote input upload",
+            ProfileLane::ActionStages,
             "remote",
         )),
+        buck2_data::span_start_event::Data::RemoteRequest(request) => {
+            Some(profile_remote_request_details(request))
+        }
         buck2_data::span_start_event::Data::DeferredPreparationStage(_) => Some(profile_details(
             "deferred preparation",
             ProfileLane::Materialization,
@@ -5174,6 +5237,11 @@ fn profile_span_end_details(data: &buck2_data::span_end_event::Data) -> Option<P
         buck2_data::span_end_event::Data::DepFileUpload(upload) => Some(
             profile_cache_upload_details(&upload.key, &upload.name, &upload.remote_dep_file_key),
         ),
+        buck2_data::span_end_event::Data::RemoteRequest(_) => Some(profile_details(
+            "remote request",
+            ProfileLane::ActionStages,
+            "remote_request",
+        )),
         buck2_data::span_end_event::Data::Materialization(materialization) => {
             let mut details = profile_details(
                 "materialization",
@@ -5306,6 +5374,30 @@ fn profile_span_end_args(
                 json_arg_non_empty(&mut args, "re_error_code", code);
             }
         }
+        buck2_data::span_end_event::Data::RemoteRequest(request) => {
+            json_arg_bool(&mut args, "success", request.success);
+            if let Some(error) = request.error.as_ref() {
+                json_arg_non_empty(&mut args, "error", error);
+            }
+            if let Some(code) = request.re_error_code.as_ref() {
+                json_arg_non_empty(&mut args, "re_error_code", code);
+            }
+            if let Some(count) = request.digest_count {
+                json_arg_u64(&mut args, "digest_count", count);
+            }
+            if let Some(bytes) = request.bytes {
+                json_arg_u64(&mut args, "bytes", bytes);
+            }
+            if let Some(cache_hit) = request.cache_hit {
+                json_arg_bool(&mut args, "cache_hit", cache_hit);
+            }
+            if let Some(ttl) = request.ttl_seconds {
+                json_arg_u64(&mut args, "ttl_seconds", ttl);
+            }
+            for (key, value) in &request.details {
+                json_arg_non_empty(&mut args, key, value);
+            }
+        }
         buck2_data::span_end_event::Data::Materialization(materialization) => {
             json_arg_u64(&mut args, "file_count", materialization.file_count);
             json_arg_u64(&mut args, "total_bytes", materialization.total_bytes);
@@ -5385,12 +5477,192 @@ fn profile_cache_upload_details(
             "upload {}",
             profile_action_name(key.as_ref(), name.as_ref(), 0)
         ),
-        ProfileLane::Cache,
+        profile_remote_child_lane(key.is_some()),
         "cache",
     );
     add_action_identity_args(&mut details.args, key.as_ref(), name.as_ref(), 0);
     json_arg_non_empty(&mut details.args, "digest", digest);
     details
+}
+
+fn profile_remote_child_lane(has_action_identity: bool) -> ProfileLane {
+    if has_action_identity {
+        ProfileLane::ActionStages
+    } else {
+        ProfileLane::Cache
+    }
+}
+
+fn profile_remote_request_details(request: &buck2_data::RemoteRequestStart) -> ProfileSpanDetails {
+    let name = if request.service.is_empty() {
+        request.method.clone()
+    } else if request.method.is_empty() {
+        request.service.clone()
+    } else {
+        format!("{} {}", request.service, request.method)
+    };
+    let mut details = profile_details(
+        if name.is_empty() {
+            "remote request".to_owned()
+        } else {
+            name
+        },
+        profile_remote_child_lane(
+            request.target.is_some()
+                || request.action_digest.is_some()
+                || request.action_id.is_some(),
+        ),
+        "remote_request",
+    );
+    json_arg_non_empty(&mut details.args, "service", &request.service);
+    json_arg_non_empty(&mut details.args, "method", &request.method);
+    if let Some(action_digest) = request.action_digest.as_ref() {
+        json_arg_non_empty(&mut details.args, "action_digest", action_digest);
+    }
+    if let Some(action_id) = request.action_id.as_ref() {
+        json_arg_non_empty(&mut details.args, "action_id", action_id);
+    }
+    if let Some(target) = request.target.as_ref() {
+        json_arg_non_empty(&mut details.args, "target", target);
+    }
+    if let Some(action_mnemonic) = request.action_mnemonic.as_ref() {
+        json_arg_non_empty(&mut details.args, "action_mnemonic", action_mnemonic);
+    }
+    json_arg_non_empty(&mut details.args, "use_case", &request.use_case);
+    if let Some(count) = request.digest_count {
+        json_arg_u64(&mut details.args, "digest_count", count);
+    }
+    if let Some(bytes) = request.bytes {
+        json_arg_u64(&mut details.args, "bytes", bytes);
+    }
+    if let Some(upload_only_missing) = request.upload_only_missing {
+        json_arg_bool(
+            &mut details.args,
+            "upload_only_missing",
+            upload_only_missing,
+        );
+    }
+    if let Some(skip_cache_lookup) = request.skip_cache_lookup {
+        json_arg_bool(&mut details.args, "skip_cache_lookup", skip_cache_lookup);
+    }
+    for (key, value) in &request.details {
+        json_arg_non_empty(&mut details.args, key, value);
+    }
+    details
+}
+
+fn remote_execution_phase_profile_spans(
+    parent_id: u64,
+    parent_start_us: i64,
+    parent_end_us: i64,
+    action: &buck2_data::ActionExecutionEnd,
+    command: &buck2_data::CommandExecution,
+    timing: &buck2_data::RemoteExecutionTiming,
+) -> Vec<ProfileCompletedSpan> {
+    [
+        (
+            "RE queue",
+            "queue",
+            timing.queued_timestamp.as_ref(),
+            timing.worker_start_timestamp.as_ref(),
+        ),
+        (
+            "RE input fetch",
+            "input_fetch",
+            timing.input_fetch_start_timestamp.as_ref(),
+            timing.input_fetch_completed_timestamp.as_ref(),
+        ),
+        (
+            "RE execution",
+            "execution",
+            timing.execution_start_timestamp.as_ref(),
+            timing.execution_completed_timestamp.as_ref(),
+        ),
+        (
+            "RE output upload",
+            "output_upload",
+            timing.output_upload_start_timestamp.as_ref(),
+            timing.output_upload_completed_timestamp.as_ref(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, phase, start, end)| {
+        remote_execution_phase_profile_span(
+            parent_id,
+            parent_start_us,
+            parent_end_us,
+            action,
+            command,
+            timing,
+            name,
+            phase,
+            start,
+            end,
+        )
+    })
+    .collect()
+}
+
+fn remote_execution_phase_profile_span(
+    parent_id: u64,
+    parent_start_us: i64,
+    parent_end_us: i64,
+    action: &buck2_data::ActionExecutionEnd,
+    command: &buck2_data::CommandExecution,
+    timing: &buck2_data::RemoteExecutionTiming,
+    name: &'static str,
+    phase: &'static str,
+    start: Option<&Timestamp>,
+    end: Option<&Timestamp>,
+) -> Option<ProfileCompletedSpan> {
+    let server_start_us = timestamp_micros(start)?;
+    let server_end_us = timestamp_micros(end)?;
+    if server_end_us <= server_start_us {
+        return None;
+    }
+
+    let start_us = server_start_us.max(parent_start_us);
+    let end_us = server_end_us.min(parent_end_us);
+    if end_us <= start_us {
+        return None;
+    }
+
+    let mut args = serde_json::Map::new();
+    json_arg_non_empty(&mut args, "phase", phase);
+    json_arg_i64(
+        &mut args,
+        "server_duration_ms",
+        (server_end_us - server_start_us) / 1_000,
+    );
+    if start_us != server_start_us || end_us != server_end_us {
+        json_arg_bool(&mut args, "clamped_to_action", true);
+    }
+    json_arg_non_empty(&mut args, "worker", &timing.worker);
+    add_action_identity_args(
+        &mut args,
+        action.key.as_ref(),
+        action.name.as_ref(),
+        action.kind,
+    );
+    if let Some(command_kind) = command
+        .details
+        .as_ref()
+        .and_then(|details| details.command_kind.as_ref())
+        .and_then(|kind| kind.command.as_ref())
+    {
+        add_command_kind_profile_args(&mut args, command_kind);
+    }
+
+    Some(ProfileCompletedSpan {
+        span_id: 0,
+        parent_id,
+        name: name.to_owned(),
+        lane: ProfileLane::ActionStages,
+        category: "remote_execution",
+        start_us,
+        duration_us: end_us.saturating_sub(start_us).max(1),
+        args,
+    })
 }
 
 fn profile_action_name(
@@ -5573,6 +5845,183 @@ fn add_command_profile_args(
             .as_ref()
             .and_then(|m| m.queue_duration.as_ref()),
     );
+    if let Some(command) = details
+        .command_kind
+        .as_ref()
+        .and_then(|kind| kind.command.as_ref())
+    {
+        add_command_kind_profile_args(args, command);
+    }
+}
+
+fn add_command_kind_profile_args(
+    args: &mut serde_json::Map<String, serde_json::Value>,
+    command: &buck2_data::command_execution_kind::Command,
+) {
+    match command {
+        buck2_data::command_execution_kind::Command::RemoteCommand(command) => {
+            json_arg_non_empty(args, "action_digest", &command.action_digest);
+            json_arg_bool(args, "cache_hit", command.cache_hit);
+            if let Ok(cache_hit_type) = buck2_data::CacheHitType::try_from(command.cache_hit_type) {
+                json_arg_non_empty(args, "cache_hit_type", cache_hit_type.as_str_name());
+            }
+            json_arg_duration_ms(args, "remote_queue_time_ms", command.queue_time.as_ref());
+            if let Some(remote_dep_file_key) = command.remote_dep_file_key.as_ref() {
+                json_arg_non_empty(args, "remote_dep_file_key", remote_dep_file_key);
+            }
+            json_arg_u64(
+                args,
+                "materialized_failed_input_count",
+                command.materialized_inputs_for_failed.len() as u64,
+            );
+            json_arg_u64(
+                args,
+                "materialized_failed_output_count",
+                command.materialized_outputs_for_failed_actions.len() as u64,
+            );
+            if let Some(details) = command.details.as_ref() {
+                if let Some(session_id) = details.session_id.as_ref() {
+                    json_arg_non_empty(args, "remote_session_id", session_id);
+                }
+                json_arg_non_empty(args, "remote_use_case", &details.use_case);
+                json_arg_bool(args, "remote_persistent_worker", details.persistent_worker);
+                add_re_platform_profile_arg(args, details.platform.as_ref());
+            }
+        }
+        buck2_data::command_execution_kind::Command::LocalCommand(command) => {
+            json_arg_non_empty(args, "action_digest", &command.action_digest);
+        }
+        buck2_data::command_execution_kind::Command::WorkerCommand(command) => {
+            json_arg_non_empty(args, "action_digest", &command.action_digest);
+        }
+        buck2_data::command_execution_kind::Command::OmittedLocalCommand(command) => {
+            json_arg_non_empty(args, "action_digest", &command.action_digest);
+        }
+        buck2_data::command_execution_kind::Command::WorkerInitCommand(_) => {}
+    }
+}
+
+fn profile_executor_stage_details(
+    stage: &buck2_data::ExecutorStageStart,
+) -> Option<ProfileSpanDetails> {
+    let name = profile_executor_stage_name(stage.stage.as_ref())?;
+    let mut details = profile_details(name, ProfileLane::ActionStages, "action_stage");
+    add_executor_stage_profile_args(&mut details.args, stage.stage.as_ref());
+    Some(details)
+}
+
+fn add_executor_stage_profile_args(
+    args: &mut serde_json::Map<String, serde_json::Value>,
+    stage: Option<&buck2_data::executor_stage_start::Stage>,
+) {
+    let Some(stage) = stage else {
+        return;
+    };
+    match stage {
+        buck2_data::executor_stage_start::Stage::Re(re) => {
+            add_re_stage_profile_args(args, re.stage.as_ref());
+        }
+        buck2_data::executor_stage_start::Stage::CacheQuery(query) => {
+            json_arg_non_empty(args, "action_digest", &query.action_digest);
+            json_arg_non_empty(args, "cache_type", query.cache_type().as_str_name());
+        }
+        buck2_data::executor_stage_start::Stage::CacheHit(hit) => {
+            json_arg_non_empty(args, "action_digest", &hit.action_digest);
+            if let Some(action_key) = hit.action_key.as_ref() {
+                json_arg_non_empty(args, "action_key", action_key);
+            }
+            json_arg_non_empty(args, "cache_type", hit.cache_type().as_str_name());
+        }
+        buck2_data::executor_stage_start::Stage::Local(_)
+        | buck2_data::executor_stage_start::Stage::Prepare(_) => {}
+    }
+}
+
+fn add_re_stage_profile_args(
+    args: &mut serde_json::Map<String, serde_json::Value>,
+    stage: Option<&buck2_data::re_stage::Stage>,
+) {
+    match stage {
+        Some(buck2_data::re_stage::Stage::Execute(execute)) => {
+            json_arg_non_empty(args, "action_digest", &execute.action_digest);
+            json_arg_non_empty(args, "remote_use_case", &execute.use_case);
+            if let Some(action_key) = execute.action_key.as_ref() {
+                json_arg_non_empty(args, "action_key", action_key);
+            }
+            json_arg_bool(args, "remote_persistent_worker", execute.persistent_worker);
+            add_re_platform_profile_arg(args, execute.platform.as_ref());
+        }
+        Some(buck2_data::re_stage::Stage::Queue(queue)) => {
+            add_re_queue_profile_args(args, queue);
+        }
+        Some(buck2_data::re_stage::Stage::QueueCancelled(queue)) => {
+            if let Some(queue) = queue.queue_info.as_ref() {
+                add_re_queue_profile_args(args, queue);
+            }
+        }
+        Some(buck2_data::re_stage::Stage::QueueOverQuota(queue)) => {
+            if let Some(queue) = queue.queue_info.as_ref() {
+                add_re_queue_profile_args(args, queue);
+            }
+        }
+        Some(buck2_data::re_stage::Stage::QueueAcquiringDependencies(queue)) => {
+            if let Some(queue) = queue.queue_info.as_ref() {
+                add_re_queue_profile_args(args, queue);
+            }
+        }
+        Some(buck2_data::re_stage::Stage::QueueNoWorkerAvailable(queue)) => {
+            if let Some(queue) = queue.queue_info.as_ref() {
+                add_re_queue_profile_args(args, queue);
+            }
+        }
+        Some(buck2_data::re_stage::Stage::WorkerDownload(download)) => {
+            json_arg_non_empty(args, "action_digest", &download.action_digest);
+            json_arg_non_empty(args, "remote_use_case", &download.use_case);
+        }
+        Some(buck2_data::re_stage::Stage::WorkerUpload(upload)) => {
+            json_arg_non_empty(args, "action_digest", &upload.action_digest);
+            json_arg_non_empty(args, "remote_use_case", &upload.use_case);
+        }
+        Some(buck2_data::re_stage::Stage::Unknown(unknown)) => {
+            json_arg_non_empty(args, "action_digest", &unknown.action_digest);
+        }
+        Some(buck2_data::re_stage::Stage::BeforeActionExecution(action)) => {
+            json_arg_non_empty(args, "action_digest", &action.action_digest);
+        }
+        Some(buck2_data::re_stage::Stage::AfterActionExecution(action)) => {
+            json_arg_non_empty(args, "action_digest", &action.action_digest);
+        }
+        Some(buck2_data::re_stage::Stage::Download(_))
+        | Some(buck2_data::re_stage::Stage::MaterializeFailedInputs(_))
+        | None => {}
+    }
+}
+
+fn add_re_queue_profile_args(
+    args: &mut serde_json::Map<String, serde_json::Value>,
+    queue: &buck2_data::ReQueue,
+) {
+    json_arg_non_empty(args, "action_digest", &queue.action_digest);
+    json_arg_non_empty(args, "remote_use_case", &queue.use_case);
+}
+
+fn add_re_platform_profile_arg(
+    args: &mut serde_json::Map<String, serde_json::Value>,
+    platform: Option<&buck2_data::RePlatform>,
+) {
+    let Some(platform) = platform else {
+        return;
+    };
+    let platform = platform
+        .properties
+        .iter()
+        .filter(|property| !property.name.is_empty())
+        .map(|property| format!("{}={}", property.name, property.value))
+        .collect::<Vec<_>>();
+    if platform.is_empty() {
+        return;
+    }
+    json_arg_non_empty(args, "remote_platform", &platform.join(","));
 }
 
 fn json_arg_non_empty(
@@ -11214,6 +11663,12 @@ mod tests {
     fn command_profile_includes_buck_spans_and_lanes() {
         let mut converter = BazelEventConverter::default();
         let target = configured_target();
+        let re_platform = buck2_data::RePlatform {
+            properties: vec![buck2_data::re_platform::Property {
+                name: "container-image".to_owned(),
+                value: "linux".to_owned(),
+            }],
+        };
         let command_start = trace_event_at(
             1,
             0,
@@ -11302,6 +11757,94 @@ mod tests {
         );
         converter.convert(4, &action_start);
 
+        let remote_stage_start = trace_event_at(
+            4,
+            3,
+            13_000,
+            buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                data: Some(buck2_data::span_start_event::Data::ExecutorStage(
+                    buck2_data::ExecutorStageStart {
+                        stage: Some(buck2_data::executor_stage_start::Stage::Re(
+                            buck2_data::ReStage {
+                                stage: Some(buck2_data::re_stage::Stage::Execute(
+                                    buck2_data::ReExecute {
+                                        action_digest: "action-digest".to_owned(),
+                                        platform: Some(re_platform.clone()),
+                                        action_key: Some("action-key".to_owned()),
+                                        use_case: "buck2-default".to_owned(),
+                                        persistent_worker: false,
+                                    },
+                                )),
+                            },
+                        )),
+                    },
+                )),
+            }),
+        );
+        converter.convert(5, &remote_stage_start);
+
+        let remote_request_start = trace_event_at(
+            5,
+            4,
+            14_000,
+            buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                data: Some(buck2_data::span_start_event::Data::RemoteRequest(
+                    buck2_data::RemoteRequestStart {
+                        service: "CAS".to_owned(),
+                        method: "FindMissingBlobs".to_owned(),
+                        action_digest: Some("action-digest".to_owned()),
+                        action_id: Some("action-id".to_owned()),
+                        target: Some("//pkg:main".to_owned()),
+                        action_mnemonic: Some("write".to_owned()),
+                        use_case: "buck2-default".to_owned(),
+                        digest_count: Some(3),
+                        bytes: Some(42),
+                        ..Default::default()
+                    },
+                )),
+            }),
+        );
+        converter.convert(6, &remote_request_start);
+
+        let remote_request_end = trace_event_at(
+            5,
+            4,
+            16_000,
+            buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+                data: Some(buck2_data::span_end_event::Data::RemoteRequest(
+                    buck2_data::RemoteRequestEnd {
+                        success: true,
+                        digest_count: Some(3),
+                        bytes: Some(42),
+                        ..Default::default()
+                    },
+                )),
+                duration: Some(prost_types::Duration {
+                    seconds: 0,
+                    nanos: 2_000_000,
+                }),
+                ..Default::default()
+            }),
+        );
+        converter.convert(7, &remote_request_end);
+
+        let remote_stage_end = trace_event_at(
+            4,
+            3,
+            18_000,
+            buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+                data: Some(buck2_data::span_end_event::Data::ExecutorStage(
+                    buck2_data::ExecutorStageEnd {},
+                )),
+                duration: Some(prost_types::Duration {
+                    seconds: 0,
+                    nanos: 5_000_000,
+                }),
+                ..Default::default()
+            }),
+        );
+        converter.convert(8, &remote_stage_end);
+
         let action_end = trace_event_at(
             3,
             1,
@@ -11312,8 +11855,112 @@ mod tests {
                         key: Some(action_key),
                         kind: buck2_data::ActionKind::Write as i32,
                         name: Some(action_name),
-                        execution_kind: buck2_data::ActionExecutionKind::Local as i32,
+                        execution_kind: buck2_data::ActionExecutionKind::Remote as i32,
                         output_size: 42,
+                        commands: vec![buck2_data::CommandExecution {
+                            details: Some(buck2_data::CommandExecutionDetails {
+                                command_kind: Some(buck2_data::CommandExecutionKind {
+                                    command: Some(
+                                        buck2_data::command_execution_kind::Command::RemoteCommand(
+                                            buck2_data::RemoteCommand {
+                                                action_digest: "action-digest".to_owned(),
+                                                cache_hit: false,
+                                                queue_time: Some(prost_types::Duration {
+                                                    seconds: 0,
+                                                    nanos: 2_000_000,
+                                                }),
+                                                details: Some(buck2_data::RemoteCommandDetails {
+                                                    session_id: Some("re-session".to_owned()),
+                                                    use_case: "buck2-default".to_owned(),
+                                                    platform: Some(re_platform),
+                                                    persistent_worker: false,
+                                                }),
+                                                cache_hit_type: buck2_data::CacheHitType::Executed
+                                                    as i32,
+                                                remote_dep_file_key: None,
+                                                materialized_inputs_for_failed: Vec::new(),
+                                                materialized_outputs_for_failed_actions: Vec::new(),
+                                            },
+                                        ),
+                                    ),
+                                }),
+                                metadata: Some(buck2_data::CommandExecutionMetadata {
+                                    wall_time: Some(prost_types::Duration {
+                                        seconds: 0,
+                                        nanos: 20_000_000,
+                                    }),
+                                    execution_time: Some(prost_types::Duration {
+                                        seconds: 0,
+                                        nanos: 12_000_000,
+                                    }),
+                                    queue_duration: Some(prost_types::Duration {
+                                        seconds: 0,
+                                        nanos: 2_000_000,
+                                    }),
+                                    remote_execution_timing: Some(
+                                        buck2_data::RemoteExecutionTiming {
+                                            worker: "executor-1".to_owned(),
+                                            queued_timestamp: Some(prost_types::Timestamp {
+                                                seconds: 1,
+                                                nanos: 13_000_000,
+                                            }),
+                                            worker_start_timestamp: Some(prost_types::Timestamp {
+                                                seconds: 1,
+                                                nanos: 15_000_000,
+                                            }),
+                                            input_fetch_start_timestamp: Some(
+                                                prost_types::Timestamp {
+                                                    seconds: 1,
+                                                    nanos: 16_000_000,
+                                                },
+                                            ),
+                                            input_fetch_completed_timestamp: Some(
+                                                prost_types::Timestamp {
+                                                    seconds: 1,
+                                                    nanos: 18_000_000,
+                                                },
+                                            ),
+                                            execution_start_timestamp: Some(
+                                                prost_types::Timestamp {
+                                                    seconds: 1,
+                                                    nanos: 19_000_000,
+                                                },
+                                            ),
+                                            execution_completed_timestamp: Some(
+                                                prost_types::Timestamp {
+                                                    seconds: 1,
+                                                    nanos: 27_000_000,
+                                                },
+                                            ),
+                                            output_upload_start_timestamp: Some(
+                                                prost_types::Timestamp {
+                                                    seconds: 1,
+                                                    nanos: 27_000_000,
+                                                },
+                                            ),
+                                            output_upload_completed_timestamp: Some(
+                                                prost_types::Timestamp {
+                                                    seconds: 1,
+                                                    nanos: 30_000_000,
+                                                },
+                                            ),
+                                            worker_completed_timestamp: Some(
+                                                prost_types::Timestamp {
+                                                    seconds: 1,
+                                                    nanos: 31_000_000,
+                                                },
+                                            ),
+                                        },
+                                    ),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }),
+                            status: Some(buck2_data::command_execution::Status::Success(
+                                buck2_data::command_execution::Success {},
+                            )),
+                            ..Default::default()
+                        }],
                         ..Default::default()
                     },
                 ))),
@@ -11324,7 +11971,7 @@ mod tests {
                 ..Default::default()
             }),
         );
-        converter.convert(5, &action_end);
+        converter.convert(9, &action_end);
 
         let command_end = trace_event_at(
             1,
@@ -11347,7 +11994,7 @@ mod tests {
                 ..Default::default()
             }),
         );
-        let events = converter.convert(6, &command_end);
+        let events = converter.convert(10, &command_end);
         let logs = events
             .iter()
             .find_map(|event| match event.payload.as_ref() {
@@ -11390,6 +12037,91 @@ mod tests {
             trace_events
                 .iter()
                 .any(|event| event["name"] == "write:main //pkg:main")
+        );
+        let action_profile_event = trace_events
+            .iter()
+            .find(|event| event["name"] == "write:main //pkg:main")
+            .expect("action profile event");
+        assert_eq!(action_profile_event["args"]["strategy"], "remote");
+        assert_eq!(
+            action_profile_event["args"]["action_digest"],
+            "action-digest"
+        );
+        assert_eq!(
+            action_profile_event["args"]["remote_use_case"],
+            "buck2-default"
+        );
+        assert_eq!(
+            action_profile_event["args"]["remote_session_id"],
+            "re-session"
+        );
+        assert_eq!(
+            action_profile_event["args"]["remote_platform"],
+            "container-image=linux"
+        );
+        assert_eq!(action_profile_event["args"]["remote_queue_time_ms"], 2);
+
+        let remote_stage_profile_event = trace_events
+            .iter()
+            .find(|event| event["name"] == "remote execute")
+            .expect("remote execute profile event");
+        assert_eq!(
+            remote_stage_profile_event["args"]["action_digest"],
+            "action-digest"
+        );
+        assert_eq!(
+            remote_stage_profile_event["args"]["remote_use_case"],
+            "buck2-default"
+        );
+        assert_eq!(
+            remote_stage_profile_event["args"]["action_key"],
+            "action-key"
+        );
+        assert_eq!(
+            remote_stage_profile_event["args"]["remote_platform"],
+            "container-image=linux"
+        );
+
+        let remote_request_profile_event = trace_events
+            .iter()
+            .find(|event| event["name"] == "CAS FindMissingBlobs")
+            .expect("remote request profile event");
+        assert_eq!(
+            remote_request_profile_event["args"]["action_digest"],
+            "action-digest"
+        );
+        assert_eq!(
+            remote_request_profile_event["args"]["action_id"],
+            "action-id"
+        );
+        assert_eq!(remote_request_profile_event["args"]["target"], "//pkg:main");
+        assert_eq!(
+            remote_request_profile_event["args"]["use_case"],
+            "buck2-default"
+        );
+        assert_eq!(remote_request_profile_event["args"]["digest_count"], 3);
+        assert_eq!(remote_request_profile_event["args"]["bytes"], 42);
+        assert_eq!(remote_request_profile_event["args"]["success"], true);
+
+        let re_execution_phase = trace_events
+            .iter()
+            .find(|event| event["name"] == "RE execution")
+            .expect("remote execution phase profile event");
+        assert_eq!(re_execution_phase["cat"], "remote_execution");
+        assert_eq!(re_execution_phase["dur"], 8_000);
+        assert_eq!(re_execution_phase["args"]["phase"], "execution");
+        assert_eq!(re_execution_phase["args"]["worker"], "executor-1");
+        assert_eq!(re_execution_phase["args"]["action_digest"], "action-digest");
+        assert_eq!(re_execution_phase["args"]["target"], "//pkg:main");
+        assert!(
+            trace_events
+                .iter()
+                .any(|event| event["name"] == "RE input fetch")
+        );
+        assert!(
+            trace_events
+                .iter()
+                .any(|event| event["name"] == "RE output upload")
         );
     }
 

@@ -305,8 +305,13 @@ fn should_send_event_data(
                 Some(
                     Data::ActionExecution(..)
                     | Data::AnalysisStage(..)
+                    | Data::CacheUpload(..)
+                    | Data::DepFileUpload(..)
                     | Data::ExecutorStage(..)
-                    | Data::Load(..),
+                    | Data::Load(..)
+                    | Data::Materialization(..)
+                    | Data::RemoteRequest(..)
+                    | Data::ReUpload(..),
                 ) if preserve_bazel_logs => true,
                 None => false,
                 _ => false,
@@ -323,6 +328,13 @@ fn should_send_event_data(
                     }
                     should_send_action_execution(a, schedule_type, upload_successful_action_events)
                 }
+                #[cfg(not(fbcode_build))]
+                Some(
+                    Data::AnalysisStage(..)
+                    | Data::ExecutorStage(..)
+                    | Data::RemoteRequest(..)
+                    | Data::ReUpload(..),
+                ) if preserve_bazel_logs => true,
                 Some(Data::Analysis(..)) => preserve_bazel_logs || !schedule_type.is_diff(),
                 Some(Data::Load(..)) => true,
                 Some(Data::CacheUpload(..)) => true,
@@ -735,6 +747,35 @@ mod tests {
                 buck2_data::DiceStateSnapshot::default(),
             )),
         });
+        let executor_stage_end = buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+            data: Some(buck2_data::span_end_event::Data::ExecutorStage(
+                buck2_data::ExecutorStageEnd::default(),
+            )),
+            ..Default::default()
+        });
+        let remote_request_start =
+            buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+                data: Some(buck2_data::span_start_event::Data::RemoteRequest(
+                    buck2_data::RemoteRequestStart::default(),
+                )),
+            });
+        let remote_request_end = buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+            data: Some(buck2_data::span_end_event::Data::RemoteRequest(
+                buck2_data::RemoteRequestEnd::default(),
+            )),
+            ..Default::default()
+        });
+        let re_upload_start = buck2_data::buck_event::Data::SpanStart(buck2_data::SpanStartEvent {
+            data: Some(buck2_data::span_start_event::Data::ReUpload(
+                buck2_data::ReUploadStart::default(),
+            )),
+        });
+        let re_upload_end = buck2_data::buck_event::Data::SpanEnd(buck2_data::SpanEndEvent {
+            data: Some(buck2_data::span_end_event::Data::ReUpload(
+                buck2_data::ReUploadEnd::default(),
+            )),
+            ..Default::default()
+        });
 
         assert!(should_send_event_data(
             &action_start,
@@ -748,6 +789,36 @@ mod tests {
             false,
             true
         ));
+        assert!(should_send_event_data(
+            &executor_stage_end,
+            &schedule_type,
+            false,
+            true
+        ));
+        assert!(should_send_event_data(
+            &remote_request_start,
+            &schedule_type,
+            false,
+            true
+        ));
+        assert!(should_send_event_data(
+            &remote_request_end,
+            &schedule_type,
+            false,
+            true
+        ));
+        assert!(should_send_event_data(
+            &re_upload_start,
+            &schedule_type,
+            false,
+            true
+        ));
+        assert!(should_send_event_data(
+            &re_upload_end,
+            &schedule_type,
+            false,
+            true
+        ));
         assert!(!should_send_event_data(
             &action_start,
             &schedule_type,
@@ -756,6 +827,24 @@ mod tests {
         ));
         assert!(!should_send_event_data(
             &dice_snapshot,
+            &schedule_type,
+            false,
+            false
+        ));
+        assert!(!should_send_event_data(
+            &executor_stage_end,
+            &schedule_type,
+            false,
+            false
+        ));
+        assert!(!should_send_event_data(
+            &remote_request_start,
+            &schedule_type,
+            false,
+            false
+        ));
+        assert!(!should_send_event_data(
+            &remote_request_end,
             &schedule_type,
             false,
             false
