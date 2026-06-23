@@ -91,6 +91,7 @@ message SpanStartEvent {
     DepFileUploadStart dep_file_upload = 88;
     ComputeDetailedAggregatedMetricsStart compute_detailed_aggregated_metrics =
         89;
+    RemoteRequestStart remote_request = 91;
     // Used in Buck unit tests.
     FakeStart fake = 999;
   }
@@ -144,6 +145,7 @@ message SpanEndEvent {
     DepFileUploadEnd dep_file_upload = 88;
     ComputeDetailedAggregatedMetricsEnd compute_detailed_aggregated_metrics =
         89;
+    RemoteRequestEnd remote_request = 91;
     // Used in Buck unit tests.
     FakeEnd fake = 999;
   }
@@ -1697,6 +1699,22 @@ message CommandExecutionMetadata {
   /// The number of times this action was suspended. None indicates that
   /// resource control was not enabled.
   optional uint64 suspend_count = 11;
+
+  /// Worker-side timing metadata reported by remote execution.
+  RemoteExecutionTiming remote_execution_timing = 12;
+}
+
+message RemoteExecutionTiming {
+  string worker = 1;
+  google.protobuf.Timestamp queued_timestamp = 2;
+  google.protobuf.Timestamp worker_start_timestamp = 3;
+  google.protobuf.Timestamp worker_completed_timestamp = 4;
+  google.protobuf.Timestamp input_fetch_start_timestamp = 5;
+  google.protobuf.Timestamp input_fetch_completed_timestamp = 6;
+  google.protobuf.Timestamp execution_start_timestamp = 7;
+  google.protobuf.Timestamp execution_completed_timestamp = 8;
+  google.protobuf.Timestamp output_upload_start_timestamp = 9;
+  google.protobuf.Timestamp output_upload_completed_timestamp = 10;
 }
 
 message CommandOutputsMissing {
@@ -3327,6 +3345,32 @@ message ReUploadEnd {
   optional uint64 digests_uploaded = 1;
   optional uint64 bytes_uploaded = 2;
   map<string, ReUploadMetrics> stats_by_extension = 3;
+}
+
+message RemoteRequestStart {
+  string service = 1;
+  string method = 2;
+  optional string action_digest = 3;
+  optional string action_id = 4;
+  optional string target = 5;
+  optional string action_mnemonic = 6;
+  string use_case = 7;
+  optional uint64 digest_count = 8;
+  optional uint64 bytes = 9;
+  optional bool upload_only_missing = 10;
+  optional bool skip_cache_lookup = 11;
+  map<string, string> details = 12;
+}
+
+message RemoteRequestEnd {
+  bool success = 1;
+  optional string error = 2;
+  optional string re_error_code = 3;
+  optional uint64 digest_count = 4;
+  optional uint64 bytes = 5;
+  optional bool cache_hit = 6;
+  optional uint64 ttl_seconds = 7;
+  map<string, string> details = 8;
 }
 
 message ConnectToInstallerStart {
