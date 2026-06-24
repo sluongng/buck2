@@ -1,9 +1,10 @@
 [buck2]
 digest_algorithms = BLAKE3
 file_watcher = watchman
-# Keep remote outputs deferred, but persist materializer state so Buck can
-# reuse files that are already present on disk after daemon restarts.
-materializations = deferred
+# Keep remote outputs deferred without downloading requested final artifacts by
+# default. Workflow steps that need a runnable output should use a bootstrap
+# profile that materializes that requested output.
+materializations = deferred_skip_final_artifacts
 sqlite_materializer_state = true
 # Defer writes on the build critical path; combined with on-disk state, this
 # lets Buck skip writes when the expected content is already present.
