@@ -87,30 +87,35 @@ actions:
       - run: |
           set -euo pipefail
 
-          # Buck2 daemon startup reads static RE metadata before command-level
-          # --config-file values are applied, so expose the checked-in
-          # BuildBuddy profile as an external config for the daemon as well.
-          export BUCK2_TEST_EXTRA_EXTERNAL_CONFIG="$PWD/.buckconfig.buildbuddy"
-
           buck2_bootstrap=$(cat .buildbuddy-workflow/bootstrap-buck2.path)
+          built_buck2="$PWD/.buildbuddy-workflow/built-buck2"
+          bootstrap_buckconfig=.buildbuddy-workflow/bootstrap-output.buckconfig
+          sed 's/^materializations = deferred_skip_final_artifacts$/materializations = deferred/' \
+            .buckconfig.buildbuddy > "$bootstrap_buckconfig"
+
+          # Buck2 daemon startup reads static RE metadata before command-level
+          # --config-file values are applied. Use a bootstrap-only profile that
+          # materializes the requested output, since this step runs that binary.
+          export BUCK2_TEST_EXTRA_EXTERNAL_CONFIG="$PWD/$bootstrap_buckconfig"
+
           local_buck2_build() {
             local attempt="$1"
+            rm -f "$built_buck2"
             "$buck2_bootstrap" \
               --isolation-dir "buildbuddy-rbe-build-$attempt" \
               build \
-              --show-full-json-output \
-              --config-file .buckconfig.buildbuddy \
+              --config-file "$bootstrap_buckconfig" \
               --local-only \
+              --out "$built_buck2" \
               //:buck2
           }
 
-          if ! built_buck2_json="$(local_buck2_build initial)"; then
+          if ! local_buck2_build initial; then
             echo "Local //:buck2 bootstrap build failed; retrying once with fresh Buck2 daemon state" >&2
             "$buck2_bootstrap" killall >/dev/null 2>&1 || true
             rm -rf "buck-out/buildbuddy-rbe-build-retry"
-            built_buck2_json="$(local_buck2_build retry)"
+            local_buck2_build retry
           fi
-          built_buck2="$(python3 -c 'import json, sys; outputs = json.load(sys.stdin); output = next(iter(outputs.values())); print(output[0] if isinstance(output, list) else output)' <<< "$built_buck2_json")"
           printf '%s\n' "$built_buck2" > .buildbuddy-workflow/built-buck2.path
           test -x "$built_buck2"
           "$built_buck2" --version
