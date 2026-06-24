@@ -5466,6 +5466,13 @@ fn convert_action_result(
             execution_dir: "".to_owned(),
             execution_attempts: 0,
             last_queued_timestamp: Default::default(),
+            auxiliary_metadata: execution_metadata
+                .auxiliary_metadata
+                .into_map(|metadata| TAny {
+                    type_url: metadata.type_url,
+                    value: metadata.value,
+                    ..Default::default()
+                }),
             ..Default::default()
         },
         ..Default::default()
@@ -5507,7 +5514,12 @@ fn convert_t_action_result2(t_action_result: TActionResult2) -> anyhow::Result<A
         output_upload_completed_timestamp: Some(ttimestamp_to(
             t_execution_metadata.output_upload_completed_timestamp,
         )),
-        auxiliary_metadata: Vec::new(),
+        auxiliary_metadata: t_execution_metadata
+            .auxiliary_metadata
+            .into_map(|metadata| prost_types::Any {
+                type_url: metadata.type_url,
+                value: metadata.value,
+            }),
     });
 
     let output_files = t_action_result
@@ -5546,9 +5558,9 @@ fn convert_t_action_result2(t_action_result: TActionResult2) -> anyhow::Result<A
         output_symlinks,
         output_directories,
         exit_code: t_action_result.exit_code,
-        stdout_raw: Vec::new(),
+        stdout_raw: t_action_result.stdout_raw.unwrap_or_default(),
         stdout_digest: t_action_result.stdout_digest.map(tdigest_to),
-        stderr_raw: Vec::new(),
+        stderr_raw: t_action_result.stderr_raw.unwrap_or_default(),
         stderr_digest: t_action_result.stderr_digest.map(tdigest_to),
         execution_metadata,
         ..Default::default()
@@ -7848,6 +7860,63 @@ mod tests {
         assert_eq!(converted.output_files.len(), 1);
         assert_eq!(converted.output_files[0].digest.digest, digest);
         assert_eq!(converted.output_files[0].ttl, 42);
+        Ok(())
+    }
+
+    #[test]
+    fn test_convert_action_result_preserves_execution_auxiliary_metadata() -> anyhow::Result<()> {
+        let action_result = ActionResult {
+            execution_metadata: Some(ExecutedActionMetadata {
+                auxiliary_metadata: vec![prost_types::Any {
+                    type_url: "type.googleapis.com/buck2.RemoteDepFile".to_owned(),
+                    value: b"dep-file-metadata".to_vec(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let converted = convert_action_result(action_result, 42)?;
+
+        assert_eq!(converted.execution_metadata.auxiliary_metadata.len(), 1);
+        let metadata = &converted.execution_metadata.auxiliary_metadata[0];
+        assert_eq!(metadata.type_url, "type.googleapis.com/buck2.RemoteDepFile");
+        assert_eq!(metadata.value, b"dep-file-metadata".to_vec());
+        Ok(())
+    }
+
+    #[test]
+    fn test_convert_t_action_result2_preserves_execution_auxiliary_metadata_and_raw_stdio()
+    -> anyhow::Result<()> {
+        let t_action_result = TActionResult2 {
+            stdout_raw: Some(b"inline stdout".to_vec()),
+            stderr_raw: Some(b"inline stderr".to_vec()),
+            execution_metadata: TExecutedActionMetadata {
+                auxiliary_metadata: vec![TAny {
+                    type_url: "type.googleapis.com/buck2.RemoteDepFile".to_owned(),
+                    value: b"dep-file-metadata".to_vec(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let converted = convert_t_action_result2(t_action_result)?;
+
+        assert_eq!(converted.stdout_raw, b"inline stdout".to_vec());
+        assert_eq!(converted.stderr_raw, b"inline stderr".to_vec());
+        let metadata = &converted
+            .execution_metadata
+            .as_ref()
+            .expect("execution metadata should be set")
+            .auxiliary_metadata;
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(
+            metadata[0].type_url,
+            "type.googleapis.com/buck2.RemoteDepFile"
+        );
+        assert_eq!(metadata[0].value, b"dep-file-metadata".to_vec());
         Ok(())
     }
 
