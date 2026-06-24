@@ -711,6 +711,10 @@ fn should_retry_execute_after_wait_execution_error(err: &anyhow::Error) -> bool 
     is_operation_not_found(err)
 }
 
+fn should_retry_execute_after_operation_stream_error(err: &anyhow::Error) -> bool {
+    is_operation_not_found(err)
+}
+
 fn should_retry_execute_after_operation_error(status: &Status) -> bool {
     if rpc_status_has_missing_precondition(status) {
         return false;
@@ -3607,6 +3611,39 @@ impl REClient {
                                 }
                                 Err(err) => {
                                     let err = anyhow::Error::from(err);
+                                    if should_retry_execute_after_operation_stream_error(&err) {
+                                        if !can_retry_execute(execute_retry_attempts, retries) {
+                                            return Err(err.context(match &operation_name {
+                                                Some(name) => format!(
+                                                    "RE operation `{name}` was lost after retry limit"
+                                                ),
+                                                None => "RE Execute stream returned NOT_FOUND before operation creation after retry limit".to_owned(),
+                                            }));
+                                        }
+
+                                        execute_retry_attempts += 1;
+                                        tracing::debug!(
+                                            operation_name =
+                                                operation_name.as_deref().unwrap_or(""),
+                                            retry_attempt = execute_retry_attempts,
+                                            retries,
+                                            "RE operation stream returned NOT_FOUND; retrying Execute"
+                                        );
+                                        stream = execute_stream(
+                                            grpc_clients.clone(),
+                                            metadata.clone(),
+                                            use_fbcode_metadata,
+                                            request_metadata_tool_name.as_str(),
+                                            grpc_request.clone(),
+                                            retries,
+                                            retry_max_delay,
+                                        )
+                                        .await
+                                        .context("RE operation stream returned NOT_FOUND and Execute retry failed")?;
+                                        operation_name = None;
+                                        continue;
+                                    }
+
                                     if !is_retryable_grpc_error(&err) {
                                         return Err(err.context("RE channel error"));
                                     }
@@ -6749,6 +6786,20 @@ mod tests {
         let err = anyhow::Error::from(tonic::Status::not_found("operation was lost"));
 
         assert!(should_retry_execute_after_wait_execution_error(&err));
+    }
+
+    #[test]
+    fn operation_stream_not_found_retries_execute() {
+        let err = anyhow::Error::from(tonic::Status::not_found("operation was lost"));
+
+        assert!(should_retry_execute_after_operation_stream_error(&err));
+    }
+
+    #[test]
+    fn operation_stream_transient_error_does_not_restart_execute_directly() {
+        let err = anyhow::Error::from(tonic::Status::unavailable("try wait again"));
+
+        assert!(!should_retry_execute_after_operation_stream_error(&err));
     }
 
     #[test]
