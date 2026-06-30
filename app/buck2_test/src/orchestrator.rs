@@ -117,6 +117,7 @@ use buck2_execute::execute::result::CommandExecutionReport;
 use buck2_execute::execute::result::CommandExecutionResult;
 use buck2_execute::execute::result::CommandExecutionStatus;
 use buck2_execute::execute::target::CommandExecutionTarget;
+use buck2_execute::execute::target::request_metadata_target_id;
 use buck2_execute::materialize::materializer::HasMaterializer;
 use buck2_execute_impl::executors::local::EnvironmentBuilder;
 use buck2_execute_impl::executors::local::apply_local_execution_environment;
@@ -811,6 +812,16 @@ async fn prepare_and_execute_dice(
     ctx.compute(key).await.map_err(buck2_error::Error::from)?
 }
 
+async fn test_discovery_command_report(
+    report: &CommandExecutionReport,
+) -> buck2_data::CommandExecution {
+    report.to_command_execution_proto(true, true, false).await
+}
+
+async fn test_run_command_report(report: &CommandExecutionReport) -> buck2_data::CommandExecution {
+    report.to_command_execution_proto(false, false, false).await
+}
+
 impl Display for TestExecutionKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "test_target = {}, ", self.test_target)?;
@@ -1256,10 +1267,7 @@ impl BuckTestOrchestrator<'_> {
                             suite_name: suite.clone(),
                             target_label: Some(test_target.target.as_proto()),
                             command_report: Some(
-                                result
-                                    .report
-                                    .to_command_execution_proto(true, true, false)
-                                    .await,
+                                test_discovery_command_report(&result.report).await,
                             ),
                             command_host_sharing_requirements: host_sharing_requirements_to_grpc(
                                 prepared_command.request.host_sharing_requirements().clone(),
@@ -1276,6 +1284,7 @@ impl BuckTestOrchestrator<'_> {
                         digest_config,
                         mergebase: &None,
                         re_platform: executor.re_platform(),
+                        paths: request.paths(),
                     };
                     let _result = match executor
                         .cache_upload(
@@ -1325,12 +1334,7 @@ impl BuckTestOrchestrator<'_> {
                         };
                         let end = TestRunEnd {
                             suite: test_suite,
-                            command_report: Some(
-                                result
-                                    .report
-                                    .to_command_execution_proto(true, true, false)
-                                    .await,
-                            ),
+                            command_report: Some(test_run_command_report(&result.report).await),
                             command_host_sharing_requirements: host_sharing_requirements_to_grpc(
                                 prepared_command.request.host_sharing_requirements().clone(),
                             )
@@ -2459,6 +2463,18 @@ impl CommandExecutionTarget for TestTarget<'_> {
             identifier: "".to_owned(),
         }
     }
+
+    fn action_mnemonic(&self) -> Option<String> {
+        Some("test".to_owned())
+    }
+
+    fn target_label(&self) -> Option<String> {
+        Some(request_metadata_target_id(self.target))
+    }
+
+    fn configuration_hash(&self) -> Option<String> {
+        Some(self.target.cfg().output_hash().as_str().to_owned())
+    }
 }
 
 fn create_action_key_suffix(stage: &TestStage) -> String {
@@ -2514,6 +2530,18 @@ impl CommandExecutionTarget for LocalResourceTarget<'_> {
             identifier: "".to_owned(),
         }
     }
+
+    fn action_mnemonic(&self) -> Option<String> {
+        Some("setup_local_resource".to_owned())
+    }
+
+    fn target_label(&self) -> Option<String> {
+        Some(request_metadata_target_id(self.target))
+    }
+
+    fn configuration_hash(&self) -> Option<String> {
+        Some(self.target.cfg().output_hash().as_str().to_owned())
+    }
 }
 
 struct TestExecutor {
@@ -2557,6 +2585,8 @@ mod tests {
     use buck2_core::cells::name::CellName;
     use buck2_core::configuration::data::ConfigurationData;
     use buck2_core::fs::project::ProjectRootTemp;
+    use buck2_execute::execute::action_digest::ActionDigest;
+    use buck2_execute::execute::output::CommandStdStreams;
     use buck2_execute::re::manager::UnconfiguredRemoteExecutionClient;
     use buck2_test_api::data::TestStage;
     use buck2_test_api::data::TestStatus;
@@ -2566,8 +2596,41 @@ mod tests {
     use futures::channel::mpsc::UnboundedReceiver;
     use futures::future;
     use futures::stream::TryStreamExt;
+    use sorted_vector_map::SortedVectorMap;
 
     use super::*;
+
+    fn make_test_command_report() -> CommandExecutionReport {
+        let digest_config = DigestConfig::testing_default();
+        CommandExecutionReport {
+            claim: None,
+            status: CommandExecutionStatus::Success {
+                execution_kind: CommandExecutionKind::Local {
+                    digest: ActionDigest::empty(digest_config.cas_digest_config()),
+                    command: vec!["test-binary".to_owned()],
+                    env: SortedVectorMap::new(),
+                },
+            },
+            timing: CommandExecutionMetadata::empty(buck2_util::time_span::TimeSpan::empty_now()),
+            std_streams: CommandStdStreams::Local {
+                stdout: b"test stdout".to_vec(),
+                stderr: b"test stderr".to_vec(),
+            },
+            exit_code: Some(0),
+            additional_message: None,
+            inline_environment_metadata: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_command_report_preserves_streams() {
+        let report = make_test_command_report();
+        let proto = test_run_command_report(&report).await;
+        let details = proto.details.as_ref().expect("command details");
+
+        assert_eq!(details.cmd_stdout, "test stdout");
+        assert_eq!(details.cmd_stderr, "test stderr");
+    }
 
     async fn make() -> buck2_error::Result<(
         BuckTestOrchestrator<'static>,

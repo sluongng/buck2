@@ -1,0 +1,76 @@
+[buck2]
+digest_algorithms = SHA256
+file_watcher = watchman
+# Keep remote outputs deferred without downloading requested final artifacts by
+# default. Workflow steps that need a runnable output should use a bootstrap
+# profile that materializes that requested output.
+materializations = deferred_skip_final_artifacts
+sqlite_materializer_state = true
+# Defer writes on the build critical path; combined with on-disk state, this
+# lets Buck skip writes when the expected content is already present.
+defer_write_actions = true
+# RBE-heavy builds ask the CAS about the same input digests from many
+# concurrent actions. Dedupe those TTL checks and use larger batches to reduce
+# GetDigestsTtl/FindMissing RPC fanout.
+deduplicate_get_digests_ttl_calls = true
+# Continuously trim stale buck-out artifacts using Buck's default clean-stale
+# schedule.
+clean_stale_enabled = true
+# Restart the daemon when Buck detects deferred materializer state that can be
+# recovered by restarting.
+restarter = true
+
+[cell_aliases]
+# Use BuildBuddy-specific hermetic toolchains without changing the default shim
+# toolchains used by ordinary local builds.
+toolchains = buildbuddy_toolchains
+
+[buck2_re_client]
+# Keep the legacy default address so bootstrap binaries that predate split
+# service address config can still connect to BuildBuddy.
+address = remote.buildbuddy.io
+engine_address = remote.buildbuddy.io
+action_cache_address = remote.buildbuddy.io
+cas_address = remote.buildbuddy.io
+# Keep capabilities enabled so Buck uses BuildBuddy's advertised remote cache
+# protocol features, including ByteStream and BatchUpdate compression.
+capabilities = true
+request_metadata_tool_name = bazel
+http_headers = x-buildbuddy-api-key:$BUILDBUDDY_API_KEY
+# BuildBuddy Workflows run through a single gRPC session. Keep remote execution
+# parallelism high enough to exercise RBE, but conservative enough for a cold
+# //:buck2 build to avoid HTTP/2 stream resets in the workflow runner.
+execution_concurrency_limit = 16
+# BuildBuddy advertises no explicit REAPI batch limit, but the hosted gRPC
+# receive cap is currently 50,000,000 bytes. Use that as the batch envelope and
+# keep decode headroom for similarly large responses.
+max_total_batch_size = 50000000
+max_decoding_message_size = 100000000
+# Match Bazel/BuildBuddy's compression break-even point.
+remote_cache_compression_threshold = 100
+# Worst-case non-negative SHA256 Digest protos are 78 bytes in the repeated
+# field, so 641,025 digests fit under the 50,000,000-byte request envelope.
+find_missing_blobs_batch_size = 641025
+remote_cache_chunking = true
+remote_cache_chunk_cache_dir = buck-out/buildbuddy-re-chunks
+
+[build]
+execution_platforms = root//buildbuddy:buildbuddy-rbe
+
+[cells]
+buildbuddy_toolchains = buildbuddy/toolchains
+
+[http_archive]
+# Download and extract archives inside remote actions so BuildBuddy RBE owns
+# toolchain preparation instead of depending on the workflow runner's host.
+remote_download = true
+
+[bes]
+backend = grpcs://remote.buildbuddy.io
+event_format = bazel
+header = x-buildbuddy-api-key=$BUILDBUDDY_API_KEY
+build_metadata = PARENT_RUN_ID=$BUILDBUDDY_RUN_ID,PARENT_INVOCATION_ID=$BUILDBUDDY_INVOCATION_ID,COMMIT_SHA=$GIT_COMMIT,REPO_URL=https://github.com/sluongng/buck2,BRANCH_NAME=$GIT_BRANCH,ROLE=CI,VISIBILITY=PUBLIC,ROOT_CELL=gh_facebook_buck2
+# Keep failed-action diagnostics while avoiding a long tail of successful
+# action events before the terminal BES events on fully remote no-cache builds.
+upload_successful_action_events = false
+results_url = https://sluongng.buildbuddy.io/invocation/
