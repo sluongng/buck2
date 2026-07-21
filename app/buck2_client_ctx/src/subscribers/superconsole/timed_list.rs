@@ -304,6 +304,7 @@ mod tests {
             false,
             timed_list_state,
             None,
+            None,
         )
         .unwrap();
         state.simple_console.observer.span_tracker = span_tracker;
@@ -480,6 +481,7 @@ mod tests {
                 max_lines: 2,
                 ..Default::default()
             },
+            None,
             None,
         )?;
 

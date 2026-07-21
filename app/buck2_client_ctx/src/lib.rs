@@ -11,6 +11,7 @@
 #![feature(once_cell_try)]
 #![feature(try_blocks)]
 #![feature(try_trait_v2)]
+#![feature(try_trait_v2_residual)]
 #![feature(used_with_arg)]
 
 pub mod agent_context;
@@ -33,6 +34,7 @@ pub mod immediate_config;
 pub mod output_destination_arg;
 pub mod path_arg;
 pub mod query_args;
+pub mod remote_sink_config;
 pub mod restarter;
 pub mod signal_handler;
 pub mod startup_deadline;

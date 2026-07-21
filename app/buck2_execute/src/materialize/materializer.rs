@@ -8,11 +8,13 @@
  * above-listed licenses.
  */
 
+use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
 use allocative::Allocative;
 use async_trait::async_trait;
+use buck2_common::file_ops::metadata::FileDigest;
 use buck2_common::file_ops::metadata::FileMetadata;
 use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::execution_types::executor_config::RemoteExecutorUseCase;
@@ -22,6 +24,7 @@ use buck2_core::fs::project_rel_path::ProjectRelativePathBuf;
 use buck2_directory::directory::directory_iterator::DirectoryIterator;
 use buck2_directory::directory::entry::DirectoryEntry;
 use buck2_directory::directory::walk::ordered_entry_walk;
+use buck2_error::TypedContext;
 use buck2_events::dispatch::EventDispatcher;
 use chrono::DateTime;
 use chrono::Duration;
@@ -110,6 +113,22 @@ pub struct CasNotFoundError {
     pub directory: ActionDirectoryEntry<ActionSharedDirectory>,
     #[source]
     pub error: Arc<buck2_error::Error>,
+}
+
+#[derive(Allocative, Clone, Debug, Eq, PartialEq)]
+pub struct ReLostInput {
+    pub path: ProjectRelativePathBuf,
+    pub digest: FileDigest,
+}
+
+impl TypedContext for ReLostInput {
+    fn eq(&self, other: &dyn TypedContext) -> bool {
+        (other as &dyn Any).downcast_ref::<Self>() == Some(self)
+    }
+
+    fn display(&self) -> Option<String> {
+        Some(format!("{self:?}"))
+    }
 }
 
 #[derive(buck2_error::Error, Debug)]
@@ -711,12 +730,39 @@ pub enum MaterializationMethodError {
 impl MaterializationMethod {
     pub fn try_new_from_config_value(config_value: Option<&str>) -> buck2_error::Result<Self> {
         match config_value {
-            None | Some("") | Some("deferred") => Ok(MaterializationMethod::Deferred),
+            None | Some("") | Some("all") | Some("deferred") => Ok(MaterializationMethod::Deferred),
             Some("deferred_skip_final_artifacts") => {
                 Ok(MaterializationMethod::DeferredSkipFinalArtifacts)
             }
             Some(v) => Err(MaterializationMethodError::InvalidValueForConfig(v.to_owned()).into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod materialization_method_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_all_policy_spelling() {
+        assert!(matches!(
+            MaterializationMethod::try_new_from_config_value(Some("all")).unwrap(),
+            MaterializationMethod::Deferred
+        ));
+    }
+
+    #[test]
+    fn accepts_skip_final_artifacts_policy_spelling() {
+        assert!(matches!(
+            MaterializationMethod::try_new_from_config_value(Some("deferred_skip_final_artifacts"))
+                .unwrap(),
+            MaterializationMethod::DeferredSkipFinalArtifacts
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_policy_spelling() {
+        assert!(MaterializationMethod::try_new_from_config_value(Some("minimal")).is_err());
     }
 }
 
