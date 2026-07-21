@@ -17,6 +17,16 @@ from buck2.tests.e2e_util.buck_workspace import buck_test, get_mode_from_platfor
 
 FLAVOR = os.environ["FLAVOR"]
 
+
+def _buck_test():
+    if os.environ.get("BUCK2_OSS_CHECK_DEPENDENCIES_DATA") == "1":
+        return buck_test(
+            inplace=False,
+            data_dir=os.environ["BUCK2_OSS_CHECK_DEPENDENCIES_DATA_DIR"],
+        )
+    return buck_test(inplace=True)
+
+
 if FLAVOR == "check_dependencies_test":  # noqa: C901
 
     def pass_list_arg(from_env_var: str, to_bxl_param: str) -> list[str]:
@@ -24,7 +34,7 @@ if FLAVOR == "check_dependencies_test":  # noqa: C901
         split_list = [] if list_env == "" else list_env.split(",")
         return [elem for item in split_list for elem in (to_bxl_param, item)]
 
-    @buck_test(inplace=True)
+    @_buck_test()
     async def test_check_dependencies_bxl(buck) -> None:
         allowlist_args = pass_list_arg(
             from_env_var="ALLOWLIST", to_bxl_param="--allowlist_patterns"
@@ -84,7 +94,7 @@ elif FLAVOR == "audit_dependents_test":
         split_list = [] if list_env == "" else list_env.split(",")
         return [elem for item in split_list for elem in ("--allowlist_patterns", item)]
 
-    @buck_test(inplace=True)
+    @_buck_test()
     async def test_audit_dependents_bxl(buck) -> None:
         allow_list = process_list_arg()
         expect_failure_msg = os.environ["EXPECT_FAILURE_MSG"]
@@ -114,7 +124,7 @@ elif FLAVOR == "assert_dependencies_test":
         split_list = [] if list_env == "" else list_env.split(",")
         return [elem for item in split_list for elem in ("--deps", item)]
 
-    @buck_test(inplace=True)
+    @_buck_test()
     async def test_check_dependencies_bxl(buck) -> None:
         dep_list = process_list_arg()
         expect_failure_msg = os.environ["EXPECT_FAILURE_MSG"]
@@ -135,7 +145,7 @@ elif FLAVOR == "assert_dependencies_test":
 
 elif FLAVOR == "check_mutually_exclusive_dependencies_test":
 
-    @buck_test(inplace=True)
+    @_buck_test()
     async def test_check_mutually_exclusive_dependencies_bxl(buck) -> None:
         expect_failure_msg = os.environ["EXPECT_FAILURE_MSG"]
 

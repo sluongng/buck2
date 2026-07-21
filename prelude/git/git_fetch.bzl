@@ -53,7 +53,9 @@ def git_fetch_impl(ctx: AnalysisContext) -> list[Provider]:
     ctx.actions.run(
         cmd,
         category = "git_fetch",
-        local_only = True,
+        # Preserve local-first behavior for hybrid executors, but do not require
+        # local execution so remote-only platforms can still run git fetches.
+        prefer_local = True,
         allow_cache_upload = ctx.attrs.allow_cache_upload,
     )
 

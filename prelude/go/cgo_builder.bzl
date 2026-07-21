@@ -58,20 +58,22 @@ CGoBuildContext = record(
     _cxx_toolchain = field(Dependency | None, None),
 )
 
-def get_cgo_build_context(ctx: AnalysisContext) -> CGoBuildContext | None:
+def get_cgo_build_context(ctx: AnalysisContext, deps: list[Dependency] | None = None, header_namespace: str | None = None) -> CGoBuildContext | None:
     cxx_toolchain_info = get_opt_cxx_toolchain_info(ctx)
     if cxx_toolchain_info == None:
         return None
+
+    inherited_preprocessor_deps = deps if deps != None else ctx.attrs.deps
 
     return CGoBuildContext(
         cxx_toolchain_info = get_cxx_toolchain_info(ctx),
         target_sdk_version_flags = get_target_sdk_version_flags(ctx),
         exec_os_type = ctx.attrs._exec_os_type[OsLookup],
-        header_namespace = cxx_attr_header_namespace(ctx),
+        header_namespace = header_namespace if header_namespace != None else cxx_attr_header_namespace(ctx),
         headers_layout = cxx_get_regular_cxx_headers_layout(ctx),
         cxx_compiler_flags = ctx.attrs.cxx_compiler_flags,
         cxx_preprocessor_flags = ctx.attrs.cxx_preprocessor_flags,
-        inherited_preprocessor_infos = cxx_inherited_preprocessor_infos(ctx.attrs.deps),
+        inherited_preprocessor_infos = cxx_inherited_preprocessor_infos(inherited_preprocessor_deps),
         _cxx_toolchain = ctx.attrs._cxx_toolchain,
     )
 

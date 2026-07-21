@@ -7,6 +7,7 @@
 # above-listed licenses.
 
 load("@prelude//:paths.bzl", "paths")
+load("@prelude//:prelude.bzl", _native = "native")
 load(
     "@prelude//java:java_toolchain.bzl",
     "AbiGenerationMode",
@@ -17,6 +18,71 @@ load(
     "PrebuiltJarToolchainInfo",
 )
 load("@prelude//tests:test_listing.bzl", "TestListingInfo")
+
+TEMURIN_JDK_ARCHIVE = {
+    "linux": {
+        "arm64": {
+            "sha256": "8d498ec88e1c1989fab95c6784240ab92d011e29c54d20a3f9c324b13476f9ad",
+            "url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.11%2B10/OpenJDK21U-jdk_aarch64_linux_hotspot_21.0.11_10.tar.gz",
+        },
+        "x86_64": {
+            "sha256": "4b2220e232a97997b436ca6ab15cbf70171ecff52958a46159dfa5a8c44ca4de",
+            "url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.11%2B10/OpenJDK21U-jdk_x64_linux_hotspot_21.0.11_10.tar.gz",
+        },
+    },
+}
+
+_JDK_TOOLS = {
+    "jar": "jar_tool",
+    "java": "java_tool",
+    "javac": "javac_tool",
+    "jlink": "jlink_tool",
+    "jmod": "jmod_tool",
+}
+
+def _jdk_archive_select(jdk_archives, key: str):
+    return select({
+        "prelude//os:{}".format(os): select({
+            "prelude//cpu:{}".format(cpu): archive[key]
+            for cpu, archive in value.items()
+        })
+        for os, value in jdk_archives.items()
+    })
+
+def download_jdk_tools(
+        name: str,
+        jdk_archives = TEMURIN_JDK_ARCHIVE,
+        remote_download: bool = True,
+        strip_prefix: str = "jdk-21.0.11+10",
+        tool_names = _JDK_TOOLS,
+        visibility = None):
+    archive = name + "_archive"
+
+    _native.http_archive(
+        name = archive,
+        urls = [_jdk_archive_select(jdk_archives, "url")],
+        sha256 = _jdk_archive_select(jdk_archives, "sha256"),
+        type = "tar.gz",
+        strip_prefix = strip_prefix,
+        remote_download = remote_download,
+        sub_targets = {
+            "jar": ["bin/jar"],
+            "java": ["bin/java"],
+            "javac": ["bin/javac"],
+            "jlink": ["bin/jlink"],
+            "jmod": ["bin/jmod"],
+            "jrt_fs_jar": ["lib/jrt-fs.jar"],
+        },
+        visibility = visibility,
+    )
+
+    for tool, tool_name in tool_names.items():
+        _native.command_alias(
+            name = tool_name,
+            exe = ":{}[{}]".format(archive, tool),
+            resources = [":{}".format(archive)],
+            visibility = visibility,
+        )
 
 def _system_java_tool_impl(ctx):
     return [
@@ -42,6 +108,11 @@ system_java_lib = rule(
         "jar": attrs.string(),
     },
 )
+
+def prebuilt_jar_bootstrap_toolchain(name, java, visibility = None):
+    kwargs = {}
+
+    _prebuilt_jar_toolchain_rule(name = name, java = java, visibility = visibility, **kwargs)
 
 def system_prebuilt_jar_bootstrap_toolchain(name, java, visibility = None):
     kwargs = {}
@@ -83,6 +154,19 @@ def javacd_toolchain(name, java, javac, jar, jlink, jmod, jrt_fs_jar, java_for_t
         javacd = "prelude//toolchains/android/src/com/facebook/buck/jvm/java/stepsbuilder/javacd/main:javacd_tool",
         javac_protocol = "javacd",
         javacd_main_class = "com.facebook.buck.jvm.java.stepsbuilder.javacd.main.JavaCDMain",
+        jlink = jlink,
+        jmod = jmod,
+        jrt_fs_jar = jrt_fs_jar,
+    )
+
+def java_bootstrap_toolchain(name, java, javac, jlink, jmod, jrt_fs_jar, visibility = None):
+    _java_toolchain(
+        name = name,
+        visibility = visibility,
+        java = java,
+        is_bootstrap_toolchain = True,
+        javac = javac,
+        javac_protocol = "classic",
         jlink = jlink,
         jmod = jmod,
         jrt_fs_jar = jrt_fs_jar,
