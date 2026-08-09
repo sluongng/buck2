@@ -17,6 +17,7 @@ use buck2_core::deferred::base_deferred_key::BaseDeferredKey;
 use buck2_core::execution_types::execution::ExecutionPlatformResolution;
 use buck2_core::target::label::label::TargetLabel;
 use buck2_execute::digest_config::DigestConfig;
+use buck2_interpreter::dialect::StarlarkDialect;
 use buck2_interpreter::file_type::StarlarkFileType;
 use buck2_interpreter::from_freeze::from_freeze_error;
 use buck2_interpreter::testing::Buck2TestHeapName;
@@ -53,7 +54,7 @@ fn run_ctx_test(
             let ast = AstModule::parse(
                 "foo.bzl",
                 full_content,
-                &StarlarkFileType::Bzl.dialect(false),
+                &StarlarkDialect::Buck2.parser_dialect(StarlarkFileType::Bzl, false),
             )
             .unwrap();
             eval.eval_module(ast, &globals).unwrap();

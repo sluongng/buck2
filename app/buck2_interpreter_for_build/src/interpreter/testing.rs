@@ -26,6 +26,7 @@ use buck2_core::cells::cell_root_path::CellRootPathBuf;
 use buck2_core::cells::name::CellName;
 use buck2_core::fs::project_rel_path::ProjectRelativePath;
 use buck2_core::pattern::pattern::InferTargetNames;
+use buck2_interpreter::dialect::StarlarkDialect;
 use buck2_interpreter::dice::starlark_provider::StarlarkEvalKind;
 use buck2_interpreter::extra::InterpreterHostArchitecture;
 use buck2_interpreter::extra::InterpreterHostPlatform;
@@ -223,6 +224,7 @@ impl Tester {
                         },
                     ))))),
                 )?,
+                StarlarkDialect::Buck2,
                 false,
                 true,
             )?),
