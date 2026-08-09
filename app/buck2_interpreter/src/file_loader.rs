@@ -18,7 +18,9 @@ use dupe::Dupe;
 use starlark::codemap::FileSpan;
 use starlark::environment::FrozenModule;
 use starlark::eval::FileLoader;
+use starlark::values::OwnedFrozen;
 use starlark::values::OwnedFrozenRef;
+use starlark::values::Value;
 use starlark::values::structs::StructRef;
 use starlark_map::ordered_map::OrderedMap;
 
@@ -28,8 +30,12 @@ use crate::paths::module::StarlarkModulePath;
 #[derive(Debug, buck2_error::Error)]
 #[buck2(tag = Input)]
 enum FileLoaderError {
+    #[error("`native` is missing from the configured Buck2 prelude")]
+    NativeMissing,
     #[error("`native` in `prelude.bzl` must be a struct")]
     NativeMustBeStruct,
+    #[error("`native.genrule` is missing from the configured Buck2 prelude")]
+    NativeGenruleMissing,
 }
 
 #[derive(Default, Clone, Allocative, Debug, pagable::Pagable)]
@@ -132,6 +138,27 @@ impl LoadedModule {
         })?;
         Ok(Some(native))
     }
+
+    /// Obtain an owned reference to the trusted prelude's `native.genrule` implementation.
+    /// The returned value retains the frozen module heap and can safely outlive this borrow.
+    pub fn bazel_genrule_backend(&self) -> buck2_error::Result<OwnedFrozen<Value<'static>>> {
+        let native = self
+            .0
+            .env
+            .get_option_ref("native")
+            .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::Input))?
+            .ok_or(FileLoaderError::NativeMissing)?;
+        let native: OwnedFrozenRef<'_, StructRef<'static>> = native.try_map(|value| {
+            StructRef::from_value(value).ok_or(FileLoaderError::NativeMustBeStruct)
+        })?;
+        let genrule = native.try_map(|native: StructRef<'_>| {
+            native
+                .iter()
+                .find_map(|(name, value)| (name.as_str() == "genrule").then_some(value))
+                .ok_or(FileLoaderError::NativeGenruleMissing)
+        })?;
+        Ok(genrule.to_owned())
+    }
 }
 
 pub struct InterpreterFileLoader {
@@ -172,6 +199,19 @@ impl InterpreterFileLoader {
                 &id.to_string(),
             )),
         }
+    }
+
+    pub fn loaded_module(&self, id: StarlarkModulePath<'_>) -> buck2_error::Result<&LoadedModule> {
+        self.loaded_modules.map.get(&id).ok_or_else(|| {
+            to_diagnostic(
+                &buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::Input,
+                    "Should have had a loaded module for {}",
+                    id
+                ),
+                &id.to_string(),
+            )
+        })
     }
 }
 
@@ -329,5 +369,24 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn bazel_backend_reports_missing_native_stably() {
+        let path =
+            OwnedStarlarkModulePath::LoadFile(ImportPath::testing_new("root//prelude:prelude.bzl"));
+        let module = LoadedModule::new(
+            path,
+            LoadedModules::default(),
+            // `env` deliberately exports only `name`.
+            env(StarlarkModulePath::LoadFile(&ImportPath::testing_new(
+                "root//prelude:prelude.bzl",
+            ))),
+        );
+        let error = module.bazel_genrule_backend().unwrap_err().to_string();
+        assert!(
+            error.contains("`native` is missing from the configured Buck2 prelude"),
+            "unexpected error: {error}"
+        );
     }
 }

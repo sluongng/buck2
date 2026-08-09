@@ -1,0 +1,14 @@
+load(":macros.bzl", "bazel_genrule")
+
+bazel_genrule(
+    name = "transitive",
+    outs = ["bazel.txt"],
+    srcs = ["input.txt"],
+    cmd = "cat $(SRCS) > $@",
+)
+
+genrule(
+    name = "direct",
+    outs = ["direct.txt"],
+    cmd = "printf 'direct-ok\\n' > $@",
+)

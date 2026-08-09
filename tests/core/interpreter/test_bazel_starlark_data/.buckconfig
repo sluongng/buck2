@@ -1,0 +1,8 @@
+[repositories]
+    root = .
+    prelude = prelude
+
+[buildfile]
+    includes = root_import.bzl
+    name_v2 = BUILD.bazel
+    package_includes = buck=>//:package_import.bzl::package_marker,negative/package_import=>//:package_import.bzl::package_marker

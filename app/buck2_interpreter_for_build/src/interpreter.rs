@@ -8,6 +8,7 @@
  * above-listed licenses.
  */
 
+pub(crate) mod bazel;
 pub mod buckconfig;
 pub mod build_context;
 pub(crate) mod bzl_eval_ctx;
