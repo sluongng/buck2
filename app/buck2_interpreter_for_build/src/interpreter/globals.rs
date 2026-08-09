@@ -186,13 +186,43 @@ mod tests {
             .names()
             .map(|name| name.as_str())
             .collect::<Vec<_>>();
-        assert!(names.contains(&"genrule"));
-        for buck_only in ["attrs", "rule", "select", "read_config", "plugins"] {
-            assert!(
-                !names.contains(&buck_only),
-                "unexpected Buck2 global `{buck_only}`"
-            );
-        }
+        assert_eq!(
+            names,
+            [
+                "False",
+                "None",
+                "True",
+                "abs",
+                "all",
+                "any",
+                "bool",
+                "bytes",
+                "chr",
+                "dict",
+                "dir",
+                "enumerate",
+                "fail",
+                "float",
+                "genrule",
+                "getattr",
+                "hasattr",
+                "hash",
+                "int",
+                "len",
+                "list",
+                "max",
+                "min",
+                "ord",
+                "range",
+                "repr",
+                "reversed",
+                "sorted",
+                "str",
+                "tuple",
+                "type",
+                "zip",
+            ]
+        );
     }
 
     #[test]
@@ -202,13 +232,42 @@ mod tests {
             .names()
             .map(|name| name.as_str())
             .collect::<Vec<_>>();
-        assert!(names.contains(&"native"));
-        assert!(!names.contains(&"genrule"));
-        for buck_only in ["attrs", "rule", "select", "read_config", "plugins"] {
-            assert!(
-                !names.contains(&buck_only),
-                "unexpected Buck2 global `{buck_only}`"
-            );
-        }
+        assert_eq!(
+            names,
+            [
+                "False",
+                "None",
+                "True",
+                "abs",
+                "all",
+                "any",
+                "bool",
+                "bytes",
+                "chr",
+                "dict",
+                "dir",
+                "enumerate",
+                "fail",
+                "float",
+                "getattr",
+                "hasattr",
+                "hash",
+                "int",
+                "len",
+                "list",
+                "max",
+                "min",
+                "native",
+                "ord",
+                "range",
+                "repr",
+                "reversed",
+                "sorted",
+                "str",
+                "tuple",
+                "type",
+                "zip",
+            ]
+        );
     }
 }
