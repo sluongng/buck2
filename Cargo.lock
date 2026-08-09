@@ -2623,6 +2623,7 @@ dependencies = [
  "ref-cast",
  "regex",
  "serde",
+ "sha2",
  "starlark",
  "starlark_map",
  "strong_hash",
