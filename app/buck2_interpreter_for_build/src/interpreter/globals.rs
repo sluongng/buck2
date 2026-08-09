@@ -183,26 +183,85 @@ mod tests {
     fn bazel_build_globals_are_clean_and_direct() {
         let globals = bazel_build_globals().build();
         let names = globals.names().collect::<Vec<_>>();
-        assert!(names.contains(&"genrule"));
-        for buck_only in ["attrs", "rule", "select", "read_config", "plugins"] {
-            assert!(
-                !names.contains(&buck_only),
-                "unexpected Buck2 global `{buck_only}`"
-            );
-        }
+        assert_eq!(
+            names,
+            [
+                "False",
+                "None",
+                "True",
+                "abs",
+                "all",
+                "any",
+                "bool",
+                "bytes",
+                "chr",
+                "dict",
+                "dir",
+                "enumerate",
+                "fail",
+                "float",
+                "genrule",
+                "getattr",
+                "hasattr",
+                "hash",
+                "int",
+                "len",
+                "list",
+                "max",
+                "min",
+                "ord",
+                "range",
+                "repr",
+                "reversed",
+                "sorted",
+                "str",
+                "tuple",
+                "type",
+                "zip",
+            ]
+        );
     }
 
     #[test]
     fn bazel_bzl_globals_expose_genrule_only_through_native() {
         let globals = bazel_bzl_globals().build();
         let names = globals.names().collect::<Vec<_>>();
-        assert!(names.contains(&"native"));
-        assert!(!names.contains(&"genrule"));
-        for buck_only in ["attrs", "rule", "select", "read_config", "plugins"] {
-            assert!(
-                !names.contains(&buck_only),
-                "unexpected Buck2 global `{buck_only}`"
-            );
-        }
+        assert_eq!(
+            names,
+            [
+                "False",
+                "None",
+                "True",
+                "abs",
+                "all",
+                "any",
+                "bool",
+                "bytes",
+                "chr",
+                "dict",
+                "dir",
+                "enumerate",
+                "fail",
+                "float",
+                "getattr",
+                "hasattr",
+                "hash",
+                "int",
+                "len",
+                "list",
+                "max",
+                "min",
+                "native",
+                "ord",
+                "range",
+                "repr",
+                "reversed",
+                "sorted",
+                "str",
+                "tuple",
+                "type",
+                "zip",
+            ]
+        );
     }
 }

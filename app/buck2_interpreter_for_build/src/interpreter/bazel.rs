@@ -123,7 +123,7 @@ fn register_genrule(builder: &mut GlobalsBuilder) {
             .as_ref()
             .add_to_heap(eval.heap());
 
-        Ok(eval.eval_function(backend, &[], &named)?)
+        eval.eval_function(backend, &[], &named)
     }
 }
 
@@ -210,6 +210,18 @@ mod tests {
         a.fail(
             r#"genrule(name = "target", outs = "out", cmd = "echo")"#,
             "Type of parameter `outs` doesn't match",
+        );
+        a.fail(
+            r#"genrule(name = 1, outs = ["out"], cmd = "echo")"#,
+            "Type of parameter `name` doesn't match",
+        );
+        a.fail(
+            r#"genrule(name = "target", outs = ["out"], cmd = 1)"#,
+            "Type of parameter `cmd` doesn't match",
+        );
+        a.fail(
+            r#"genrule(name = "target", outs = ["out"], cmd = "echo", srcs = "src")"#,
+            "Type of parameter `srcs` doesn't match",
         );
     }
 }
