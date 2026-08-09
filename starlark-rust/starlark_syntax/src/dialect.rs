@@ -64,6 +64,21 @@ pub struct Dialect {
     ///
     /// [Starlark spec proposal](https://github.com/bazelbuild/starlark/issues/91).
     pub enable_f_strings: bool,
+    /// May `load()` import a symbol whose original name starts with `_`.
+    /// Enabled by default for compatibility with existing dialects.
+    pub allow_load_private_symbols: bool,
+    /// May one `load()` statement bind the same local name more than once.
+    /// Enabled by default for compatibility with existing dialects.
+    pub allow_load_duplicate_local_bindings: bool,
+    /// May a name be bound more than once at module scope.
+    /// Enabled by default for compatibility with existing dialects.
+    pub allow_toplevel_rebinding: bool,
+    /// Must all `load()` statements precede every non-string-literal statement.
+    /// Disabled by default for compatibility with existing dialects.
+    pub require_load_statements_first: bool,
+    /// Are `*args` and `**kwargs` permitted in function calls.
+    /// Enabled by default for compatibility with existing dialects.
+    pub allow_call_star_args: bool,
     /// Like `#[non_exhaustive]`, but allows struct expression.
     ///
     /// [Explanation](https://github.com/rust-lang/rust-clippy/issues/6559).
@@ -93,6 +108,11 @@ impl Dialect {
         enable_load_reexport: true, // But they plan to change it
         enable_top_level_stmt: false,
         enable_f_strings: false,
+        allow_load_private_symbols: true,
+        allow_load_duplicate_local_bindings: true,
+        allow_toplevel_rebinding: true,
+        require_load_statements_first: false,
+        allow_call_star_args: true,
         _non_exhaustive: (),
     };
 
@@ -108,6 +128,11 @@ impl Dialect {
         enable_load_reexport: true,
         enable_top_level_stmt: true,
         enable_f_strings: false,
+        allow_load_private_symbols: true,
+        allow_load_duplicate_local_bindings: true,
+        allow_toplevel_rebinding: true,
+        require_load_statements_first: false,
+        allow_call_star_args: true,
         _non_exhaustive: (),
     };
 
@@ -123,6 +148,11 @@ impl Dialect {
         enable_load_reexport: true,
         enable_top_level_stmt: true,
         enable_f_strings: true,
+        allow_load_private_symbols: true,
+        allow_load_duplicate_local_bindings: true,
+        allow_toplevel_rebinding: true,
+        require_load_statements_first: false,
+        allow_call_star_args: true,
         _non_exhaustive: (),
     };
 }
