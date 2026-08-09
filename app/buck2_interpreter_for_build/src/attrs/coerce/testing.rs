@@ -88,12 +88,11 @@ fn cell_resolver() -> CellResolver {
 
 pub fn to_value<'v>(env: &Module<'v>, globals: &Globals, content: &str) -> Value<'v> {
     let import_path = ImportPath::testing_new("root//:defs.bzl");
-    let ast = AstModule::parse(
-        &import_path.to_string(),
-        content.to_owned(),
-        &StarlarkDialect::Buck2.parser_dialect(StarlarkFileType::Bzl, false),
-    )
-    .unwrap_or_else(|err| panic!("Failed parsing `{content}`. Error: `{err}`"));
+    let dialect = StarlarkDialect::Buck2
+        .parser_dialect(StarlarkFileType::Bzl, false)
+        .unwrap();
+    let ast = AstModule::parse(&import_path.to_string(), content.to_owned(), &dialect)
+        .unwrap_or_else(|err| panic!("Failed parsing `{content}`. Error: `{err}`"));
     let cell_info = InterpreterCellInfo::new(
         BuildFileCell::new(CellName::testing_new("root")),
         cell_resolver(),

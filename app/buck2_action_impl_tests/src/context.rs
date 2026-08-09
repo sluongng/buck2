@@ -51,12 +51,10 @@ fn run_ctx_test(
 
         {
             let mut eval = Evaluator::new(&func_mod);
-            let ast = AstModule::parse(
-                "foo.bzl",
-                full_content,
-                &StarlarkDialect::Buck2.parser_dialect(StarlarkFileType::Bzl, false),
-            )
-            .unwrap();
+            let dialect = StarlarkDialect::Buck2
+                .parser_dialect(StarlarkFileType::Bzl, false)
+                .unwrap();
+            let ast = AstModule::parse("foo.bzl", full_content, &dialect).unwrap();
             eval.eval_module(ast, &globals).unwrap();
         };
         let frozen_func_mod = func_mod

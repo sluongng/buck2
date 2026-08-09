@@ -1,0 +1,4 @@
+[buildfile]
+    name = TARGETS.fixture
+[buck2]
+    starlark_dialect = bazel

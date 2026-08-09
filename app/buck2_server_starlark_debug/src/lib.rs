@@ -53,6 +53,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use buck2_core::fs::project::ProjectRoot;
 use buck2_events::dispatch::EventDispatcher;
+use buck2_interpreter::dialect::StarlarkDialect;
 use buck2_interpreter::starlark_debug::StarlarkDebugController;
 use buck2_interpreter::starlark_debug::StarlarkDebuggerHandle;
 use derive_more::Display;
@@ -77,6 +78,7 @@ pub struct BuckStarlarkDebuggerHandle(Arc<HandleData>);
 #[derive(Debug)]
 pub struct HandleData {
     id: HandleId,
+    starlark_dialect: StarlarkDialect,
     server: Arc<BuckStarlarkDebuggerServer>,
 }
 
@@ -108,12 +110,15 @@ static CURRENT_DEBUGGER: Mutex<Option<Arc<BuckStarlarkDebuggerServer>>> = Mutex:
 /// Used by each command to get a handle to the current debugger. The debugger server will capture the
 /// event dispatcher to send back debugger state snapshots (which indicate that the debugger is attached
 /// and which, if any, threads are paused) while the command is running.
-pub fn create_debugger_handle(events: EventDispatcher) -> Option<BuckStarlarkDebuggerHandle> {
+pub fn create_debugger_handle(
+    events: EventDispatcher,
+    starlark_dialect: StarlarkDialect,
+) -> Option<BuckStarlarkDebuggerHandle> {
     CURRENT_DEBUGGER
         .lock()
         .unwrap()
         .as_ref()
-        .and_then(|v| v.new_handle(events))
+        .and_then(|v| v.new_handle(events, starlark_dialect))
 }
 
 /// Manages setting/unsetting the CURRENT_DEBUGGER while the starlark debug-attach command is running.
@@ -123,6 +128,7 @@ impl ServerConnection {
     fn new(
         to_client_send: mpsc::UnboundedSender<ToClientMessage>,
         project_root: ProjectRoot,
+        provisional_starlark_dialect: StarlarkDialect,
     ) -> buck2_error::Result<Self> {
         let mut locked = CURRENT_DEBUGGER.lock().unwrap();
         if locked.is_some() {
@@ -132,6 +138,7 @@ impl ServerConnection {
         let server = Arc::new(BuckStarlarkDebuggerServer::new(
             to_client_send,
             project_root,
+            provisional_starlark_dialect,
         ));
         *locked = Some(server.dupe());
         Ok(Self(server))

@@ -25,6 +25,7 @@ use buck2_hash::StdBuckHashMap;
 use buck2_interpreter::dialect::StarlarkDialect;
 use buck2_interpreter::file_type::StarlarkFileType;
 use buck2_interpreter::paths::path::StarlarkPath;
+use buck2_interpreter_for_build::interpreter::global_interpreter_state::HasGlobalInterpreterState;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::ctx::ServerCommandDiceContext;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
@@ -76,8 +77,10 @@ async fn lint_file(
     cell_resolver: &CellResolver,
     io: &dyn IoProvider,
     cache: &mut Cache<'_>,
+    starlark_dialect: StarlarkDialect,
 ) -> buck2_error::Result<Vec<Lint>> {
-    let dialect = StarlarkDialect::Buck2.parser_dialect(path.file_type(), false);
+    starlark_dialect.require_available()?;
+    let dialect = starlark_dialect.parser_dialect(path.file_type(), false)?;
     let proj_path = cell_resolver.resolve_path(path.path().as_ref().as_ref())?;
     let path_str = proj_path.to_string();
     let content = io
@@ -114,6 +117,11 @@ impl StarlarkServerSubcommand for StarlarkLintCommand {
         server_ctx
             .with_dice_ctx(|server_ctx, ctx| async move {
                 let cell_resolver = &ctx.ctx().get_cell_resolver().await?;
+                let starlark_dialect = ctx
+                    .ctx()
+                    .get_global_interpreter_state()
+                    .await?
+                    .starlark_dialect;
                 let io = &ctx.global_data().get_io_provider();
 
                 let mut stdout = stdout.as_writer();
@@ -129,7 +137,14 @@ impl StarlarkServerSubcommand for StarlarkLintCommand {
                 let mut cache = Cache::new(&ctx);
 
                 for file in &files {
-                    let lints = lint_file(&file.borrow(), cell_resolver, &**io, &mut cache).await?;
+                    let lints = lint_file(
+                        &file.borrow(),
+                        cell_resolver,
+                        &**io,
+                        &mut cache,
+                        starlark_dialect,
+                    )
+                    .await?;
                     lint_count += lints.len();
                     for lint in lints {
                         writeln!(stdout, "{lint}")?;

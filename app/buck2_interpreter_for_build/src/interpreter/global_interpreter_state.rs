@@ -65,6 +65,7 @@ impl GlobalInterpreterState {
         disable_starlark_types: bool,
         unstable_typecheck: bool,
     ) -> buck2_error::Result<Self> {
+        starlark_dialect.require_available()?;
         let global_env = base_globals()
             .with(|g| {
                 if let Some(additional_globals) = interpreter_configuror.additional_globals() {
@@ -133,11 +134,12 @@ impl<'d> HasGlobalInterpreterState<'d> for DiceComputations<'d> {
                 let cell_resolver = ctx.get_cell_resolver().await?.dupe();
                 let disable_starlark_types = ctx.get_disable_starlark_types().await?;
                 let unstable_typecheck = ctx.get_unstable_typecheck().await?;
+                let starlark_dialect = interpreter_configuror.starlark_dialect();
 
                 Ok(Arc::new(GlobalInterpreterState::new(
                     cell_resolver,
                     interpreter_configuror,
-                    StarlarkDialect::Buck2,
+                    starlark_dialect,
                     disable_starlark_types,
                     unstable_typecheck,
                 )?))

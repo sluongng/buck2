@@ -78,19 +78,17 @@ pub(crate) async fn check_starlark_stack_size(
                                 f()
                         "#
                         );
-                        let ast = AstModule::parse(
-                            "x.star",
-                            content.to_owned(),
-                            &StarlarkDialect::Buck2.parser_dialect(StarlarkFileType::Bzl, false),
-                        )
-                        .map_err(|e| {
-                            from_starlark_with_options(
-                                e,
-                                buck2_error::starlark_error::NativeErrorHandling::Unknown,
-                                false,
-                            )
-                        })
-                        .internal_error("Failed to parse check module")?;
+                        let dialect =
+                            StarlarkDialect::Buck2.parser_dialect(StarlarkFileType::Bzl, false)?;
+                        let ast = AstModule::parse("x.star", content.to_owned(), &dialect)
+                            .map_err(|e| {
+                                from_starlark_with_options(
+                                    e,
+                                    buck2_error::starlark_error::NativeErrorHandling::Unknown,
+                                    false,
+                                )
+                            })
+                            .internal_error("Failed to parse check module")?;
                         match eval.eval_module(ast, &Globals::standard()) {
                             Err(e) if e.to_string().contains("Starlark call stack overflow") => {
                                 Ok(())

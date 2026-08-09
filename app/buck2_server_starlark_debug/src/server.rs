@@ -110,10 +110,12 @@ impl BuckStarlarkDebuggerServer {
     pub(crate) fn new(
         to_client: mpsc::UnboundedSender<ToClientMessage>,
         project_root: ProjectRoot,
+        provisional_starlark_dialect: StarlarkDialect,
     ) -> Self {
         let (to_state, state_recv) = mpsc::unbounded_channel();
         tokio::task::spawn(async move {
-            let mut server = ServerState::new(to_client, project_root);
+            let mut server =
+                ServerState::new(to_client, project_root, provisional_starlark_dialect);
             let res = server.run(state_recv).await;
             // We always send the ::Shutdown message when the state thread finishes. It may be normal
             // shutdown (on detach()) or indicate an internal state error or that the client has already
@@ -144,14 +146,17 @@ impl BuckStarlarkDebuggerServer {
     pub(crate) fn new_handle(
         self: &Arc<Self>,
         events: EventDispatcher,
+        starlark_dialect: StarlarkDialect,
     ) -> Option<BuckStarlarkDebuggerHandle> {
         let handle_id = HandleId(self.next_handle_id.fetch_add(1, Ordering::Relaxed));
         self.maybe_to_state(ServerMessage::NewHandle {
             id: handle_id,
             events,
+            starlark_dialect,
         });
         Some(BuckStarlarkDebuggerHandle(Arc::new(HandleData {
             id: handle_id,
+            starlark_dialect,
             server: self.clone(),
         })))
     }
@@ -240,6 +245,7 @@ enum ServerMessage {
     NewHandle {
         id: HandleId,
         events: EventDispatcher,
+        starlark_dialect: StarlarkDialect,
     },
     DropHook {
         id: HookId,
@@ -272,6 +278,9 @@ struct ServerState {
 
     /// The project root is used to get the current source code to resolve breakpoints.
     project_root: ProjectRoot,
+
+    /// Validated dialect from the attaching transaction, used only before a debugged command exists.
+    provisional_starlark_dialect: StarlarkDialect,
 
     /// Currently executing buck commands, this is primarily used to send debugger snapshots.
     current_commands: StdBuckHashMap<HandleId, CommandState>,
@@ -413,7 +422,8 @@ impl DebugServer for ServerState {
         x.source.path = Some(source.clone());
 
         // We currently just resolve new breakpoints against the current state of the file. This isn't quite correct, but oh well.
-        let resolved = resolve_breakpoints(&x, &self.get_ast(&project_relative)?)
+        let starlark_dialect = self.breakpoint_starlark_dialect()?;
+        let resolved = resolve_breakpoints(&x, &self.get_ast(&project_relative, starlark_dialect)?)
             .map_err(|e| from_any_with_tag(e, buck2_error::ErrorTag::StarlarkServer))?;
         for hook_state in self.current_hooks.values() {
             hook_state
@@ -685,10 +695,15 @@ impl DebugServer for ServerState {
 }
 
 impl ServerState {
-    fn new(to_client: mpsc::UnboundedSender<ToClientMessage>, project_root: ProjectRoot) -> Self {
+    fn new(
+        to_client: mpsc::UnboundedSender<ToClientMessage>,
+        project_root: ProjectRoot,
+        provisional_starlark_dialect: StarlarkDialect,
+    ) -> Self {
         Self {
             to_client,
             project_root,
+            provisional_starlark_dialect,
             current_commands: StdBuckHashMap::default(),
             current_hooks: StdBuckHashMap::default(),
             free_pseudo_threads: BTreeSet::new(),
@@ -792,7 +807,11 @@ impl ServerState {
                     )
                 })?;
             }
-            ServerMessage::NewHandle { id, events } => self.new_handle(id, events),
+            ServerMessage::NewHandle {
+                id,
+                events,
+                starlark_dialect,
+            } => self.new_handle(id, events, starlark_dialect),
             ServerMessage::DropHook { id } => self.drop_hook(id)?,
             ServerMessage::DropHandle { id } => self.drop_handle(id),
             ServerMessage::DapRequest { req } => {
@@ -831,6 +850,8 @@ impl ServerState {
         handle: BuckStarlarkDebuggerHandle,
         description: String,
     ) -> buck2_error::Result<(HookId, Option<Box<dyn DapAdapterEvalHook>>)> {
+        let starlark_dialect = handle.0.starlark_dialect;
+        starlark_dialect.require_available()?;
         let (hook_id, pseudo_thread_id) = self.next_hook_id();
 
         let client = Box::new(BuckStarlarkDapAdapterClient {
@@ -844,6 +865,7 @@ impl ServerState {
             pseudo_thread_name: description,
             stopped_at: None,
             handle_id: handle.0.id,
+            starlark_dialect,
         };
 
         for (source, breakpoints) in &self.set_breakpoints {
@@ -865,8 +887,19 @@ impl ServerState {
         Ok((hook_id, Some(Box::new(eval_wrapper))))
     }
 
-    fn new_handle(&mut self, id: HandleId, events: EventDispatcher) {
-        self.current_commands.insert(id, CommandState { events });
+    fn new_handle(
+        &mut self,
+        id: HandleId,
+        events: EventDispatcher,
+        starlark_dialect: StarlarkDialect,
+    ) {
+        self.current_commands.insert(
+            id,
+            CommandState {
+                events,
+                starlark_dialect,
+            },
+        );
     }
 
     fn drop_hook(&mut self, hook_id: HookId) -> buck2_error::Result<()> {
@@ -931,7 +964,25 @@ impl ServerState {
         ))
     }
 
-    fn get_ast(&self, source: &ProjectRelativePath) -> buck2_error::Result<AstModule> {
+    fn breakpoint_starlark_dialect(&self) -> buck2_error::Result<StarlarkDialect> {
+        select_breakpoint_starlark_dialect(
+            self.provisional_starlark_dialect,
+            self.current_commands
+                .values()
+                .map(|state| state.starlark_dialect)
+                .chain(
+                    self.current_hooks
+                        .values()
+                        .map(|state| state.starlark_dialect),
+                ),
+        )
+    }
+
+    fn get_ast(
+        &self,
+        source: &ProjectRelativePath,
+        starlark_dialect: StarlarkDialect,
+    ) -> buck2_error::Result<AstModule> {
         debug!("tried to get ast `{}`", source);
         let abs_path = self.project_root.resolve(source);
         let content = fs_util::read_to_string_if_exists(abs_path)?.ok_or_else(|| {
@@ -941,15 +992,37 @@ impl ServerState {
                 source
             )
         })?;
-        match AstModule::parse(
-            source.as_ref(),
-            content,
-            &StarlarkDialect::Buck2.debugger_parser_dialect(),
-        ) {
+        let dialect = starlark_dialect.debugger_parser_dialect()?;
+        match AstModule::parse(source.as_ref(), content, &dialect) {
             Ok(v) => Ok(v),
             Err(e) => Err(e.into()),
         }
     }
+}
+
+fn select_breakpoint_starlark_dialect(
+    provisional_starlark_dialect: StarlarkDialect,
+    dialects: impl IntoIterator<Item = StarlarkDialect>,
+) -> buck2_error::Result<StarlarkDialect> {
+    let mut selected = None;
+    for starlark_dialect in dialects {
+        match selected {
+            Some(existing) if existing != starlark_dialect => {
+                return Err(buck2_error::buck2_error!(
+                    buck2_error::ErrorTag::StarlarkServer,
+                    "Cannot resolve breakpoints for concurrent commands using different Starlark dialects"
+                ));
+            }
+            Some(_) => {}
+            None => selected = Some(starlark_dialect),
+        }
+    }
+
+    // DAP clients commonly set breakpoints before launching the command to debug. Once a command
+    // exists its explicit dialect always takes precedence over the attaching transaction's mode.
+    let selected = selected.unwrap_or(provisional_starlark_dialect);
+    selected.require_available()?;
+    Ok(selected)
 }
 
 /// Our implementation of starlark's DapAdapterClient. It basically just needs to
@@ -973,6 +1046,7 @@ impl DapAdapterClient for BuckStarlarkDapAdapterClient {
 struct CommandState {
     /// The EventDispatcher for the command. This is used to send debugger snapshots.
     events: EventDispatcher,
+    starlark_dialect: StarlarkDialect,
 }
 
 /// Information about ongoing starlark evaluations held by the debugger server.
@@ -994,6 +1068,7 @@ struct HookState {
     /// The id of the corresponding handle (also used for snapshots so a command can tell if a
     /// stopped evaluation is from itself or another command).
     handle_id: HandleId,
+    starlark_dialect: StarlarkDialect,
 }
 
 /// Provides a simple description of a stack frame, typically "<file>:<line>".
@@ -1014,7 +1089,37 @@ fn describe_frame(frame: dap::StackFrame) -> String {
 
 #[cfg(test)]
 mod tests {
+    use buck2_interpreter::dialect::StarlarkDialect;
+
     use super::VariableId;
+    use super::select_breakpoint_starlark_dialect;
+
+    #[test]
+    fn breakpoint_dialect_follows_the_debugged_command() {
+        assert_eq!(
+            StarlarkDialect::Buck2,
+            select_breakpoint_starlark_dialect(StarlarkDialect::Buck2, []).unwrap()
+        );
+        assert_eq!(
+            StarlarkDialect::Buck2,
+            select_breakpoint_starlark_dialect(
+                StarlarkDialect::Buck2,
+                [StarlarkDialect::Buck2, StarlarkDialect::Buck2],
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            StarlarkDialect::Buck2,
+            select_breakpoint_starlark_dialect(StarlarkDialect::Bazel, [StarlarkDialect::Buck2],)
+                .unwrap()
+        );
+        assert_eq!(
+            "Bazel Starlark dialect is not yet available",
+            select_breakpoint_starlark_dialect(StarlarkDialect::Bazel, [])
+                .unwrap_err()
+                .to_string()
+        );
+    }
 
     fn check_variable_err(frame_id: u32, thread_id: u32, variable_id: u32) {
         assert!(

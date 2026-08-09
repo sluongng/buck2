@@ -72,3 +72,46 @@ impl SetInterpreterContext for DiceTransactionUpdater {
         Ok(self.changed_to(vec![(BuildContextKey(), interpreter_configuror)])?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use buck2_core::pattern::pattern::InferTargetNames;
+    use buck2_core::target::label::interner::ConcurrentTargetLabelInterner;
+    use buck2_interpreter::dialect::StarlarkDialect;
+    use buck2_interpreter::extra::InterpreterHostArchitecture;
+    use buck2_interpreter::extra::InterpreterHostPlatform;
+
+    use super::*;
+
+    fn configuror(
+        starlark_dialect: StarlarkDialect,
+        global_target_interner: Arc<ConcurrentTargetLabelInterner>,
+    ) -> Arc<BuildInterpreterConfiguror> {
+        BuildInterpreterConfiguror::new(
+            starlark_dialect,
+            None,
+            InterpreterHostPlatform::Linux,
+            InterpreterHostArchitecture::X86_64,
+            None,
+            false,
+            false,
+            InferTargetNames::No,
+            None,
+            global_target_interner,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn starlark_dialect_participates_in_dice_identity() {
+        let global_target_interner = Arc::new(ConcurrentTargetLabelInterner::default());
+        let buck2 = configuror(StarlarkDialect::Buck2, global_target_interner.clone());
+        let buck2_again = configuror(StarlarkDialect::Buck2, global_target_interner.clone());
+        let bazel = configuror(StarlarkDialect::Bazel, global_target_interner);
+
+        assert!(BuildContextKey::equality(&buck2, &buck2_again));
+        assert!(!BuildContextKey::equality(&buck2, &bazel));
+    }
+}

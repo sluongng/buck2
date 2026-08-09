@@ -416,11 +416,8 @@ mod tests {
     fn assert_promise<'v>(modu: &Module<'v>, content: &str) -> buck2_error::Result<Value<'v>> {
         alloc_promises(modu);
         let globals = GlobalsBuilder::standard().with(helpers).build();
-        let ast = AstModule::parse(
-            "test.bzl",
-            content.to_owned(),
-            &StarlarkDialect::Buck2.parser_dialect(StarlarkFileType::Bzl, false),
-        )?;
+        let dialect = StarlarkDialect::Buck2.parser_dialect(StarlarkFileType::Bzl, false)?;
+        let ast = AstModule::parse("test.bzl", content.to_owned(), &dialect)?;
         let mut eval = Evaluator::new(modu);
         let res = eval.eval_module(ast, &globals)?;
         let promises = get_promises(modu);

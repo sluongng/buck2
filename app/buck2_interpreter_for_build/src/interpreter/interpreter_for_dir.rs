@@ -451,14 +451,11 @@ impl InterpreterForDir {
             .resolve_path(import.path().as_ref().as_ref())?;
 
         let disable_starlark_types = self.global_state.disable_starlark_types;
-        let ast = match AstModule::parse(
-            project_relative_path.as_str(),
-            content,
-            &self
-                .global_state
-                .starlark_dialect
-                .parser_dialect(import.file_type(), disable_starlark_types),
-        ) {
+        let dialect = self
+            .global_state
+            .starlark_dialect
+            .parser_dialect(import.file_type(), disable_starlark_types)?;
+        let ast = match AstModule::parse(project_relative_path.as_str(), content, &dialect) {
             Ok(ast) => ast,
             Err(e) => {
                 return Ok(Err(buck2_error::Error::from(e).context(format!(

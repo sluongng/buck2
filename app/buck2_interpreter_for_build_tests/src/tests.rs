@@ -25,6 +25,7 @@ use buck2_core::package::PackageLabel;
 use buck2_core::pattern::pattern::InferTargetNames;
 use buck2_core::target::label::interner::ConcurrentTargetLabelInterner;
 use buck2_events::dispatch::EventDispatcher;
+use buck2_interpreter::dialect::StarlarkDialect;
 use buck2_interpreter::dice::starlark_debug::SetStarlarkDebugger;
 use buck2_interpreter::dice::starlark_types::SetStarlarkTypes;
 use buck2_interpreter::extra::InterpreterHostArchitecture;
@@ -62,6 +63,7 @@ pub(crate) async fn calculation(fs: &ProjectRootTemp) -> DiceTransaction {
     ctx.set_cell_resolver(resolver.dupe()).unwrap();
     ctx.set_interpreter_context(
         BuildInterpreterConfiguror::new(
+            StarlarkDialect::Buck2,
             None,
             InterpreterHostPlatform::Linux,
             InterpreterHostArchitecture::X86_64,

@@ -210,6 +210,7 @@ impl Tester {
             Arc::new(GlobalInterpreterState::new(
                 self.cell_resolver.dupe(),
                 BuildInterpreterConfiguror::new(
+                    StarlarkDialect::Buck2,
                     self.prelude_path.clone(),
                     InterpreterHostPlatform::Linux,
                     InterpreterHostArchitecture::X86_64,
