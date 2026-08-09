@@ -1,7 +1,7 @@
 # Bazel Starlark compatibility
 
-Status: implemented bounded compatibility surface at Buck2 commit
-`ccad6aeccdbf420190d3af9ab9219165432bb680`; runtime enablement landed in
+Status: implemented bounded compatibility surface through Buck2 commit
+`81b4c5e89388d3010796d26f46aaa2b7cbda5196`; runtime enablement landed in
 `eb773980c4cf87f6a9828d9f0b107ccfa1f20222`.
 
 This document defines Buck2's Bazel Starlark mode. Compatibility claims are
@@ -270,7 +270,8 @@ classes and stable message fragments:
 - **Adapter:** zero or multiple outputs contain `exactly one output`.
   Unsupported and malformed commands contain `unsupported Bazel genrule make
   variable`, `unterminated Bazel genrule make variable`, `unsupported Bazel
-  genrule dollar expression`, or `dangling $ in Bazel genrule command`.
+  genrule dollar expression`, or
+  `` dangling `$` in Bazel genrule command ``.
 - **Loading:** an explicit backend load contains `cannot load Buck2 prelude`.
   Attempted automatic load re-export contains `not exported`.
 
@@ -422,13 +423,13 @@ sha256 27151c510e36d0172db80347f5e6de4840a0c644d67cd8a43a5f8561b5f87a01
 That binary's 2026-08-09 15:05 Europe/Amsterdam modification time preceded
 the 15:37 invocation below, and the e2e command used that absolute path.
 
-At final HEAD `ccad6aeccdbf420190d3af9ab9219165432bb680`, a fresh
-`cargo build --locked -p buck2 --bin buck2` passed in 117.84 seconds and
+At production HEAD `81b4c5e89388d3010796d26f46aaa2b7cbda5196`, a fresh
+`cargo build --locked -p buck2 --bin buck2` passed in 150.93 seconds and
 produced:
 
 ```text
-/tmp/buck2-bazel-starlark-final-cargo.FXQf1mIkvF/debug/buck2
-sha256 36a7b725a911bd57682eb164ceb10af850fd03caaf93a23cf905976a1c5a6f4c
+/tmp/buck2-bazel-starlark-production-cargo.B5huUdcbwS/debug/buck2
+sha256 22399e3733a4cc739706e0cd9420c8f41c9b70ed13a34c39872e7e597c1d9799
 ```
 
 - BuildBuddy invocation `73340226-d4b1-4716-b3e5-b7272eda05d2` passed all
