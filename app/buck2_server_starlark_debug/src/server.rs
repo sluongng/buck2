@@ -23,6 +23,7 @@ use buck2_fs::fs_util;
 use buck2_fs::paths::abs_norm_path::AbsNormPath;
 use buck2_hash::IntentionallyStdHashMap;
 use buck2_hash::StdBuckHashMap;
+use buck2_interpreter::dialect::StarlarkDialect;
 use buck2_interpreter::starlark_debug::StarlarkDebugController;
 use debugserver_types as dap;
 use dupe::Dupe;
@@ -37,8 +38,6 @@ use starlark::debug::VariablePath;
 use starlark::debug::prepare_dap_adapter;
 use starlark::debug::resolve_breakpoints;
 use starlark::syntax::AstModule;
-use starlark::syntax::Dialect;
-use starlark::syntax::DialectTypes;
 use tokio::select;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
@@ -945,16 +944,7 @@ impl ServerState {
         match AstModule::parse(
             source.as_ref(),
             content,
-            &Dialect {
-                enable_def: true,
-                enable_lambda: true,
-                enable_load: true,
-                enable_keyword_only_arguments: true,
-                enable_types: DialectTypes::ParseOnly,
-                enable_load_reexport: false,
-                enable_top_level_stmt: true,
-                ..Dialect::Standard
-            },
+            &StarlarkDialect::Buck2.debugger_parser_dialect(),
         ) {
             Ok(v) => Ok(v),
             Err(e) => Err(e.into()),

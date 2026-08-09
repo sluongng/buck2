@@ -14,6 +14,7 @@ use allocative::Allocative;
 use async_trait::async_trait;
 use buck2_common::dice::cells::HasCellResolver;
 use buck2_core::cells::CellResolver;
+use buck2_interpreter::dialect::StarlarkDialect;
 use buck2_interpreter::dice::starlark_types::GetStarlarkTypes;
 use dice::DiceComputations;
 use dice::Key;
@@ -49,6 +50,9 @@ pub struct GlobalInterpreterState {
     /// Check types in Starlark (or just parse and ignore).
     pub disable_starlark_types: bool,
 
+    /// Language dialect used to parse Starlark input files.
+    pub starlark_dialect: StarlarkDialect,
+
     /// Static typechecking for bzl and bxl files.
     pub unstable_typecheck: bool,
 }
@@ -57,6 +61,7 @@ impl GlobalInterpreterState {
     pub fn new(
         cell_resolver: CellResolver,
         interpreter_configuror: Arc<BuildInterpreterConfiguror>,
+        starlark_dialect: StarlarkDialect,
         disable_starlark_types: bool,
         unstable_typecheck: bool,
     ) -> buck2_error::Result<Self> {
@@ -74,6 +79,7 @@ impl GlobalInterpreterState {
             cell_resolver,
             global_env,
             configuror: interpreter_configuror,
+            starlark_dialect,
             disable_starlark_types,
             unstable_typecheck,
         })
@@ -131,6 +137,7 @@ impl<'d> HasGlobalInterpreterState<'d> for DiceComputations<'d> {
                 Ok(Arc::new(GlobalInterpreterState::new(
                     cell_resolver,
                     interpreter_configuror,
+                    StarlarkDialect::Buck2,
                     disable_starlark_types,
                     unstable_typecheck,
                 )?))

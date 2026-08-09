@@ -22,6 +22,7 @@ use buck2_core::cells::name::CellName;
 use buck2_error::internal_error;
 use buck2_hash::IntentionallyStdHashSet;
 use buck2_hash::StdBuckHashMap;
+use buck2_interpreter::dialect::StarlarkDialect;
 use buck2_interpreter::file_type::StarlarkFileType;
 use buck2_interpreter::paths::path::StarlarkPath;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
@@ -76,7 +77,7 @@ async fn lint_file(
     io: &dyn IoProvider,
     cache: &mut Cache<'_>,
 ) -> buck2_error::Result<Vec<Lint>> {
-    let dialect = path.file_type().dialect(false);
+    let dialect = StarlarkDialect::Buck2.parser_dialect(path.file_type(), false);
     let proj_path = cell_resolver.resolve_path(path.path().as_ref().as_ref())?;
     let path_str = proj_path.to_string();
     let content = io

@@ -13,6 +13,7 @@
 pub mod allow_relative_paths;
 pub mod build_context;
 pub mod coerce;
+pub mod dialect;
 pub mod dice;
 pub mod downstream_crate_starlark_defs;
 pub mod extra;

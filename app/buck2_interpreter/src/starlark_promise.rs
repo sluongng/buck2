@@ -351,6 +351,7 @@ mod tests {
     use starlark::values::tuple::TupleRef;
 
     use super::*;
+    use crate::dialect::StarlarkDialect;
     use crate::file_type::StarlarkFileType;
 
     #[derive(
@@ -418,7 +419,7 @@ mod tests {
         let ast = AstModule::parse(
             "test.bzl",
             content.to_owned(),
-            &StarlarkFileType::Bzl.dialect(false),
+            &StarlarkDialect::Buck2.parser_dialect(StarlarkFileType::Bzl, false),
         )?;
         let mut eval = Evaluator::new(modu);
         let res = eval.eval_module(ast, &globals)?;

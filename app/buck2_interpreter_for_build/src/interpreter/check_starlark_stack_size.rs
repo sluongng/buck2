@@ -12,6 +12,7 @@ use allocative::Allocative;
 use async_trait::async_trait;
 use buck2_error::BuckErrorContext;
 use buck2_error::starlark_error::from_starlark_with_options;
+use buck2_interpreter::dialect::StarlarkDialect;
 use buck2_interpreter::dice::starlark_provider::StarlarkEvalKind;
 use buck2_interpreter::factory::BuckStarlarkModule;
 use buck2_interpreter::factory::StarlarkEvaluatorProvider;
@@ -80,7 +81,7 @@ pub(crate) async fn check_starlark_stack_size(
                         let ast = AstModule::parse(
                             "x.star",
                             content.to_owned(),
-                            &StarlarkFileType::Bzl.dialect(false),
+                            &StarlarkDialect::Buck2.parser_dialect(StarlarkFileType::Bzl, false),
                         )
                         .map_err(|e| {
                             from_starlark_with_options(

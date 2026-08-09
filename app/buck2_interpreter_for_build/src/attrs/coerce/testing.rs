@@ -23,6 +23,7 @@ use buck2_core::cells::name::CellName;
 use buck2_core::package::PackageLabel;
 use buck2_core::pattern::pattern::InferTargetNames;
 use buck2_core::target::label::interner::ConcurrentTargetLabelInterner;
+use buck2_interpreter::dialect::StarlarkDialect;
 use buck2_interpreter::extra::InterpreterHostArchitecture;
 use buck2_interpreter::extra::InterpreterHostPlatform;
 use buck2_interpreter::file_type::StarlarkFileType;
@@ -90,7 +91,7 @@ pub fn to_value<'v>(env: &Module<'v>, globals: &Globals, content: &str) -> Value
     let ast = AstModule::parse(
         &import_path.to_string(),
         content.to_owned(),
-        &StarlarkFileType::Bzl.dialect(false),
+        &StarlarkDialect::Buck2.parser_dialect(StarlarkFileType::Bzl, false),
     )
     .unwrap_or_else(|err| panic!("Failed parsing `{content}`. Error: `{err}`"));
     let cell_info = InterpreterCellInfo::new(
