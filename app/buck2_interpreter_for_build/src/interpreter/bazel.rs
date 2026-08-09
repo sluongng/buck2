@@ -165,15 +165,18 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_or_malformed_dollar_expressions() {
-        for cmd in [
-            "echo $(location //foo)",
-            "echo $HOME",
-            "echo $(SRCS",
-            "echo $",
+        for (cmd, expected) in [
+            (
+                "echo $(location //foo)",
+                "unsupported Bazel genrule make variable",
+            ),
+            ("echo $HOME", "unsupported Bazel genrule dollar expression"),
+            ("echo $(SRCS", "unterminated Bazel genrule make variable"),
+            ("echo $", "dangling `$` in Bazel genrule command"),
         ] {
             let error = translate_genrule_cmd(cmd).unwrap_err().to_string();
             assert!(
-                error.contains("Bazel genrule"),
+                error.contains(expected),
                 "unexpected error for {cmd:?}: {error}"
             );
         }

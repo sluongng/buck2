@@ -241,6 +241,8 @@ classes and stable message fragments:
   `` Expected one of `buck2` or `bazel` ``. A root-level trusted prelude
   contains
   `dedicated cell or subdirectory`. Backend-shape failures contain
+  `Bazel genrule backend is unavailable because the configured Buck2 prelude
+  does not export native.genrule`,
   `` `native` is missing from the configured Buck2 prelude ``,
   `` `native` in `prelude.bzl` must be a struct `` or
   `` `native.genrule` is missing ``.
@@ -277,9 +279,13 @@ Unsupported operations are errors, not warnings or no-ops.
 ## Tooling behavior
 
 `buck2 starlark lint` reads the same root-project dialect and uses the same
-file-kind parser, validator, load policy, and globals as build evaluation. A
+file-kind parser, validator, and globals as build evaluation. A
 file that fails Bazel-mode validation during a build must not pass because lint
 silently used the Buck dialect.
+
+Lint does not invoke the production load resolver. Build or query evaluation,
+not lint, is authoritative for diagnostics such as explicit hidden-prelude
+loads and unavailable loaded symbols.
 
 `buck2 starlark typecheck` also selects the file-kind-specific Bazel globals
 and rejects Bazel-disabled type syntax.

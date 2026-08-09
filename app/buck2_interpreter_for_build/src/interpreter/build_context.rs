@@ -189,6 +189,13 @@ pub struct BuildContext<'a> {
     bazel_genrule_backend: Option<OwnedFrozenValue>,
 }
 
+fn bazel_genrule_backend_unavailable() -> buck2_error::Error {
+    buck2_error::buck2_error!(
+        buck2_error::ErrorTag::Input,
+        "Bazel genrule backend is unavailable because the configured Buck2 prelude does not export native.genrule"
+    )
+}
+
 impl<'a> BuildContext<'a> {
     /// Create a build context for the given module.
     pub(crate) fn new(
@@ -267,12 +274,9 @@ impl<'a> BuildContext<'a> {
     }
 
     pub(crate) fn bazel_genrule_backend(&self) -> buck2_error::Result<&OwnedFrozenValue> {
-        self.bazel_genrule_backend.as_ref().ok_or_else(|| {
-            buck2_error::buck2_error!(
-                buck2_error::ErrorTag::Input,
-                "Bazel genrule backend is unavailable because the configured Buck2 prelude does not export native.genrule"
-            )
-        })
+        self.bazel_genrule_backend
+            .as_ref()
+            .ok_or_else(bazel_genrule_backend_unavailable)
     }
 }
 
@@ -292,5 +296,18 @@ impl ModuleInternals {
         BuildContext::from_context(ctx)?
             .additional
             .require_build(function_name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bazel_genrule_backend_unavailable;
+
+    #[test]
+    fn bazel_backend_unavailable_diagnostic_is_stable() {
+        assert_eq!(
+            bazel_genrule_backend_unavailable().to_string(),
+            "Bazel genrule backend is unavailable because the configured Buck2 prelude does not export native.genrule"
+        );
     }
 }
