@@ -16,6 +16,7 @@ use buck2_common::package_listing::listing::PackageListing;
 use buck2_core::build_file_path::BuildFilePath;
 use buck2_core::cells::cell_path_with_allowed_relative_dir::CellPathWithAllowedRelativeDir;
 use buck2_core::pattern::pattern::InferTargetNames;
+use buck2_interpreter::dialect::StarlarkDialect;
 use buck2_interpreter::extra::InterpreterHostArchitecture;
 use buck2_interpreter::extra::InterpreterHostPlatform;
 use buck2_interpreter::extra::xcode::XcodeVersionInfo;
@@ -64,6 +65,7 @@ impl PartialEq for AdditionalGlobalsFn {
 
 #[derive(Clone, Debug, PartialEq, Allocative, Pagable)]
 pub struct BuildInterpreterConfiguror {
+    starlark_dialect: StarlarkDialect,
     /// Path to prelude import (typically `prelude//:prelude.bzl`).
     ///
     /// It serves two purposes:
@@ -85,6 +87,7 @@ pub struct BuildInterpreterConfiguror {
 
 impl BuildInterpreterConfiguror {
     pub fn new(
+        starlark_dialect: StarlarkDialect,
         prelude_import: Option<PreludePath>,
         host_platform: InterpreterHostPlatform,
         host_architecture: InterpreterHostArchitecture,
@@ -95,6 +98,7 @@ impl BuildInterpreterConfiguror {
         additional_globals: Option<AdditionalGlobalsFn>,
     ) -> buck2_error::Result<Arc<Self>> {
         Ok(Arc::new(Self {
+            starlark_dialect,
             prelude_import,
             host_info: HostInfo::new(host_platform, host_architecture, host_xcode_version),
             record_target_call_stack,
@@ -102,6 +106,10 @@ impl BuildInterpreterConfiguror {
             infer_target_names,
             additional_globals,
         }))
+    }
+
+    pub fn starlark_dialect(&self) -> StarlarkDialect {
+        self.starlark_dialect
     }
 
     pub(crate) fn infer_target_names(&self) -> InferTargetNames {

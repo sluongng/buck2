@@ -3137,6 +3137,7 @@ dependencies = [
  "buck2_fs",
  "buck2_hash",
  "buck2_interpreter",
+ "buck2_interpreter_for_build",
  "buck2_server_ctx",
  "buck2_util",
  "debugserver-types",

@@ -9,8 +9,10 @@
  */
 
 use buck2_events::dispatch::span_async;
+use buck2_interpreter_for_build::interpreter::context::HasInterpreterContext;
 use buck2_server_ctx::commands::command_end;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
+use buck2_server_ctx::ctx::ServerCommandDiceContext;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
 use buck2_server_ctx::streaming_request_handler::StreamingRequestHandler;
 use debugserver_types as dap;
@@ -64,7 +66,22 @@ async fn run_dap_server(
     mut req: StreamingRequestHandler<buck2_cli_proto::DapRequest>,
 ) -> buck2_error::Result<buck2_cli_proto::DapResponse> {
     let (to_client_send, mut to_client_recv) = mpsc::unbounded_channel();
-    let server_connection = ServerConnection::new(to_client_send, ctx.project_root().clone())?;
+    let provisional_starlark_dialect = ctx
+        .with_dice_ctx(|_, dice| async move {
+            let starlark_dialect = dice
+                .ctx()
+                .get_interpreter_configuror()
+                .await?
+                .starlark_dialect();
+            starlark_dialect.require_available()?;
+            Ok(starlark_dialect)
+        })
+        .await?;
+    let server_connection = ServerConnection::new(
+        to_client_send,
+        ctx.project_root().clone(),
+        provisional_starlark_dialect,
+    )?;
 
     let mut seq = 0;
 

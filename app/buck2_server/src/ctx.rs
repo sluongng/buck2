@@ -103,6 +103,7 @@ use buck2_fs::paths::file_name::FileNameBuf;
 use buck2_fs::working_dir::AbsWorkingDir;
 use buck2_hash::BuckMutSet;
 use buck2_hash::IntentionallyStdHashMap;
+use buck2_interpreter::dialect::StarlarkDialect;
 use buck2_interpreter::dice::starlark_debug::SetStarlarkDebugger;
 use buck2_interpreter::extra::InterpreterHostArchitecture;
 use buck2_interpreter::extra::InterpreterHostPlatform;
@@ -121,7 +122,6 @@ use buck2_server_ctx::ctx::PrivateStruct;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::stderr_output_guard::StderrOutputGuard;
 use buck2_server_ctx::stderr_output_guard::StderrOutputWriter;
-use buck2_server_starlark_debug::BuckStarlarkDebuggerHandle;
 use buck2_server_starlark_debug::create_debugger_handle;
 use buck2_test::local_resource_registry::InitLocalResourceRegistry;
 use buck2_util::arc_str::ArcS;
@@ -235,8 +235,6 @@ pub struct ServerCommandContext<'a> {
     /// Starlark profiler instrumentation requested throughout the duration of this command. Usually associated with
     /// the `buck2 profile` command.
     pub starlark_profiling_manager: StarlarkProfilingManager,
-
-    debugger_handle: Option<BuckStarlarkDebuggerHandle>,
 
     record_target_call_stacks: bool,
     skip_targets_with_duplicate_names: bool,
@@ -373,8 +371,6 @@ impl<'a> ServerCommandContext<'a> {
             total_disk_space_bytes,
         );
 
-        let debugger_handle = create_debugger_handle(base_context.events.dupe());
-
         // Read before `base_context` moves into the struct literal below.
         let buck_out_dir = base_context.repo().paths.buck_out_dir();
         let isolation_prefix = base_context.repo().paths.isolation().to_owned();
@@ -406,7 +402,6 @@ impl<'a> ServerCommandContext<'a> {
             command_name: client_context.command_name.clone(),
             sanitized_argv: client_context.sanitized_argv.clone(),
             agent_context: client_context.agent_context.clone(),
-            debugger_handle,
             cancellations,
             preemptible: client_context.preemptible(),
             exit_when: client_context.exit_when(),
@@ -759,7 +754,15 @@ impl DiceUpdater for DiceCommandUpdater<'_, '_> {
             InferTargetNames::No
         };
 
+        let starlark_dialect = StarlarkDialect::from_config_value(
+            cells_and_configs.root_config.get(BuckconfigKeyRef {
+                section: "buck2",
+                property: "starlark_dialect",
+            }),
+        )?;
+
         let configuror = BuildInterpreterConfiguror::new(
+            starlark_dialect,
             prelude_path(&cell_resolver)?,
             self.interpreter_platform,
             self.interpreter_architecture,
@@ -803,7 +806,8 @@ impl DiceUpdater for DiceCommandUpdater<'_, '_> {
             .await?;
         early_timings.end_known_span();
 
-        let mut user_data = self.make_user_computation_data(&cells_and_configs.root_config)?;
+        let mut user_data =
+            self.make_user_computation_data(&cells_and_configs.root_config, starlark_dialect)?;
         user_data.set_mergebase(mergebase);
 
         Ok((ctx, user_data))
@@ -814,6 +818,7 @@ impl DiceCommandUpdater<'_, '_> {
     fn make_user_computation_data(
         &self,
         root_config: &LegacyBuckConfig,
+        starlark_dialect: StarlarkDialect,
     ) -> buck2_error::Result<UserComputationData> {
         let config_threads = root_config
             .parse(BuckconfigKeyRef {
@@ -1084,9 +1089,7 @@ impl DiceCommandUpdater<'_, '_> {
                 .dupe(),
         );
         data.set_starlark_debugger_handle(
-            self.cmd_ctx
-                .debugger_handle
-                .clone()
+            create_debugger_handle(self.cmd_ctx.base_context.events.dupe(), starlark_dialect)
                 .map(|v| Box::new(v) as _),
         );
         data.set_keep_going(self.keep_going);

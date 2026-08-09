@@ -73,3 +73,43 @@ impl SetInterpreterContext for DiceTransactionUpdater {
         Ok(self.changed_to(vec![(BuildContextKey(), interpreter_configuror)])?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use buck2_core::pattern::pattern::InferTargetNames;
+    use buck2_interpreter::dialect::StarlarkDialect;
+    use buck2_interpreter::extra::InterpreterHostArchitecture;
+    use buck2_interpreter::extra::InterpreterHostPlatform;
+
+    use super::*;
+
+    fn configuror(starlark_dialect: StarlarkDialect) -> Arc<BuildInterpreterConfiguror> {
+        BuildInterpreterConfiguror::new(
+            starlark_dialect,
+            None,
+            InterpreterHostPlatform::Linux,
+            InterpreterHostArchitecture::X86_64,
+            None,
+            false,
+            false,
+            InferTargetNames::No,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn starlark_dialect_participates_in_dice_identity() {
+        let buck2 = configuror(StarlarkDialect::Buck2);
+        let buck2_again = configuror(StarlarkDialect::Buck2);
+        let bazel = configuror(StarlarkDialect::Bazel);
+
+        let EqualityBehavior::Compare(equality) = BuildContextKey::equality_behavior() else {
+            panic!("build context must compare configuror values");
+        };
+        assert!(equality(&buck2, &buck2_again));
+        assert!(!equality(&buck2, &bazel));
+    }
+}

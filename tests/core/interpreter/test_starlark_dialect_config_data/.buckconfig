@@ -1,0 +1,5 @@
+[repositories]
+    root = .
+    child = child
+[buildfile]
+    name = TARGETS.fixture

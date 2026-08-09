@@ -44,6 +44,7 @@ use buck2_events::dispatch::EventDispatcher;
 use buck2_execute::digest_config::DigestConfig;
 use buck2_execute::digest_config::SetDigestConfig;
 use buck2_hash::IntentionallyStdHashMap;
+use buck2_interpreter::dialect::StarlarkDialect;
 use buck2_interpreter::dice::starlark_debug::SetStarlarkDebugger;
 use buck2_interpreter::extra::InterpreterHostArchitecture;
 use buck2_interpreter::extra::InterpreterHostPlatform;
@@ -166,6 +167,7 @@ async fn test_analysis_calculation() -> buck2_error::Result<()> {
         &mut dice,
         resolver,
         BuildInterpreterConfiguror::new(
+            StarlarkDialect::Buck2,
             None,
             InterpreterHostPlatform::Linux,
             InterpreterHostArchitecture::X86_64,
