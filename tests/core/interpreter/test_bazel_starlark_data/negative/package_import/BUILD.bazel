@@ -1,0 +1,5 @@
+genrule(
+    name = implicit_package_symbol("package_marker"),
+    outs = ["bad.txt"],
+    cmd = "touch $@",
+)

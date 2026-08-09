@@ -1,0 +1,6 @@
+[repositories]
+    root = .
+    prelude = bad_native_prelude
+
+[buildfile]
+    name_v2 = BUILD.bazel

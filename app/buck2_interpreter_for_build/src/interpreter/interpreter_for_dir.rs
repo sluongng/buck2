@@ -164,6 +164,7 @@ pub(crate) struct InterpreterForDir {
 
 struct InterpreterLoadResolver {
     config: Arc<InterpreterForDir>,
+    loader_path: OwnedStarlarkPath,
     loader_file_type: StarlarkFileType,
     build_file_cell: BuildFileCell,
 }
@@ -181,6 +182,10 @@ enum LoadResolutionError {
         wanted: CellPath,
         location: String,
     },
+    #[error(
+        "Bazel Starlark files cannot load Buck2 prelude modules explicitly: `{0}`; the configured prelude is available only as a hidden compatibility backend"
+    )]
+    ExplicitBuck2PreludeLoad(CellPath),
 }
 
 impl LoadResolver for InterpreterLoadResolver {
@@ -197,6 +202,19 @@ impl LoadResolver for InterpreterLoadResolver {
             relative_import_option,
             path,
         )?;
+
+        if self
+            .config
+            .uses_bazel_user_environment(self.loader_path.borrow())
+            && self
+                .config
+                .global_state
+                .configuror
+                .prelude_import()
+                .is_some_and(|prelude| prelude.is_prelude_path(&path))
+        {
+            return Err(LoadResolutionError::ExplicitBuck2PreludeLoad(path).into());
+        }
 
         // check for bxl files first before checking for prelude.
         // All bxl imports are parsed the same regardless of prelude or not.
@@ -276,6 +294,10 @@ struct EvalResult {
 }
 
 impl InterpreterForDir {
+    fn uses_bazel_user_environment(&self, path: StarlarkPath<'_>) -> bool {
+        self.global_state.uses_bazel_user_environment(path)
+    }
+
     fn verbose_gc() -> buck2_error::Result<bool> {
         match std::env::var_os("BUCK2_STARLARK_VERBOSE_GC") {
             Some(val) => Ok(!val.is_empty()),
@@ -322,7 +344,9 @@ impl InterpreterForDir {
         starlark_path: StarlarkPath<'_>,
         loaded_modules: &LoadedModules,
     ) -> buck2_error::Result<BuckStarlarkModule<'v>> {
-        if let Some(prelude_import) = self.prelude_import(starlark_path) {
+        if !self.uses_bazel_user_environment(starlark_path)
+            && let Some(prelude_import) = self.prelude_import(starlark_path)
+        {
             let prelude_env = loaded_modules
                 .map
                 .get(&StarlarkModulePath::LoadFile(prelude_import.import_path()))
@@ -361,6 +385,8 @@ impl InterpreterForDir {
         package_boundary_exception: bool,
         loaded_modules: &LoadedModules,
     ) -> buck2_error::Result<(BuckStarlarkModule<'v>, ModuleInternals)> {
+        let bazel_user_environment =
+            self.uses_bazel_user_environment(StarlarkPath::BuildFile(build_file));
         let internals = self.global_state.configuror.new_extra_context(
             &self.cell_info,
             build_file.clone(),
@@ -368,14 +394,18 @@ impl InterpreterForDir {
             super_package,
             package_boundary_exception,
             loaded_modules,
-            self.package_import(build_file),
+            if bazel_user_environment {
+                None
+            } else {
+                self.package_import(build_file)
+            },
             self.current_dir_with_allowed_relative_dirs
                 .as_ref()
                 .to_owned(),
         )?;
         let env = self.create_env(env, StarlarkPath::BuildFile(build_file), loaded_modules)?;
 
-        if let Some(root_import) = self.root_import() {
+        if !bazel_user_environment && let Some(root_import) = self.root_import() {
             let root_env = loaded_modules
                 .map
                 .get(&StarlarkModulePath::LoadFile(&root_import))
@@ -395,6 +425,7 @@ impl InterpreterForDir {
     ) -> InterpreterLoadResolver {
         InterpreterLoadResolver {
             config: self.dupe(),
+            loader_path: OwnedStarlarkPath::new(current_file_path),
             loader_file_type: current_file_path.file_type(),
             build_file_cell: current_file_path.build_file_cell(),
         }
@@ -451,10 +482,9 @@ impl InterpreterForDir {
             .resolve_path(import.path().as_ref().as_ref())?;
 
         let disable_starlark_types = self.global_state.disable_starlark_types;
-        let dialect = self
-            .global_state
-            .starlark_dialect
-            .parser_dialect(import.file_type(), disable_starlark_types)?;
+        let effective_dialect = self.global_state.effective_dialect(import);
+        let dialect =
+            effective_dialect.parser_dialect(import.file_type(), disable_starlark_types)?;
         let ast = match AstModule::parse(project_relative_path.as_str(), content, &dialect) {
             Ok(ast) => ast,
             Err(e) => {
@@ -469,11 +499,13 @@ impl InterpreterForDir {
             implicit_imports.push(OwnedStarlarkModulePath::LoadFile(i.import_path().clone()));
         }
         if let StarlarkPath::BuildFile(build_file) = import {
-            if let Some(i) = self.package_import(build_file) {
-                implicit_imports.push(OwnedStarlarkModulePath::LoadFile(i.import().clone()));
-            }
-            if let Some(i) = self.root_import() {
-                implicit_imports.push(OwnedStarlarkModulePath::LoadFile(i));
+            if !self.uses_bazel_user_environment(import) {
+                if let Some(i) = self.package_import(build_file) {
+                    implicit_imports.push(OwnedStarlarkModulePath::LoadFile(i.import().clone()));
+                }
+                if let Some(i) = self.root_import() {
+                    implicit_imports.push(OwnedStarlarkModulePath::LoadFile(i));
+                }
             }
         }
         ParseData::new(ast, implicit_imports, &self.load_resolver(import)).map(Ok)
@@ -499,17 +531,30 @@ impl InterpreterForDir {
         cancellation: &CancellationContext,
     ) -> buck2_error::Result<(FinishedStarlarkEvaluation, EvalResult)> {
         let import = extra_context.starlark_path();
-        let globals = self.global_state.globals();
+        let globals = self.global_state.globals_for_path(import);
         let file_loader =
             InterpreterFileLoader::new(loaded_modules, Arc::new(self.load_resolver(import)));
         let host_info = self.global_state.configuror.host_info();
-        let extra = BuildContext::new(
+        let bazel_genrule_backend = if self.uses_bazel_user_environment(import) {
+            match self.global_state.configuror.prelude_import() {
+                Some(prelude) => Some(
+                    file_loader
+                        .loaded_module(StarlarkModulePath::LoadFile(prelude.import_path()))?
+                        .bazel_genrule_backend()?,
+                ),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let extra = BuildContext::new_with_bazel_backend(
             &self.cell_info,
             buckconfigs,
             host_info,
             extra_context,
             self.ignore_attrs_for_profiling,
             self.global_state.configuror.infer_target_names(),
+            bazel_genrule_backend,
         );
 
         let print = EventDispatcherPrintHandler(get_dispatcher());

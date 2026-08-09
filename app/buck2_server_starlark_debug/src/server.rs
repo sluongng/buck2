@@ -851,7 +851,6 @@ impl ServerState {
         description: String,
     ) -> buck2_error::Result<(HookId, Option<Box<dyn DapAdapterEvalHook>>)> {
         let starlark_dialect = handle.0.starlark_dialect;
-        starlark_dialect.require_available()?;
         let (hook_id, pseudo_thread_id) = self.next_hook_id();
 
         let client = Box::new(BuckStarlarkDapAdapterClient {
@@ -1020,9 +1019,7 @@ fn select_breakpoint_starlark_dialect(
 
     // DAP clients commonly set breakpoints before launching the command to debug. Once a command
     // exists its explicit dialect always takes precedence over the attaching transaction's mode.
-    let selected = selected.unwrap_or(provisional_starlark_dialect);
-    selected.require_available()?;
-    Ok(selected)
+    Ok(selected.unwrap_or(provisional_starlark_dialect))
 }
 
 /// Our implementation of starlark's DapAdapterClient. It basically just needs to
@@ -1095,7 +1092,9 @@ mod tests {
     use super::select_breakpoint_starlark_dialect;
 
     #[test]
-    fn breakpoint_dialect_follows_the_debugged_command() {
+    fn breakpoint_dialect_follows_the_attach_and_debugged_commands() {
+        let bazel_debugger_parser = StarlarkDialect::Bazel.debugger_parser_dialect().unwrap();
+
         assert_eq!(
             StarlarkDialect::Buck2,
             select_breakpoint_starlark_dialect(StarlarkDialect::Buck2, []).unwrap()
@@ -1114,10 +1113,44 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            "Bazel Starlark dialect is not yet available",
+            StarlarkDialect::Bazel,
+            select_breakpoint_starlark_dialect(StarlarkDialect::Bazel, []).unwrap()
+        );
+        assert_eq!(
+            bazel_debugger_parser,
             select_breakpoint_starlark_dialect(StarlarkDialect::Bazel, [])
-                .unwrap_err()
-                .to_string()
+                .unwrap()
+                .debugger_parser_dialect()
+                .unwrap()
+        );
+        assert_eq!(
+            StarlarkDialect::Bazel,
+            select_breakpoint_starlark_dialect(
+                StarlarkDialect::Buck2,
+                [StarlarkDialect::Bazel, StarlarkDialect::Bazel],
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            bazel_debugger_parser,
+            select_breakpoint_starlark_dialect(
+                StarlarkDialect::Buck2,
+                [StarlarkDialect::Bazel, StarlarkDialect::Bazel],
+            )
+            .unwrap()
+            .debugger_parser_dialect()
+            .unwrap()
+        );
+
+        let error = select_breakpoint_starlark_dialect(
+            StarlarkDialect::Bazel,
+            [StarlarkDialect::Buck2, StarlarkDialect::Bazel],
+        );
+        let error = error.unwrap_err();
+        assert!(error.has_tag(buck2_error::ErrorTag::StarlarkServer));
+        assert_eq!(
+            "Cannot resolve breakpoints for concurrent commands using different Starlark dialects",
+            error.to_string()
         );
     }
 

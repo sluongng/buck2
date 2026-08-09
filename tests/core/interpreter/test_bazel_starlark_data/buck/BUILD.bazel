@@ -1,0 +1,8 @@
+load(":defs.bzl", "buck_message", "buck_write")
+
+buck_write(
+    name = "buck",
+    content = buck_message(
+        root_marker + implicit_package_symbol("package_marker"),
+    ),
+)

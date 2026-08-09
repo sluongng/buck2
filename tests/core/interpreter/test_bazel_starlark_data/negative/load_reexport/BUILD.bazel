@@ -1,0 +1,7 @@
+load(":middle.bzl", "public")
+
+genrule(
+    name = "must_not_evaluate",
+    outs = ["bad.txt"],
+    cmd = "touch $@",
+)

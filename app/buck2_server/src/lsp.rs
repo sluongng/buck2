@@ -158,7 +158,7 @@ async fn get_builtin_globals_docs(dice_ctx: &DiceTransaction) -> buck2_error::Re
         .ctx()
         .get_global_interpreter_state()
         .await?
-        .globals()
+        .buck2_globals()
         .documentation())
 }
 

@@ -23,6 +23,7 @@ use buck2_interpreter::file_type::StarlarkFileType;
 use buck2_interpreter::paths::path::StarlarkPath;
 use starlark::any::ProvidesStaticType;
 use starlark::eval::Evaluator;
+use starlark::values::OwnedFrozenValue;
 
 use crate::interpreter::buckconfig::BuckConfigsViewForStarlark;
 use crate::interpreter::buckconfig::LegacyBuckConfigsForStarlark;
@@ -182,6 +183,10 @@ pub struct BuildContext<'a> {
 
     /// Peak allocated bytes limit for starlark.
     pub(crate) starlark_peak_allocated_byte_limit: OnceCell<Option<u64>>,
+
+    /// Hidden Buck prelude callable used to implement the narrow Bazel compatibility adapter.
+    /// This is never installed in a Bazel user's module environment.
+    bazel_genrule_backend: Option<OwnedFrozenValue>,
 }
 
 impl<'a> BuildContext<'a> {
@@ -194,6 +199,26 @@ impl<'a> BuildContext<'a> {
         ignore_attrs_for_profiling: bool,
         infer_target_names: InferTargetNames,
     ) -> BuildContext<'a> {
+        Self::new_with_bazel_backend(
+            cell_info,
+            buckconfigs,
+            host_info,
+            additional,
+            ignore_attrs_for_profiling,
+            infer_target_names,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_bazel_backend(
+        cell_info: &'a InterpreterCellInfo,
+        buckconfigs: &'a mut dyn BuckConfigsViewForStarlark,
+        host_info: &'a HostInfo,
+        additional: PerFileTypeContext,
+        ignore_attrs_for_profiling: bool,
+        infer_target_names: InferTargetNames,
+        bazel_genrule_backend: Option<OwnedFrozenValue>,
+    ) -> BuildContext<'a> {
         let buckconfigs = LegacyBuckConfigsForStarlark::new(buckconfigs);
         BuildContext {
             cell_info,
@@ -203,6 +228,7 @@ impl<'a> BuildContext<'a> {
             ignore_attrs_for_profiling,
             infer_target_names,
             starlark_peak_allocated_byte_limit: OnceCell::new(),
+            bazel_genrule_backend,
         }
     }
 
@@ -238,6 +264,15 @@ impl<'a> BuildContext<'a> {
 
     pub(crate) fn base_path(&self) -> buck2_error::Result<CellPath> {
         self.additional.base_path()
+    }
+
+    pub(crate) fn bazel_genrule_backend(&self) -> buck2_error::Result<&OwnedFrozenValue> {
+        self.bazel_genrule_backend.as_ref().ok_or_else(|| {
+            buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "Bazel genrule backend is unavailable because the configured Buck2 prelude does not export native.genrule"
+            )
+        })
     }
 }
 

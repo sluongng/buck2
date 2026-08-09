@@ -22,6 +22,7 @@ use buck2_core::cells::name::CellName;
 use buck2_error::buck2_error;
 use buck2_error::internal_error;
 use buck2_hash::StdBuckHashMap;
+use buck2_interpreter::dialect::StarlarkDialect;
 use buck2_interpreter::file_type::StarlarkFileType;
 use buck2_interpreter::paths::module::OwnedStarlarkModulePath;
 use buck2_interpreter::paths::path::OwnedStarlarkPath;
@@ -49,7 +50,7 @@ struct Cache<'a> {
     stdout: &'a mut (dyn Write + Send + Sync),
     stderr: &'a mut (dyn Write + Send + Sync),
     // Our accumulated state
-    oracle: StdBuckHashMap<(CellName, StarlarkFileType), Globals>,
+    oracle: StdBuckHashMap<(CellName, StarlarkFileType, StarlarkDialect), Globals>,
     cache: StdBuckHashMap<OwnedStarlarkModulePath, Interface>,
 }
 
@@ -61,16 +62,15 @@ impl Cache<'_> {
 
     async fn get_oracle(
         &mut self,
-        cell: CellName,
-        path_type: StarlarkFileType,
+        path: buck2_interpreter::paths::path::StarlarkPath<'_>,
     ) -> buck2_error::Result<Globals> {
-        match self.oracle.get(&(cell, path_type)) {
+        let environment = Environment::new(path, &mut self.dice.ctx()).await?;
+        let key = (path.cell(), path.file_type(), environment.effective_dialect);
+        match self.oracle.get(&key) {
             Some(g) => Ok(g.dupe()),
             None => {
-                let globals = Environment::new(cell, path_type, &mut self.dice.ctx())
-                    .await?
-                    .globals;
-                self.oracle.insert((cell, path_type), globals.dupe());
+                let globals = environment.globals;
+                self.oracle.insert(key, globals.dupe());
                 Ok(globals)
             }
         }
@@ -113,9 +113,7 @@ impl Cache<'_> {
             let interface = self.get(y).await?;
             loads.insert(x.module_id.to_owned(), interface);
         }
-        let globals = self
-            .get_oracle(path_ref.cell(), path_ref.file_type())
-            .await?;
+        let globals = self.get_oracle(path_ref).await?;
         let (errors, bindings, interface, approxiomations) = ast.typecheck(&globals, &loads);
 
         if !approxiomations.is_empty() {

@@ -16,6 +16,8 @@ use buck2_common::dice::cells::HasCellResolver;
 use buck2_core::cells::CellResolver;
 use buck2_interpreter::dialect::StarlarkDialect;
 use buck2_interpreter::dice::starlark_types::GetStarlarkTypes;
+use buck2_interpreter::file_type::StarlarkFileType;
+use buck2_interpreter::paths::path::StarlarkPath;
 use dice::DiceComputations;
 use dice::Key;
 use dice::OkPagableValueSerialize;
@@ -31,8 +33,16 @@ use starlark::environment::Globals;
 use crate::interpreter::configuror::BuildInterpreterConfiguror;
 use crate::interpreter::context::HasInterpreterContext;
 use crate::interpreter::globals::base_globals;
+use crate::interpreter::globals::bazel_build_globals;
+use crate::interpreter::globals::bazel_bzl_globals;
 
-pagable::static_str!(GLOBAL_ENV_HEAP_NAME = concat!(module_path!(), "::global_env"));
+pagable::static_str!(BUCK2_GLOBAL_ENV_HEAP_NAME = concat!(module_path!(), "::buck2_global_env"));
+pagable::static_str!(
+    BAZEL_BUILD_GLOBAL_ENV_HEAP_NAME = concat!(module_path!(), "::bazel_build_global_env")
+);
+pagable::static_str!(
+    BAZEL_BZL_GLOBAL_ENV_HEAP_NAME = concat!(module_path!(), "::bazel_bzl_global_env")
+);
 
 /// Information shared across interpreters. Contains no cell-specific
 /// information.
@@ -43,6 +53,12 @@ pub struct GlobalInterpreterState {
     /// The GlobalEnvironment contains all the globally available symbols
     /// (primarily starlark stdlib and Buck-provided functions).
     pub global_env: Globals,
+
+    /// Clean Bazel globals used only for user BUILD files when Bazel mode is selected.
+    bazel_build_env: Globals,
+
+    /// Clean Bazel globals used only for user `.bzl` files when Bazel mode is selected.
+    bazel_bzl_env: Globals,
 
     /// Interpreter Configurer
     pub configuror: Arc<BuildInterpreterConfiguror>,
@@ -65,7 +81,17 @@ impl GlobalInterpreterState {
         disable_starlark_types: bool,
         unstable_typecheck: bool,
     ) -> buck2_error::Result<Self> {
-        starlark_dialect.require_available()?;
+        if starlark_dialect == StarlarkDialect::Bazel
+            && let Some(prelude) = interpreter_configuror.prelude_import()
+            && prelude.prelude_cell() == cell_resolver.root_cell()
+            && prelude.import_path().path_parent().path().is_empty()
+        {
+            return Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "Bazel Starlark mode requires the configured Buck2 prelude to use a dedicated cell or subdirectory; a root-level prelude would make every project file part of the trusted backend"
+            ));
+        }
+
         let global_env = base_globals()
             .with(|g| {
                 if let Some(additional_globals) = interpreter_configuror.additional_globals() {
@@ -73,12 +99,21 @@ impl GlobalInterpreterState {
                 }
             })
             .build_named(GlobalFrozenHeapName {
-                name: GLOBAL_ENV_HEAP_NAME,
+                name: BUCK2_GLOBAL_ENV_HEAP_NAME,
             });
+
+        let bazel_build_env = bazel_build_globals().build_named(GlobalFrozenHeapName {
+            name: BAZEL_BUILD_GLOBAL_ENV_HEAP_NAME,
+        });
+        let bazel_bzl_env = bazel_bzl_globals().build_named(GlobalFrozenHeapName {
+            name: BAZEL_BZL_GLOBAL_ENV_HEAP_NAME,
+        });
 
         Ok(Self {
             cell_resolver,
             global_env,
+            bazel_build_env,
+            bazel_bzl_env,
             configuror: interpreter_configuror,
             starlark_dialect,
             disable_starlark_types,
@@ -90,7 +125,51 @@ impl GlobalInterpreterState {
         &self.configuror
     }
 
-    pub fn globals(&self) -> &Globals {
+    pub fn globals(&self, file_type: StarlarkFileType) -> &Globals {
+        self.globals_for_dialect(file_type, self.starlark_dialect)
+    }
+
+    pub fn globals_for_dialect(
+        &self,
+        file_type: StarlarkFileType,
+        effective_dialect: StarlarkDialect,
+    ) -> &Globals {
+        match (effective_dialect, file_type) {
+            (StarlarkDialect::Bazel, StarlarkFileType::Buck) => &self.bazel_build_env,
+            (StarlarkDialect::Bazel, StarlarkFileType::Bzl) => &self.bazel_bzl_env,
+            _ => &self.global_env,
+        }
+    }
+
+    pub fn is_trusted_prelude(&self, path: StarlarkPath<'_>) -> bool {
+        self.configuror
+            .prelude_import()
+            .is_some_and(|prelude| prelude.is_prelude_path(path.path().as_ref()))
+    }
+
+    pub fn uses_bazel_user_environment(&self, path: StarlarkPath<'_>) -> bool {
+        self.starlark_dialect == StarlarkDialect::Bazel
+            && matches!(path, StarlarkPath::BuildFile(_) | StarlarkPath::LoadFile(_))
+            && !self.is_trusted_prelude(path)
+    }
+
+    pub fn effective_dialect(&self, path: StarlarkPath<'_>) -> StarlarkDialect {
+        if self.is_trusted_prelude(path) {
+            StarlarkDialect::Buck2
+        } else {
+            self.starlark_dialect
+        }
+    }
+
+    pub fn globals_for_path(&self, path: StarlarkPath<'_>) -> &Globals {
+        if self.is_trusted_prelude(path) {
+            self.buck2_globals()
+        } else {
+            self.globals(path.file_type())
+        }
+    }
+
+    pub fn buck2_globals(&self) -> &Globals {
         &self.global_env
     }
 }

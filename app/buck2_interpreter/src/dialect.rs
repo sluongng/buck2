@@ -24,13 +24,6 @@ pub enum StarlarkDialect {
 }
 
 impl StarlarkDialect {
-    fn bazel_unavailable_error() -> buck2_error::Error {
-        buck2_error::buck2_error!(
-            buck2_error::ErrorTag::Input,
-            "Bazel Starlark dialect is not yet available"
-        )
-    }
-
     pub fn from_config_value(value: Option<&str>) -> buck2_error::Result<Self> {
         match value {
             None | Some("buck2") => Ok(Self::Buck2),
@@ -40,14 +33,6 @@ impl StarlarkDialect {
                 "Invalid value for buckconfig `[buck2] starlark_dialect`. Got `{}`. Expected one of `buck2` or `bazel`.",
                 value
             )),
-        }
-    }
-
-    /// Rejects modes whose parser, validation, and globals are not yet available together.
-    pub fn require_available(self) -> buck2_error::Result<()> {
-        match self {
-            Self::Buck2 => Ok(()),
-            Self::Bazel => Err(Self::bazel_unavailable_error()),
         }
     }
 
@@ -559,13 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn bazel_mode_is_explicitly_unavailable() {
-        let error = StarlarkDialect::Bazel
-            .require_available()
-            .unwrap_err()
-            .to_string();
-        assert_eq!("Bazel Starlark dialect is not yet available", error);
-
+    fn bazel_mode_exposes_production_parser_dialects() {
         assert!(
             StarlarkDialect::Bazel
                 .parser_dialect(StarlarkFileType::Buck, false)

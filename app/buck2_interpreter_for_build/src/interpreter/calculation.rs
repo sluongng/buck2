@@ -20,8 +20,10 @@ use buck2_core::bzl::ImportPath;
 use buck2_core::package::PackageLabel;
 use buck2_events::dispatch::async_record_root_spans;
 use buck2_events::span::SpanId;
+use buck2_interpreter::dialect::StarlarkDialect;
 use buck2_interpreter::file_loader::LoadedModule;
 use buck2_interpreter::file_loader::ModuleDeps;
+use buck2_interpreter::file_type::StarlarkFileType;
 use buck2_interpreter::load_module::INTERPRETER_CALCULATION_IMPL;
 use buck2_interpreter::load_module::InterpreterCalculationImpl;
 use buck2_interpreter::paths::module::OwnedStarlarkModulePath;
@@ -250,7 +252,24 @@ impl InterpreterCalculationImpl for InterpreterCalculationInstance {
     }
 
     async fn global_env(&self, ctx: &mut DiceComputations<'_>) -> buck2_error::Result<Globals> {
-        Ok(ctx.get_global_interpreter_state().await?.globals().dupe())
+        Ok(ctx
+            .get_global_interpreter_state()
+            .await?
+            .buck2_globals()
+            .dupe())
+    }
+
+    async fn global_env_for_file_type(
+        &self,
+        ctx: &mut DiceComputations<'_>,
+        file_type: StarlarkFileType,
+        effective_dialect: StarlarkDialect,
+    ) -> buck2_error::Result<Globals> {
+        Ok(ctx
+            .get_global_interpreter_state()
+            .await?
+            .globals_for_dialect(file_type, effective_dialect)
+            .dupe())
     }
 
     async fn prelude_import(

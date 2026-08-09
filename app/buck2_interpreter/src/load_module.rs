@@ -17,8 +17,10 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use starlark::environment::Globals;
 
+use crate::dialect::StarlarkDialect;
 use crate::file_loader::LoadedModule;
 use crate::file_loader::ModuleDeps;
+use crate::file_type::StarlarkFileType;
 use crate::paths::module::StarlarkModulePath;
 use crate::paths::package::PackageFilePath;
 use crate::prelude_path::PreludePath;
@@ -47,6 +49,18 @@ pub trait InterpreterCalculationImpl: Send + Sync + 'static {
     ) -> buck2_error::Result<Option<(PackageFilePath, Vec<ImportPath>)>>;
 
     async fn global_env(&self, ctx: &mut DiceComputations<'_>) -> buck2_error::Result<Globals>;
+
+    /// Return the global environment for a particular kind of Starlark file.
+    ///
+    /// This is distinct from [`Self::global_env`], which is retained for
+    /// callers that inspect Buck's complete global environment without an
+    /// evaluation context (for example `buck2 audit prelude`).
+    async fn global_env_for_file_type(
+        &self,
+        ctx: &mut DiceComputations<'_>,
+        file_type: StarlarkFileType,
+        effective_dialect: StarlarkDialect,
+    ) -> buck2_error::Result<Globals>;
 
     async fn prelude_import(
         &self,

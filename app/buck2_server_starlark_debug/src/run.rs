@@ -73,7 +73,6 @@ async fn run_dap_server(
                 .get_interpreter_configuror()
                 .await?
                 .starlark_dialect();
-            starlark_dialect.require_available()?;
             Ok(starlark_dialect)
         })
         .await?;

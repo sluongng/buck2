@@ -17,7 +17,7 @@ from buck2.tests.e2e_util.buck_workspace import buck_test
 
 _BAZEL = "buck2.starlark_dialect=bazel"
 _BUCK2 = "buck2.starlark_dialect=buck2"
-_UNAVAILABLE = "Bazel Starlark dialect is not yet available"
+_BAZEL_SYNTAX_ERROR = "type annotation"
 
 
 async def _daemon_identity(buck: Buck) -> tuple[int, str]:
@@ -35,7 +35,7 @@ async def test_starlark_dialect_changes_in_one_daemon(buck: Buck) -> None:
 
     await expect_failure(
         buck.uquery("root//:", "-c", _BAZEL),
-        stderr_regex=_UNAVAILABLE,
+        stderr_regex=_BAZEL_SYNTAX_ERROR,
     )
     bazel_identity = await _daemon_identity(buck)
 
@@ -52,7 +52,7 @@ async def test_starlark_dialect_config_precedence_and_validation(buck: Buck) -> 
     config_file = str(buck.cwd / "bazel.buckconfig")
     await expect_failure(
         buck.uquery("root//:", "--config-file", config_file),
-        stderr_regex=_UNAVAILABLE,
+        stderr_regex=_BAZEL_SYNTAX_ERROR,
     )
 
     overridden = await buck.uquery(
@@ -85,5 +85,5 @@ async def test_starlark_dialect_is_selected_from_root_config(buck: Buck) -> None
 async def test_starlark_lint_uses_the_selected_dialect(buck: Buck) -> None:
     await expect_failure(
         buck.starlark("lint", "defs.bzl", "-c", _BAZEL),
-        stderr_regex=_UNAVAILABLE,
+        stdout_regex=_BAZEL_SYNTAX_ERROR,
     )

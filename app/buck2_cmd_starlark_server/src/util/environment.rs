@@ -10,13 +10,15 @@
 
 use buck2_core::bzl::ImportPath;
 use buck2_core::cells::build_file_cell::BuildFileCell;
-use buck2_core::cells::name::CellName;
 use buck2_hash::IntentionallyStdHashSet;
+use buck2_interpreter::dialect::StarlarkDialect;
 use buck2_interpreter::file_type::StarlarkFileType;
 use buck2_interpreter::import_paths::HasImportPaths;
 use buck2_interpreter::load_module::INTERPRETER_CALCULATION_IMPL;
 use buck2_interpreter::load_module::InterpreterCalculation;
+use buck2_interpreter::paths::path::StarlarkPath;
 use buck2_interpreter::prelude_path::PreludePath;
+use buck2_interpreter_for_build::interpreter::global_interpreter_state::HasGlobalInterpreterState;
 use dice::DiceComputations;
 use dice::DiceTransaction;
 use starlark::environment::Globals;
@@ -25,6 +27,9 @@ use starlark::environment::Globals;
 pub(crate) struct Environment {
     /// The globals that are driven from Rust.
     pub(crate) globals: Globals,
+    /// The effective dialect for this path. Configured prelude sources remain
+    /// trusted Buck2 implementation files even when user files select Bazel.
+    pub(crate) effective_dialect: StarlarkDialect,
     /// The path to the prelude, if the prelude is loaded in this file.
     /// Note that in a BUCK file the `native` value is also exploded into the top-level.
     prelude: Option<PreludePath>,
@@ -34,36 +39,61 @@ pub(crate) struct Environment {
 
 impl Environment {
     pub(crate) async fn new(
-        cell: CellName,
-        path_type: StarlarkFileType,
+        path: StarlarkPath<'_>,
         dice: &mut DiceComputations<'_>,
     ) -> buck2_error::Result<Environment> {
-        // Find the information from the globals
-        let globals = INTERPRETER_CALCULATION_IMPL.get()?.global_env(dice).await?;
+        let cell = path.cell();
+        let path_type = path.file_type();
+        let calculation = INTERPRETER_CALCULATION_IMPL.get()?;
+
+        // Configured prelude load files remain trusted Buck implementation
+        // sources even when user BUILD and `.bzl` files select Bazel.
+        let configured_prelude = calculation.prelude_import(dice).await?;
+        let effective_dialect = dice
+            .get_global_interpreter_state()
+            .await?
+            .effective_dialect(path);
+
+        // Find the information from the globals.
+        let globals = calculation
+            .global_env_for_file_type(dice, path_type, effective_dialect)
+            .await?;
+
+        // Bazel BUILD and .bzl files use a deliberately closed environment.
+        // In particular, Buck's prelude and root imports must not leak rule or
+        // helper names into lint/typecheck merely because the project defines
+        // them. BXL and PACKAGE retain their existing Buck semantics.
+        let use_buck_implicit_imports = effective_dialect != StarlarkDialect::Bazel
+            || !matches!(path_type, StarlarkFileType::Buck | StarlarkFileType::Bzl);
 
         // Next grab the prelude, unless we are in the prelude cell and not a build file
-        let prelude = match INTERPRETER_CALCULATION_IMPL
-            .get()?
-            .prelude_import(dice)
-            .await?
-        {
-            Some(prelude)
-                if path_type == StarlarkFileType::Buck || prelude.import_path().cell() != cell =>
-            {
+        let prelude = if use_buck_implicit_imports {
+            match configured_prelude {
                 Some(prelude)
+                    if path_type == StarlarkFileType::Buck
+                        || prelude.import_path().cell() != cell =>
+                {
+                    Some(prelude)
+                }
+                _ => None,
             }
-            _ => None,
+        } else {
+            None
         };
 
         // Now grab the pre-load things
-        let preload = dice
-            .import_paths_for_cell(BuildFileCell::new(cell))
-            .await?
-            .root_import()
-            .cloned();
+        let preload = if use_buck_implicit_imports {
+            dice.import_paths_for_cell(BuildFileCell::new(cell))
+                .await?
+                .root_import()
+                .cloned()
+        } else {
+            None
+        };
 
         Ok(Environment {
             globals,
+            effective_dialect,
             prelude,
             preload,
         })

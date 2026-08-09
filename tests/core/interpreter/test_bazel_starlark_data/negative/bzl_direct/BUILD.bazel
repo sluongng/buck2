@@ -1,0 +1,7 @@
+load(":bad.bzl", "bad")
+
+genrule(
+    name = "unused",
+    outs = ["unused.txt"],
+    cmd = "touch $@",
+)

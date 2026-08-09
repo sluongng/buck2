@@ -25,7 +25,6 @@ use buck2_hash::StdBuckHashMap;
 use buck2_interpreter::dialect::StarlarkDialect;
 use buck2_interpreter::file_type::StarlarkFileType;
 use buck2_interpreter::paths::path::StarlarkPath;
-use buck2_interpreter_for_build::interpreter::global_interpreter_state::HasGlobalInterpreterState;
 use buck2_server_ctx::ctx::ServerCommandContextTrait;
 use buck2_server_ctx::ctx::ServerCommandDiceContext;
 use buck2_server_ctx::partial_result_dispatcher::PartialResultDispatcher;
@@ -42,10 +41,13 @@ use crate::StarlarkServerSubcommand;
 use crate::util::environment::Environment;
 use crate::util::paths::starlark_files;
 
-/// The cache of names for a path, keyed by its CellName and its path type.
+/// The cache of names for a path, keyed by its cell, file type, and effective dialect.
 struct Cache<'a> {
     dice: &'a DiceTransaction,
-    cached: StdBuckHashMap<(CellName, StarlarkFileType), Arc<IntentionallyStdHashSet<String>>>,
+    cached: StdBuckHashMap<
+        (CellName, StarlarkFileType, StarlarkDialect),
+        Arc<IntentionallyStdHashSet<String>>,
+    >,
 }
 
 impl<'a> Cache<'a> {
@@ -59,15 +61,16 @@ impl<'a> Cache<'a> {
     pub(crate) async fn get_names(
         &mut self,
         path: &StarlarkPath<'_>,
+        environment: &Environment,
     ) -> buck2_error::Result<Arc<IntentionallyStdHashSet<String>>> {
         let path_type = path.file_type();
         let cell = path.cell();
-        if let Some(res) = self.cached.get(&(cell, path_type)) {
+        let key = (cell, path_type, environment.effective_dialect);
+        if let Some(res) = self.cached.get(&key) {
             return Ok(res.dupe());
         }
-        let env: Environment = Environment::new(cell, path_type, &mut self.dice.ctx()).await?;
-        let res = Arc::new(env.get_names(path_type, self.dice).await?);
-        self.cached.insert((cell, path_type), res.dupe());
+        let res = Arc::new(environment.get_names(path_type, self.dice).await?);
+        self.cached.insert(key, res.dupe());
         Ok(res)
     }
 }
@@ -77,10 +80,11 @@ async fn lint_file(
     cell_resolver: &CellResolver,
     io: &dyn IoProvider,
     cache: &mut Cache<'_>,
-    starlark_dialect: StarlarkDialect,
 ) -> buck2_error::Result<Vec<Lint>> {
-    starlark_dialect.require_available()?;
-    let dialect = starlark_dialect.parser_dialect(path.file_type(), false)?;
+    let environment = Environment::new(*path, &mut cache.dice.ctx()).await?;
+    let dialect = environment
+        .effective_dialect
+        .parser_dialect(path.file_type(), false)?;
     let proj_path = cell_resolver.resolve_path(path.path().as_ref().as_ref())?;
     let path_str = proj_path.to_string();
     let content = io
@@ -88,7 +92,7 @@ async fn lint_file(
         .await?
         .ok_or_else(|| internal_error!("File not found: `{path_str}`"))?;
     match AstModule::parse(&path_str, content.clone(), &dialect) {
-        Ok(ast) => Ok(ast.lint(Some(&*cache.get_names(path).await?))),
+        Ok(ast) => Ok(ast.lint(Some(&*cache.get_names(path, &environment).await?))),
         Err(err) => {
             // There was a parse error, so we don't want to fail, we want to give a nice error message
             // Do the best we can - it is probably a `Diagnostic`, which gives us more precise info.
@@ -117,11 +121,6 @@ impl StarlarkServerSubcommand for StarlarkLintCommand {
         server_ctx
             .with_dice_ctx(|server_ctx, ctx| async move {
                 let cell_resolver = &ctx.ctx().get_cell_resolver().await?;
-                let starlark_dialect = ctx
-                    .ctx()
-                    .get_global_interpreter_state()
-                    .await?
-                    .starlark_dialect;
                 let io = &ctx.global_data().get_io_provider();
 
                 let mut stdout = stdout.as_writer();
@@ -137,14 +136,7 @@ impl StarlarkServerSubcommand for StarlarkLintCommand {
                 let mut cache = Cache::new(&ctx);
 
                 for file in &files {
-                    let lints = lint_file(
-                        &file.borrow(),
-                        cell_resolver,
-                        &**io,
-                        &mut cache,
-                        starlark_dialect,
-                    )
-                    .await?;
+                    let lints = lint_file(&file.borrow(), cell_resolver, &**io, &mut cache).await?;
                     lint_count += lints.len();
                     for lint in lints {
                         writeln!(stdout, "{lint}")?;

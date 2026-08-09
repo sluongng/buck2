@@ -28,6 +28,8 @@ use starlark::environment::GlobalsBuilder;
 use starlark::environment::LibraryExtension;
 
 use crate::attrs::attrs_global::register_attrs;
+use crate::interpreter::bazel::register_bazel_build_globals;
+use crate::interpreter::bazel::register_bazel_bzl_globals;
 use crate::interpreter::functions::dedupe::register_dedupe;
 use crate::interpreter::functions::host_info::register_host_info;
 use crate::interpreter::functions::internals::register_internals;
@@ -156,4 +158,57 @@ pub(crate) fn base_globals() -> GlobalsBuilder {
         register_all_natives(x);
     });
     global_env
+}
+
+/// The globals visible to Bazel BUILD files.
+///
+/// Keep this environment deliberately small: Bazel compatibility is an API boundary, so Buck2
+/// globals and downstream-provided additions must not accidentally become part of it.
+pub(crate) fn bazel_build_globals() -> GlobalsBuilder {
+    GlobalsBuilder::standard().with(register_bazel_build_globals)
+}
+
+/// The globals visible to Bazel `.bzl` files.
+///
+/// Bazel exposes rule constructors through `native` in extension files, not as top-level symbols.
+pub(crate) fn bazel_bzl_globals() -> GlobalsBuilder {
+    GlobalsBuilder::standard().with(register_bazel_bzl_globals)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bazel_build_globals_are_clean_and_direct() {
+        let globals = bazel_build_globals().build();
+        let names = globals
+            .names()
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"genrule"));
+        for buck_only in ["attrs", "rule", "select", "read_config", "plugins"] {
+            assert!(
+                !names.contains(&buck_only),
+                "unexpected Buck2 global `{buck_only}`"
+            );
+        }
+    }
+
+    #[test]
+    fn bazel_bzl_globals_expose_genrule_only_through_native() {
+        let globals = bazel_bzl_globals().build();
+        let names = globals
+            .names()
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"native"));
+        assert!(!names.contains(&"genrule"));
+        for buck_only in ["attrs", "rule", "select", "read_config", "plugins"] {
+            assert!(
+                !names.contains(&buck_only),
+                "unexpected Buck2 global `{buck_only}`"
+            );
+        }
+    }
 }
