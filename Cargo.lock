@@ -2984,8 +2984,10 @@ dependencies = [
  "buck2_bzlmod",
  "http",
  "indexmap",
+ "nix 0.31.3",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

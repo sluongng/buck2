@@ -12,7 +12,12 @@ rust_library(
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_json",
         "//buck2/app/buck2_bzlmod:buck2_bzlmod",
-    ],
+    ] + select({
+        "DEFAULT": [],
+        "ovr_config//os:linux": [
+            "fbsource//third-party/rust:nix",
+        ],
+    }),
 )
 
 rust_unittest(
@@ -24,6 +29,12 @@ rust_unittest(
         "fbsource//third-party/rust:indexmap",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:tempfile",
         "//buck2/app/buck2_bzlmod:buck2_bzlmod",
-    ],
+    ] + select({
+        "DEFAULT": [],
+        "ovr_config//os:linux": [
+            "fbsource//third-party/rust:nix",
+        ],
+    }),
 )
