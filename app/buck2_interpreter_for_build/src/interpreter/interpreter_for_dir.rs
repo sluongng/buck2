@@ -227,6 +227,9 @@ impl LoadResolver for InterpreterLoadResolver {
                 | StarlarkFileType::Toml => {
                     return Err(LoadResolutionError::BxlLoadNotAllowed(path).into());
                 }
+                StarlarkFileType::Module => {
+                    unreachable!("MODULE.bazel files do not use build-file load resolution")
+                }
                 StarlarkFileType::Bxl => {
                     return Ok(OwnedStarlarkModulePath::BxlFile(BxlFilePath::new(path)?));
                 }

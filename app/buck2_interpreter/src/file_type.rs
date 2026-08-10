@@ -15,6 +15,7 @@ pub enum StarlarkFileType {
     Bzl,
     Bxl,
     Buck,
+    Module,
     Package,
     Json,
     Toml,

@@ -41,9 +41,13 @@ impl StarlarkDialect {
         file_type: StarlarkFileType,
         disable_starlark_types: bool,
     ) -> buck2_error::Result<Dialect> {
-        match self {
-            Self::Buck2 => Ok(buck2_parser_dialect(file_type, disable_starlark_types)),
-            Self::Bazel => Ok(bazel_parser_dialect(file_type, disable_starlark_types)),
+        match (self, file_type) {
+            (Self::Buck2, StarlarkFileType::Module) => Err(buck2_error::buck2_error!(
+                buck2_error::ErrorTag::Input,
+                "MODULE.bazel files require `[buck2] starlark_dialect = bazel`; the Buck2 Starlark dialect is not supported"
+            )),
+            (Self::Buck2, _) => Ok(buck2_parser_dialect(file_type, disable_starlark_types)),
+            (Self::Bazel, _) => Ok(bazel_parser_dialect(file_type, disable_starlark_types)),
         }
     }
 
@@ -117,10 +121,31 @@ fn bazel_parser_dialect(file_type: StarlarkFileType, disable_starlark_types: boo
         allow_load_duplicate_local_bindings: false,
         ..Dialect::Standard
     };
+    // Bazel parses MODULE.bazel files with a deliberately smaller dialect than
+    // either BUILD or .bzl files. `**kwargs` needs an AST validation pass because
+    // Bazel permits it only when the expanded expression is a literal dict.
+    let module_dialect = Dialect {
+        enable_def: false,
+        enable_lambda: false,
+        enable_load: false,
+        enable_keyword_only_arguments: true,
+        enable_positional_only_arguments: false,
+        enable_types: DialectTypes::Disable,
+        enable_load_reexport: false,
+        enable_top_level_stmt: true,
+        enable_f_strings: false,
+        allow_load_private_symbols: false,
+        allow_toplevel_rebinding: false,
+        require_load_statements_first: true,
+        allow_call_star_args: true,
+        allow_load_duplicate_local_bindings: false,
+        ..Dialect::Standard
+    };
 
     match file_type {
         StarlarkFileType::Buck => build_dialect,
         StarlarkFileType::Bzl => bzl_dialect,
+        StarlarkFileType::Module => module_dialect,
         // BXL and PACKAGE files remain Buck2-specific even when Bazel mode is selected.
         StarlarkFileType::Bxl | StarlarkFileType::Package => {
             buck2_parser_dialect(file_type, disable_starlark_types)
@@ -187,6 +212,9 @@ fn buck2_parser_dialect(file_type: StarlarkFileType, disable_starlark_types: boo
     match file_type {
         StarlarkFileType::Bzl => bzl_dialect,
         StarlarkFileType::Buck => buck_dialect,
+        StarlarkFileType::Module => {
+            unreachable!("Buck2 MODULE.bazel dialect is rejected by `parser_dialect`")
+        }
         StarlarkFileType::Package => package_dialect,
         StarlarkFileType::Bxl => bxl_dialect,
         StarlarkFileType::Json | StarlarkFileType::Toml => Dialect::Standard,
@@ -229,6 +257,26 @@ mod tests {
             enable_types: DialectTypes::Disable,
             enable_load_reexport: false,
             enable_top_level_stmt: false,
+            enable_f_strings: false,
+            allow_load_private_symbols: false,
+            allow_toplevel_rebinding: false,
+            require_load_statements_first: true,
+            allow_call_star_args: true,
+            allow_load_duplicate_local_bindings: false,
+            ..Dialect::Standard
+        }
+    }
+
+    fn expected_bazel_module_dialect() -> Dialect {
+        Dialect {
+            enable_def: false,
+            enable_lambda: false,
+            enable_load: false,
+            enable_keyword_only_arguments: true,
+            enable_positional_only_arguments: false,
+            enable_types: DialectTypes::Disable,
+            enable_load_reexport: false,
+            enable_top_level_stmt: true,
             enable_f_strings: false,
             allow_load_private_symbols: false,
             allow_toplevel_rebinding: false,
@@ -360,6 +408,12 @@ mod tests {
                 expected_bazel_bzl_dialect(),
                 dialect
                     .parser_dialect(StarlarkFileType::Bzl, disable_starlark_types)
+                    .unwrap()
+            );
+            assert_eq!(
+                expected_bazel_module_dialect(),
+                dialect
+                    .parser_dialect(StarlarkFileType::Module, disable_starlark_types)
                     .unwrap()
             );
             assert_eq!(
@@ -549,6 +603,16 @@ mod tests {
             StarlarkDialect::Bazel
                 .parser_dialect(StarlarkFileType::Buck, false)
                 .is_ok()
+        );
+        assert!(
+            StarlarkDialect::Bazel
+                .parser_dialect(StarlarkFileType::Module, false)
+                .is_ok()
+        );
+        assert!(
+            StarlarkDialect::Buck2
+                .parser_dialect(StarlarkFileType::Module, false)
+                .is_err()
         );
         assert!(StarlarkDialect::Bazel.debugger_parser_dialect().is_ok());
     }

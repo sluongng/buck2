@@ -135,6 +135,9 @@ impl GlobalInterpreterState {
         effective_dialect: StarlarkDialect,
     ) -> &Globals {
         match (effective_dialect, file_type) {
+            (_, StarlarkFileType::Module) => {
+                unreachable!("MODULE.bazel files do not use build-file globals")
+            }
             (StarlarkDialect::Bazel, StarlarkFileType::Buck) => &self.bazel_build_env,
             (StarlarkDialect::Bazel, StarlarkFileType::Bzl) => &self.bazel_bzl_env,
             _ => &self.global_env,
