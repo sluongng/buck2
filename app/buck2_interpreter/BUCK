@@ -83,9 +83,13 @@ rust_unittest(
 
 rust_unittest(
     name = "module_evaluator_tests",
-    srcs = ["tests/module_evaluator.rs"],
+    srcs = ["tests/module_evaluator.rs"] + glob([
+        "testcases/bazel/**",
+    ]),
     crate_root = "tests/module_evaluator.rs",
     deps = [
+        "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:sha2",
         ":buck2_interpreter",
         "//buck2/app/buck2_bzlmod:buck2_bzlmod",
         "//buck2/app/buck2_error:buck2_error",

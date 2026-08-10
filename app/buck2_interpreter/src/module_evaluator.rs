@@ -14,8 +14,8 @@
 //! network context. Its globals contain standard Starlark helpers, isolated
 //! `print`, `module`, `bazel_dep`, `single_version_override`,
 //! `local_path_override`, fail-closed stubs for other override directives,
-//! `use_extension`, and `use_repo`. A successful call publishes one immutable
-//! [`ModuleFile`] and its warnings.
+//! `use_extension`, `use_repo`, and `use_repo_rule`. A successful call
+//! publishes one immutable [`ModuleFile`] and its warnings.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -44,6 +44,9 @@ use buck2_bzlmod::RawAttributeValue;
 use buck2_bzlmod::RawInteger;
 use buck2_bzlmod::RawTag;
 use buck2_bzlmod::RepoImport;
+use buck2_bzlmod::RepoRuleInvocation;
+use buck2_bzlmod::RepoRuleUse;
+use buck2_bzlmod::RepoRuleUseId;
 use buck2_bzlmod::RepositoryName;
 use buck2_bzlmod::SingleVersionOverride;
 use buck2_bzlmod::StarlarkBindingName;
@@ -103,6 +106,13 @@ impl ModuleFileEvalKind {
 
     fn is_root(&self) -> bool {
         matches!(self, Self::Root { .. })
+    }
+
+    fn owner(&self) -> ModuleKey {
+        match self {
+            Self::Root { .. } => ModuleKey::ROOT,
+            Self::Dependency { expected } => expected.clone(),
+        }
     }
 }
 
@@ -254,6 +264,12 @@ enum ModuleFileEvaluationError {
     InvalidExtensionRepoName(String),
     #[error("use_repo() repository name got value of type '{actual}', want 'string'")]
     UseRepoNameType { actual: &'static str },
+    #[error("repo rule proxy requires named-only parameter 'name'")]
+    MissingRepoRuleName,
+    #[error("repo rule proxy parameter 'name' got value of type '{actual}', want 'string'")]
+    RepoRuleNameType { actual: &'static str },
+    #[error("repo rule proxy parameter 'dev_dependency' got value of type '{actual}', want 'bool'")]
+    RepoRuleDevDependencyType { actual: &'static str },
     #[error(
         "The repo exported as '{exported}' by module extension '{extension_name}' is already imported at {location}"
     )]
@@ -295,6 +311,8 @@ struct WorkingModuleFile {
     extension_uses: Vec<WorkingExtensionUse>,
     regular_extension_indices: BTreeMap<(ApparentLabel, ExtensionName), usize>,
     extension_proxies: Vec<WorkingExtensionProxy>,
+    repo_rule_uses: Vec<WorkingRepoRuleUse>,
+    repo_rule_indices: BTreeMap<RepoRuleUseId, usize>,
 }
 
 #[derive(Debug)]
@@ -316,6 +334,13 @@ struct WorkingExtensionProxy {
     location: ModuleSourceLocation,
     imports: Vec<RepoImport>,
     exported_imports: BTreeMap<RepositoryName, ModuleSourceLocation>,
+}
+
+#[derive(Debug)]
+struct WorkingRepoRuleUse {
+    first_use_ordinal: u32,
+    id: RepoRuleUseId,
+    invocations: Vec<RepoRuleInvocation>,
 }
 
 #[derive(
@@ -412,6 +437,83 @@ impl<'v> StarlarkValue<'v> for StarlarkExtensionTagCallable {
 
 starlark_simple_value!(StarlarkExtensionTagCallable);
 
+#[derive(
+    Debug,
+    Display,
+    ProvidesStaticType,
+    NoSerialize,
+    StarlarkPagable,
+    Allocative
+)]
+#[display("<repository rule proxy>")]
+struct StarlarkRepoRuleProxy {
+    group_index: usize,
+}
+
+#[starlark_value(type = "repo_rule_proxy")]
+impl<'v> StarlarkValue<'v> for StarlarkRepoRuleProxy {
+    fn invoke(
+        &self,
+        _me: Value<'v>,
+        args: &Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        let names = args.names_map()?;
+        let mut repository_name = None;
+        let mut dev_dependency = false;
+        let mut attributes = Vec::new();
+        for (name, value) in names {
+            match name.as_str() {
+                "name" => {
+                    repository_name = Some(value.unpack_str().ok_or_else(|| {
+                        buck2_error::Error::from(ModuleFileEvaluationError::RepoRuleNameType {
+                            actual: value.get_type(),
+                        })
+                    })?);
+                }
+                "dev_dependency" => {
+                    dev_dependency = value.unpack_bool().ok_or_else(|| {
+                        buck2_error::Error::from(
+                            ModuleFileEvaluationError::RepoRuleDevDependencyType {
+                                actual: value.get_type(),
+                            },
+                        )
+                    })?;
+                }
+                _ => attributes.push((name.as_str().to_owned(), value)),
+            }
+        }
+        // Bazel type-checks recognized named parameters before its final
+        // unexpected-positional and missing-required checks.
+        args.no_positional_args(eval.heap())?;
+        let repository_name = repository_name.ok_or_else(|| {
+            buck2_error::Error::from(ModuleFileEvaluationError::MissingRepoRuleName)
+        })?;
+        // Bazel validates `name` before its ignored-development early return.
+        let repository_name = parse_extension_repo_name(repository_name)?;
+        let location = call_site(eval);
+        let state = state(eval)?;
+        let Some(ordinal) = state.begin_repo_rule_invocation(self.group_index, dev_dependency)?
+        else {
+            // Ignored calls deliberately do not convert arbitrary raw kwargs.
+            return Ok(Value::new_none());
+        };
+        state.reserve_repo_rule_name(&repository_name, &location)?;
+        let attributes = convert_tag_attributes(attributes)?;
+        state.finish_repo_rule_invocation(
+            self.group_index,
+            ordinal,
+            repository_name,
+            attributes,
+            dev_dependency,
+            &location,
+        )?;
+        Ok(Value::new_none())
+    }
+}
+
+starlark_simple_value!(StarlarkRepoRuleProxy);
+
 impl WorkingModuleFile {
     fn new() -> Self {
         Self {
@@ -426,6 +528,8 @@ impl WorkingModuleFile {
             extension_uses: Vec::new(),
             regular_extension_indices: BTreeMap::new(),
             extension_proxies: Vec::new(),
+            repo_rule_uses: Vec::new(),
+            repo_rule_indices: BTreeMap::new(),
         }
     }
 
@@ -733,6 +837,93 @@ impl ModuleFileEvalState {
         Ok(proxy_id)
     }
 
+    fn add_repo_rule_proxy(
+        &self,
+        raw_bzl_file: &str,
+        raw_rule_name: &str,
+    ) -> buck2_error::Result<usize> {
+        self.working.borrow_mut().had_non_module_call = true;
+        let id = RepoRuleUseId::new(
+            self.kind.owner(),
+            raw_bzl_file.to_owned(),
+            raw_rule_name.to_owned(),
+        );
+        let mut working = self.working.borrow_mut();
+        // Every factory call is an observable source event even when its
+        // identity was seen before or no returned proxy is ever called.
+        let ordinal = working.next_extension_ordinal()?;
+        if let Some(index) = working.repo_rule_indices.get(&id).copied() {
+            return Ok(index);
+        }
+        let index = working.repo_rule_uses.len();
+        working.repo_rule_uses.push(WorkingRepoRuleUse {
+            first_use_ordinal: ordinal,
+            id: id.clone(),
+            invocations: Vec::new(),
+        });
+        working.repo_rule_indices.insert(id, index);
+        Ok(index)
+    }
+
+    fn begin_repo_rule_invocation(
+        &self,
+        group_index: usize,
+        dev_dependency: bool,
+    ) -> buck2_error::Result<Option<u32>> {
+        let mut working = self.working.borrow_mut();
+        if working.repo_rule_uses.get(group_index).is_none() {
+            return Err(ModuleFileEvaluationError::InvalidExtensionState(format!(
+                "unknown repository rule group {group_index}"
+            ))
+            .into());
+        }
+        let ordinal = working.next_extension_ordinal()?;
+        Ok((!dev_dependency || !self.kind.ignores_dev_dependencies()).then_some(ordinal))
+    }
+
+    fn finish_repo_rule_invocation(
+        &self,
+        group_index: usize,
+        ordinal: u32,
+        repository_name: RepositoryName,
+        attributes: Box<[RawAttribute]>,
+        dev_dependency: bool,
+        location: &str,
+    ) -> buck2_error::Result<()> {
+        let invocation = RepoRuleInvocation::new(
+            ordinal,
+            repository_name,
+            attributes,
+            dev_dependency,
+            ModuleSourceLocation::new(location),
+        )
+        .map_err(|error| ModuleFileEvaluationError::InvalidExtensionState(error.to_string()))?;
+        self.working
+            .borrow_mut()
+            .repo_rule_uses
+            .get_mut(group_index)
+            .ok_or_else(|| {
+                buck2_error::Error::from(ModuleFileEvaluationError::InvalidExtensionState(format!(
+                    "unknown repository rule group {group_index}"
+                )))
+            })?
+            .invocations
+            .push(invocation);
+        Ok(())
+    }
+
+    fn reserve_repo_rule_name(
+        &self,
+        repository_name: &RepositoryName,
+        location: &str,
+    ) -> buck2_error::Result<()> {
+        self.working.borrow_mut().reserve_repo_name(
+            repository_name.as_str(),
+            "by a repo rule",
+            location,
+        )
+    }
+
     fn export_extension_proxy(
         &self,
         proxy_id: usize,
@@ -974,6 +1165,21 @@ impl ModuleFileEvalState {
                 })?,
             );
         }
+        let repo_rule_uses = working
+            .repo_rule_uses
+            .into_iter()
+            .filter(|use_value| !use_value.invocations.is_empty())
+            .map(|use_value| {
+                RepoRuleUse::new(
+                    use_value.first_use_ordinal,
+                    use_value.id,
+                    use_value.invocations.into_boxed_slice(),
+                )
+                .map_err(|error| {
+                    ModuleFileEvaluationError::InvalidExtensionState(error.to_string()).into()
+                })
+            })
+            .collect::<buck2_error::Result<Vec<_>>>()?;
         let module_file = ModuleFile::new(
             Some(declaration),
             working.dependencies.into_boxed_slice(),
@@ -981,6 +1187,9 @@ impl ModuleFileEvalState {
         )
         .with_extension_uses(extension_uses.into_boxed_slice())
         .map_err(|error| ModuleFileEvaluationError::InvalidExtensionState(error.to_string()))?;
+        let module_file = module_file
+            .with_repo_rule_uses(repo_rule_uses.into_boxed_slice())
+            .map_err(|error| ModuleFileEvaluationError::InvalidExtensionState(error.to_string()))?;
         Ok(ModuleFileEvaluation {
             module_file,
             warnings: working.warnings.into_boxed_slice(),
@@ -1581,6 +1790,17 @@ fn register_module_file_globals(builder: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
+    fn use_repo_rule<'v>(
+        repo_rule_bzl_file: &str,
+        repo_rule_name: &str,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        let group_index = state(eval)?.add_repo_rule_proxy(repo_rule_bzl_file, repo_rule_name)?;
+        Ok(eval
+            .heap()
+            .alloc_simple(StarlarkRepoRuleProxy { group_index }))
+    }
+
     fn multiple_version_override<'v>(
         #[starlark(args)] _args: UnpackTuple<Value<'v>>,
         #[starlark(kwargs)] _kwargs: Value<'v>,
@@ -1638,12 +1858,12 @@ static NOOP_MODULE_PRINT_HANDLER: NoopModulePrintHandler = NoopModulePrintHandle
 ///
 /// The evaluator has no loader and adds isolated `print`, `module`, and
 /// `bazel_dep`, `single_version_override`, `local_path_override`, fail-closed
-/// stubs for other override directives, `use_extension`, and `use_repo` to the
-/// standard Starlark globals. The accumulator is private to this call and is
-/// converted to [`ModuleFile`] only after evaluation and contextual checks
-/// both succeed. Print output is discarded rather than emitted to an ambient
-/// process stream, and root warnings are returned with the module file rather
-/// than emitted ambiently.
+/// stubs for other override directives, `use_extension`, `use_repo`, and
+/// `use_repo_rule` to the standard Starlark globals. The private accumulator is
+/// converted to [`ModuleFile`] only after evaluation and contextual checks both
+/// succeed. Print output is discarded rather than emitted to an ambient process
+/// stream, and root warnings are returned with the module file rather than
+/// emitted ambiently.
 pub fn evaluate_module_file(
     filename: &str,
     content: String,
@@ -1713,6 +1933,7 @@ mod tests {
                 "type",
                 "use_extension",
                 "use_repo",
+                "use_repo_rule",
                 "zip",
             ]
         );
