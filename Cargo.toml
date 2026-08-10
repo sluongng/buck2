@@ -44,6 +44,7 @@ members = [
   "app/buck2_build_info",
   "app/buck2_build_signals",
   "app/buck2_build_signals_impl",
+  "app/buck2_bzlmod",
   "app/buck2_bxl",
   "app/buck2_certs",
   "app/buck2_cfg_constructor",
@@ -210,6 +211,7 @@ buck2_build_api_derive = { path = "app/buck2_build_api_derive" }
 buck2_build_info = { path = "app/buck2_build_info" }
 buck2_build_signals = { path = "app/buck2_build_signals" }
 buck2_build_signals_impl = { path = "app/buck2_build_signals_impl" }
+buck2_bzlmod = { path = "app/buck2_bzlmod" }
 buck2_bxl = { path = "app/buck2_bxl" }
 buck2_certs = { path = "app/buck2_certs" }
 buck2_cfg_constructor = { path = "app/buck2_cfg_constructor" }
