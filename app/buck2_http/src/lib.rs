@@ -14,6 +14,7 @@ use hyper::StatusCode;
 mod client;
 mod proxy;
 mod redirect;
+mod repository;
 pub mod retries;
 mod stats;
 mod x2p;
@@ -21,6 +22,11 @@ mod x2p;
 pub use client::HttpClient;
 pub use client::HttpClientBuilder;
 pub use client::to_bytes;
+pub use repository::NoRepositoryRequestHooks;
+pub use repository::RedactedUri;
+pub use repository::RepositoryHttpPolicy;
+pub use repository::RepositoryRequestHookError;
+pub use repository::RepositoryRequestHooks;
 
 fn http_error_label(status: StatusCode) -> &'static str {
     if status.is_server_error() {
@@ -84,6 +90,28 @@ pub enum HttpError {
     TooManyRedirects { uri: String, max_redirects: usize },
     #[error("HTTP: Error mutating request")]
     MutateRequest(#[source] buck2_error::Error),
+    #[error("HTTP repository request to {uri} was rejected: {reason}")]
+    RepositoryPolicy { uri: String, reason: &'static str },
+    #[error("HTTP repository request hook failed for {uri}: {kind}")]
+    RepositoryRequestHook {
+        uri: String,
+        kind: RepositoryRequestHookError,
+    },
+    #[error(
+        "HTTP repository response from {uri} exceeds the {limit_bytes}-byte limit{advertised_suffix}",
+        advertised_suffix = advertised_bytes.map_or(String::new(), |size| format!(" (advertised {size} bytes)"))
+    )]
+    ResponseTooLarge {
+        uri: String,
+        limit_bytes: u64,
+        advertised_bytes: Option<u64>,
+    },
+    #[error("HTTP: Error reading response from {uri}")]
+    ReadResponse {
+        uri: String,
+        #[source]
+        source: hyper::Error,
+    },
     #[error("HTTP: Timed out while making request to URI: {uri} after {duration} seconds.")]
     #[buck2(tier0)]
     Timeout { uri: String, duration: u64 },
@@ -93,6 +121,24 @@ pub enum HttpError {
         #[source]
         source: x2p::X2PAgentError,
     },
+}
+
+impl HttpError {
+    /// Returns the HTTP status associated with a response error, if any.
+    pub fn status_code(&self) -> Option<StatusCode> {
+        match self {
+            Self::Status { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    pub fn is_not_found(&self) -> bool {
+        self.status_code() == Some(StatusCode::NOT_FOUND)
+    }
+
+    pub fn is_gone(&self) -> bool {
+        self.status_code() == Some(StatusCode::GONE)
+    }
 }
 
 impl From<http::Error> for HttpError {

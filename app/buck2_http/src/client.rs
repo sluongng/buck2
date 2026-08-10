@@ -41,7 +41,7 @@ use crate::x2p::X2PAgentError;
 mod builder;
 pub use builder::HttpClientBuilder;
 
-const DEFAULT_USER_AGENT: &str = "Buck2";
+pub(crate) const DEFAULT_USER_AGENT: &str = "Buck2";
 
 #[derive(Allocative, Clone, Dupe)]
 pub struct HttpClient {
@@ -115,18 +115,30 @@ impl HttpClient {
         self.request(req).await
     }
 
-    async fn send_request_impl(
+    pub(crate) async fn send_request_impl(
+        &self,
+        request: Request<Bytes>,
+    ) -> Result<Response<BoxStream<'_, hyper::Result<Bytes>>>, HttpError> {
+        let uri = crate::repository::redact_uri(request.uri());
+        self.send_request_impl_with_diagnostic_uri(request, uri)
+            .await
+    }
+
+    /// Send a request while using a caller-provided, already-redacted URI in
+    /// every diagnostic. Repository redirects use this to avoid copying
+    /// untrusted Location paths into logs and errors.
+    pub(crate) async fn send_request_impl_with_diagnostic_uri(
         &self,
         mut request: Request<Bytes>,
+        uri: String,
     ) -> Result<Response<BoxStream<'_, hyper::Result<Bytes>>>, HttpError> {
-        let uri = request.uri().to_string();
         let now = tokio::time::Instant::now();
 
         // x2p requires scheme to be http since it handles all TLS.
         if self.supports_vpnless() {
             tracing::debug!(
                 "http: request: changing scheme for '{}' to http for vpnless",
-                request.uri()
+                uri
             );
             change_scheme_to_http(&mut request)?;
         }
@@ -169,7 +181,11 @@ impl HttpClient {
     ) -> Result<Response<BoxStream<'_, hyper::Result<Bytes>>>, HttpError> {
         let pending_request = PendingRequest::from_request(&request);
         let uri = request.uri().clone();
-        tracing::debug!("http: request: {:?}", request);
+        tracing::debug!(
+            method = %request.method(),
+            uri = %crate::repository::RedactedUri::from_uri(request.uri()),
+            "http: request"
+        );
         let resp = self.send_request_impl(request).await?;
         tracing::debug!("http: response: {:?}", resp.status());
 
@@ -187,7 +203,7 @@ impl HttpClient {
             // Handle x2p errors as indicated by headers.
             if let Some(x2p_err) = X2PAgentError::from_headers(&uri, resp.headers()) {
                 return Err(HttpError::X2P {
-                    uri: uri.to_string(),
+                    uri: crate::repository::redact_uri(&uri),
                     source: x2p_err,
                 });
             }
@@ -196,7 +212,7 @@ impl HttpClient {
             let text = read_truncated_error_response(resp).await;
             return Err(HttpError::Status {
                 status,
-                uri: uri.to_string(),
+                uri: crate::repository::redact_uri(&uri),
                 text,
             });
         }
@@ -238,7 +254,7 @@ where
     }
 }
 
-async fn read_truncated_error_response(
+pub(crate) async fn read_truncated_error_response(
     mut resp: Response<BoxStream<'_, hyper::Result<Bytes>>>,
 ) -> String {
     let read = StreamReader::new(resp.body_mut().map_err(std::io::Error::other));
@@ -270,7 +286,7 @@ fn change_scheme_to_http(request: &mut Request<Bytes>) -> Result<(), HttpError> 
     let mut parts = uri.into_parts();
     parts.scheme = Some(Scheme::HTTP);
     *request.uri_mut() = Uri::from_parts(parts).map_err(|e| HttpError::InvalidUriParts {
-        uri: uri_for_error.to_string(),
+        uri: crate::repository::redact_uri(&uri_for_error),
         source: e,
     })?;
     Ok(())
@@ -662,7 +678,11 @@ mod tests {
                             .expect("Couldn't get all bytes from incoming request")
                             .to_bytes(),
                     );
-                    println!("Proxying request: {req:?}");
+                    println!(
+                        "Proxying {} request to {}",
+                        req.method(),
+                        crate::repository::RedactedUri::from_uri(req.uri())
+                    );
                     client
                         .build_http()
                         // Use 'map' here to preserve headers from original request
@@ -938,7 +958,11 @@ mod proxy_tests {
                                 http::header::VIA,
                                 http::HeaderValue::from_static("testing-proxy-server"),
                             );
-                            println!("Proxying request: {req:?}");
+                            println!(
+                                "Proxying {} request to {}",
+                                req.method(),
+                                crate::repository::RedactedUri::from_uri(req.uri())
+                            );
                             client.request(req).await
                         });
 
