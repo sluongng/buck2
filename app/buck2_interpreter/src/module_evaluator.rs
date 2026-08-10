@@ -12,18 +12,23 @@
 //!
 //! This evaluator deliberately has no loader, filesystem, DICE, action, or
 //! network context. Its globals contain standard Starlark helpers, isolated
-//! `print`, and only the `module` and `bazel_dep` directives. A successful call
-//! publishes one immutable [`ModuleFile`] and its warnings.
+//! `print`, the supported module/dependency/override directives, and explicit
+//! fail-closed stubs for later override kinds. A successful call publishes one
+//! immutable [`ModuleFile`] and its warnings.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use buck2_bzlmod::DependencyRepoName;
 use buck2_bzlmod::DependencyRequest;
+use buck2_bzlmod::LocalPathOverride;
 use buck2_bzlmod::ModuleDeclaration;
 use buck2_bzlmod::ModuleFile;
 use buck2_bzlmod::ModuleKey;
 use buck2_bzlmod::ModuleName;
+use buck2_bzlmod::ModuleOverride;
+use buck2_bzlmod::PatchLabel;
+use buck2_bzlmod::SingleVersionOverride;
 use buck2_bzlmod::Version;
 use starlark::PrintHandler;
 use starlark::any::ProvidesStaticType;
@@ -38,6 +43,7 @@ use starlark::values::Value;
 use starlark::values::list_or_tuple::UnpackListOrTuple;
 use starlark::values::none::NoneOr;
 use starlark::values::none::NoneType;
+use starlark::values::tuple::UnpackTuple;
 
 use crate::dialect::StarlarkDialect;
 use crate::module_file::parse_module_file;
@@ -167,6 +173,37 @@ enum ModuleFileEvaluationError {
     BazelCompatibilitySequenceType { actual: &'static str },
     #[error("at index {index} of bazel_compatibility, got element of type {actual}, want string")]
     BazelCompatibilityElementType { index: usize, actual: &'static str },
+    #[error("for {parameter}, got {actual}, want sequence")]
+    StringSequenceType {
+        parameter: &'static str,
+        actual: &'static str,
+    },
+    #[error("at index {index} of {parameter}, got element of type {actual}, want string")]
+    StringSequenceElementType {
+        parameter: &'static str,
+        index: usize,
+        actual: &'static str,
+    },
+    #[error("invalid label \"{label}\" in 'patches': {message}")]
+    InvalidPatchLabel { label: String, message: String },
+    #[error(
+        "invalid label in 'patches': only patches in the main repository can be applied, not from '@{0}'"
+    )]
+    InvalidPatchRepository(String),
+    #[error("multiple overrides for dep {0} found")]
+    DuplicateOverride(String),
+    #[error(
+        "module '{module_name}' is overridden to use version '{override_version}', which is lower than the version '{requested_version}' requested by the root module"
+    )]
+    OverrideVersionTooLow {
+        module_name: ModuleName,
+        override_version: Version,
+        requested_version: Version,
+    },
+    #[error("invalid override for the root module found: {0}")]
+    RootSelfOverride(ModuleName),
+    #[error("{0}() is not supported by the Buck2 Bazel MODULE dialect yet")]
+    UnsupportedDirective(&'static str),
 }
 
 #[derive(Debug)]
@@ -179,6 +216,8 @@ struct RepoNameUsage {
 struct WorkingModuleFile {
     declaration: Option<ModuleDeclaration>,
     dependencies: Vec<DependencyRequest>,
+    overrides: Vec<ModuleOverride>,
+    override_names: BTreeMap<ModuleName, ()>,
     repo_names: BTreeMap<Box<str>, RepoNameUsage>,
     warnings: Vec<ModuleFileWarning>,
     had_non_module_call: bool,
@@ -189,6 +228,8 @@ impl WorkingModuleFile {
         Self {
             declaration: None,
             dependencies: Vec::new(),
+            overrides: Vec::new(),
+            override_names: BTreeMap::new(),
             repo_names: BTreeMap::new(),
             warnings: Vec::new(),
             had_non_module_call: false,
@@ -226,6 +267,22 @@ impl WorkingModuleFile {
             location: location.into(),
             message: message.into(),
         });
+    }
+
+    fn root_repo_alias(&self) -> &str {
+        self.declaration
+            .as_ref()
+            .and_then(ModuleDeclaration::repo_name)
+            .unwrap_or("")
+    }
+
+    fn add_override(&mut self, value: ModuleOverride) -> buck2_error::Result<()> {
+        let name = value.module_name().clone();
+        if self.override_names.insert(name.clone(), ()).is_some() {
+            return Err(ModuleFileEvaluationError::DuplicateOverride(name.to_string()).into());
+        }
+        self.overrides.push(value);
+        Ok(())
     }
 }
 
@@ -361,6 +418,59 @@ impl ModuleFileEvalState {
         Ok(())
     }
 
+    fn add_single_version_override(
+        &self,
+        module_name: &str,
+        version: &str,
+        registry: &str,
+        patches: Option<Value<'_>>,
+        patch_cmds: Option<Value<'_>>,
+        patch_strip: Option<Value<'_>>,
+    ) -> buck2_error::Result<()> {
+        self.working.borrow_mut().had_non_module_call = true;
+
+        // Bazel validates the complete directive before deciding whether root
+        // override declarations are ignored in this evaluation context.
+        let module_name = parse_module_name(module_name)?;
+        let version = parse_version("single_version_override", version)?;
+        let patches = parse_string_sequence(patches, "patches")?;
+        let root_repo_alias = self.working.borrow().root_repo_alias().to_owned();
+        let patches = patches
+            .into_iter()
+            .map(|raw| parse_patch_label(&raw, &root_repo_alias))
+            .collect::<buck2_error::Result<Vec<_>>>()?;
+        let patch_cmds = parse_string_sequence(patch_cmds, "patch_cmds")?;
+        let patch_strip = unpack_i32(patch_strip, "patch_strip", 0)?;
+
+        if self.kind.ignores_dev_dependencies() {
+            return Ok(());
+        }
+        self.working
+            .borrow_mut()
+            .add_override(ModuleOverride::SingleVersion(SingleVersionOverride::new(
+                module_name,
+                version,
+                registry.into(),
+                patches.into_boxed_slice(),
+                patch_cmds.into_boxed_slice(),
+                patch_strip,
+            )))
+    }
+
+    fn add_local_path_override(&self, module_name: &str, path: &str) -> buck2_error::Result<()> {
+        self.working.borrow_mut().had_non_module_call = true;
+        let module_name = parse_module_name(module_name)?;
+        if self.kind.ignores_dev_dependencies() {
+            return Ok(());
+        }
+        self.working
+            .borrow_mut()
+            .add_override(ModuleOverride::LocalPath(LocalPathOverride::new(
+                module_name,
+                path.into(),
+            )))
+    }
+
     fn finish(self) -> buck2_error::Result<ModuleFileEvaluation> {
         let working = self.working.into_inner();
         let declaration = working.declaration.unwrap_or_else(|| {
@@ -386,10 +496,43 @@ impl ModuleFileEvalState {
                 .into());
             }
         }
+        if self.kind.is_root() {
+            for override_value in &working.overrides {
+                let Some(single) = override_value.as_single_version() else {
+                    continue;
+                };
+                let Some(requested) = working.dependencies.iter().find(|dependency| {
+                    matches!(
+                        dependency.repo_name(),
+                        DependencyRepoName::Apparent(alias)
+                            if alias.as_ref() == single.module_name().as_str()
+                    )
+                }) else {
+                    continue;
+                };
+                if !single.version().is_empty()
+                    && !requested.module().version().is_empty()
+                    && single.version() < requested.module().version()
+                {
+                    return Err(ModuleFileEvaluationError::OverrideVersionTooLow {
+                        module_name: single.module_name().clone(),
+                        override_version: single.version().clone(),
+                        requested_version: requested.module().version().clone(),
+                    }
+                    .into());
+                }
+            }
+            if let Some(root_name) = declaration.name()
+                && working.override_names.contains_key(root_name)
+            {
+                return Err(ModuleFileEvaluationError::RootSelfOverride(root_name.clone()).into());
+            }
+        }
         Ok(ModuleFileEvaluation {
             module_file: ModuleFile::new(
                 Some(declaration),
                 working.dependencies.into_boxed_slice(),
+                working.overrides.into_boxed_slice(),
             ),
             warnings: working.warnings.into_boxed_slice(),
         })
@@ -455,12 +598,186 @@ fn parse_bazel_compatibility(value: Option<Value<'_>>) -> buck2_error::Result<Ve
     Ok(result)
 }
 
+fn parse_string_sequence(
+    value: Option<Value<'_>>,
+    parameter: &'static str,
+) -> buck2_error::Result<Vec<Box<str>>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let value = UnpackListOrTuple::<Value>::unpack_value(value)?.ok_or(
+        ModuleFileEvaluationError::StringSequenceType {
+            parameter,
+            actual: value.get_type(),
+        },
+    )?;
+    value
+        .items
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            String::unpack_value(item)?
+                .map(Box::<str>::from)
+                .ok_or_else(|| {
+                    ModuleFileEvaluationError::StringSequenceElementType {
+                        parameter,
+                        index,
+                        actual: item.get_type(),
+                    }
+                    .into()
+                })
+        })
+        .collect()
+}
+
+fn parse_patch_label(raw: &str, root_repo_alias: &str) -> buck2_error::Result<PatchLabel> {
+    let (canonical_repo, package_start, package_is_absolute) = if raw.starts_with('@') {
+        let canonical = raw.starts_with("@@");
+        let repo_start = if canonical { 2 } else { 1 };
+        if let Some(double_slash) = raw.find("//") {
+            let repo = &raw[repo_start..double_slash];
+            validate_canonical_repo_name(repo, raw)?;
+            if !canonical && !repo.is_empty() && repo != root_repo_alias {
+                return Err(
+                    ModuleFileEvaluationError::InvalidPatchRepository(repo.to_owned()).into(),
+                );
+            }
+            (
+                if canonical && !repo.is_empty() {
+                    Some(repo)
+                } else {
+                    None
+                },
+                double_slash + 2,
+                true,
+            )
+        } else {
+            let repo = &raw[repo_start..];
+            validate_canonical_repo_name(repo, raw)?;
+            if !canonical && !repo.is_empty() && repo != root_repo_alias {
+                return Err(
+                    ModuleFileEvaluationError::InvalidPatchRepository(repo.to_owned()).into(),
+                );
+            }
+            (
+                if canonical && !repo.is_empty() {
+                    Some(repo)
+                } else {
+                    None
+                },
+                raw.len(),
+                true,
+            )
+        }
+    } else if raw.starts_with("//") {
+        (None, 2, true)
+    } else {
+        (None, 0, false)
+    };
+
+    let remainder = &raw[package_start..];
+    let (package, target) = if package_start == raw.len() && raw.starts_with('@') {
+        let repo_start = if raw.starts_with("@@") { 2 } else { 1 };
+        ("", &raw[repo_start..])
+    } else if let Some(colon) = remainder.find(':') {
+        (&remainder[..colon], &remainder[colon + 1..])
+    } else if !package_is_absolute {
+        ("", remainder)
+    } else {
+        (remainder, remainder.rsplit('/').next().unwrap_or(""))
+    };
+    if !package_is_absolute && !package.is_empty() {
+        return Err(ModuleFileEvaluationError::InvalidPatchLabel {
+            label: raw.to_owned(),
+            message: "package-relative labels must use an absolute package".to_owned(),
+        }
+        .into());
+    }
+    validate_label_parts(raw, package, target)?;
+    let target = target.strip_suffix("/.").unwrap_or(target);
+
+    let repository = canonical_repo
+        .map(|repo| format!("@@{repo}"))
+        .unwrap_or_default();
+    let normalized = format!("{repository}//{package}:{target}");
+    PatchLabel::parse_normalized(&normalized).map_err(|error| {
+        ModuleFileEvaluationError::InvalidPatchLabel {
+            label: raw.to_owned(),
+            message: error.to_string(),
+        }
+        .into()
+    })
+}
+
+fn validate_canonical_repo_name(repo: &str, raw: &str) -> buck2_error::Result<()> {
+    if !matches!(repo, "." | "..")
+        && repo
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+'))
+    {
+        Ok(())
+    } else {
+        Err(ModuleFileEvaluationError::InvalidPatchLabel {
+            label: raw.to_owned(),
+            message: "invalid canonical repository name".to_owned(),
+        }
+        .into())
+    }
+}
+
+fn validate_label_parts(raw: &str, package: &str, target: &str) -> buck2_error::Result<()> {
+    let valid_printable = |character: char, allow_non_ascii: bool| {
+        (character.is_ascii() && !character.is_ascii_control() && !matches!(character, ':' | '\\'))
+            || (allow_non_ascii && !character.is_ascii())
+    };
+    let valid_package = package.is_empty()
+        || (!package.starts_with('/')
+            && !package.ends_with('/')
+            && !package.contains("//")
+            && package
+                .chars()
+                .all(|character| valid_printable(character, false))
+            && package
+                .split('/')
+                .all(|segment| segment.chars().any(|character| character != '.')));
+    let invalid_target_path = target.starts_with('/')
+        || target.ends_with('/')
+        || target == ".."
+        || target.starts_with("../")
+        || target.ends_with("/..")
+        || target.contains("/../")
+        || target.starts_with("./")
+        || target.contains("/./")
+        || target.contains("//");
+    let valid_target = !target.is_empty()
+        && !invalid_target_path
+        && target
+            .chars()
+            .all(|character| valid_printable(character, true));
+    if !valid_package || !valid_target {
+        return Err(ModuleFileEvaluationError::InvalidPatchLabel {
+            label: raw.to_owned(),
+            message: "invalid package or target name".to_owned(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn unpack_compatibility_level(
     value: Option<Value<'_>>,
     parameter: &'static str,
 ) -> buck2_error::Result<i32> {
+    unpack_i32(value, parameter, -1)
+}
+
+fn unpack_i32(
+    value: Option<Value<'_>>,
+    parameter: &'static str,
+    default: i32,
+) -> buck2_error::Result<i32> {
     let Some(value) = value else {
-        return Ok(-1);
+        return Ok(default);
     };
     if value.get_type() != "int" {
         return Err(ModuleFileEvaluationError::CompatibilityLevelType {
@@ -545,6 +862,62 @@ fn register_module_file_globals(builder: &mut GlobalsBuilder) {
         )?;
         Ok(NoneType)
     }
+
+    fn single_version_override<'v>(
+        #[starlark(require = named)] module_name: &str,
+        #[starlark(require = named, default = "")] version: &str,
+        #[starlark(require = named, default = "")] registry: &str,
+        #[starlark(require = named)] patches: Option<Value<'v>>,
+        #[starlark(require = named)] patch_cmds: Option<Value<'v>>,
+        #[starlark(require = named)] patch_strip: Option<Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<NoneType> {
+        state(eval)?.add_single_version_override(
+            module_name,
+            version,
+            registry,
+            patches,
+            patch_cmds,
+            patch_strip,
+        )?;
+        Ok(NoneType)
+    }
+
+    fn local_path_override<'v>(
+        #[starlark(require = named)] module_name: &str,
+        #[starlark(require = named)] path: &str,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<NoneType> {
+        state(eval)?.add_local_path_override(module_name, path)?;
+        Ok(NoneType)
+    }
+
+    fn multiple_version_override<'v>(
+        #[starlark(args)] _args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] _kwargs: Value<'v>,
+    ) -> starlark::Result<NoneType> {
+        let error: buck2_error::Error =
+            ModuleFileEvaluationError::UnsupportedDirective("multiple_version_override").into();
+        Err(error.into())
+    }
+
+    fn archive_override<'v>(
+        #[starlark(args)] _args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] _kwargs: Value<'v>,
+    ) -> starlark::Result<NoneType> {
+        let error: buck2_error::Error =
+            ModuleFileEvaluationError::UnsupportedDirective("archive_override").into();
+        Err(error.into())
+    }
+
+    fn git_override<'v>(
+        #[starlark(args)] _args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] _kwargs: Value<'v>,
+    ) -> starlark::Result<NoneType> {
+        let error: buck2_error::Error =
+            ModuleFileEvaluationError::UnsupportedDirective("git_override").into();
+        Err(error.into())
+    }
 }
 
 fn module_file_globals() -> Globals {
@@ -575,11 +948,12 @@ static NOOP_MODULE_PRINT_HANDLER: NoopModulePrintHandler = NoopModulePrintHandle
 /// Parse, validate, and evaluate one in-memory Bazel `MODULE.bazel` source.
 ///
 /// The evaluator has no loader and adds isolated `print`, `module`, and
-/// `bazel_dep` to the standard Starlark globals. The accumulator is private to
-/// this call and is converted to [`ModuleFile`] only after evaluation and
-/// contextual checks both succeed. Print output is discarded rather than
-/// emitted to an ambient process stream, and root warnings are returned with
-/// the module file rather than emitted ambiently.
+/// `bazel_dep`, `single_version_override`, and `local_path_override` to the
+/// standard Starlark globals. The accumulator is private to this call and is
+/// converted to [`ModuleFile`] only after evaluation and contextual checks
+/// both succeed. Print output is discarded rather than emitted to an ambient
+/// process stream, and root warnings are returned with the module file rather
+/// than emitted ambiently.
 pub fn evaluate_module_file(
     filename: &str,
     content: String,
@@ -615,6 +989,7 @@ mod tests {
                 "abs",
                 "all",
                 "any",
+                "archive_override",
                 "bazel_dep",
                 "bool",
                 "bytes",
@@ -625,19 +1000,23 @@ mod tests {
                 "fail",
                 "float",
                 "getattr",
+                "git_override",
                 "hasattr",
                 "hash",
                 "int",
                 "len",
                 "list",
+                "local_path_override",
                 "max",
                 "min",
                 "module",
+                "multiple_version_override",
                 "ord",
                 "print",
                 "range",
                 "repr",
                 "reversed",
+                "single_version_override",
                 "sorted",
                 "str",
                 "tuple",

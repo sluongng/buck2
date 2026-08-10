@@ -12,6 +12,7 @@ use buck2_bzlmod::DependencyRepoName;
 use buck2_bzlmod::ModuleFile;
 use buck2_bzlmod::ModuleKey;
 use buck2_bzlmod::ModuleName;
+use buck2_bzlmod::ModuleOverride;
 use buck2_bzlmod::Version;
 use buck2_interpreter::module_evaluator::ModuleFileEvalKind;
 use buck2_interpreter::module_evaluator::ModuleFileEvaluation;
@@ -467,6 +468,7 @@ fn exact_global_surface_includes_only_isolated_phase_two_capabilities() {
             "abs",
             "all",
             "any",
+            "archive_override",
             "bazel_dep",
             "bool",
             "bytes",
@@ -477,19 +479,23 @@ fn exact_global_surface_includes_only_isolated_phase_two_capabilities() {
             "fail",
             "float",
             "getattr",
+            "git_override",
             "hasattr",
             "hash",
             "int",
             "len",
             "list",
+            "local_path_override",
             "max",
             "min",
             "module",
+            "multiple_version_override",
             "ord",
             "print",
             "range",
             "repr",
             "reversed",
+            "single_version_override",
             "sorted",
             "str",
             "tuple",
@@ -541,11 +547,6 @@ fn build_action_filesystem_and_network_globals_are_absent() {
 #[test]
 fn later_phase_module_directives_fail_explicitly() {
     for directive in [
-        "single_version_override(module_name = \"aaa\", version = \"1.0\")",
-        "multiple_version_override(module_name = \"aaa\", versions = [\"1.0\"])",
-        "archive_override(module_name = \"aaa\", urls = [])",
-        "git_override(module_name = \"aaa\", remote = \"https://example.invalid\", commit = \"abc\")",
-        "local_path_override(module_name = \"aaa\", path = \"../aaa\")",
         "use_extension(\"//:extensions.bzl\", \"ext\")",
         "use_repo(None, \"repo\")",
         "use_repo_rule(\"//:repo.bzl\", \"repo_rule\")",
@@ -554,6 +555,340 @@ fn later_phase_module_directives_fail_explicitly() {
     ] {
         let name = directive.split_once('(').unwrap().0;
         assert_rejected(root(directive), &format!("Variable `{name}` not found"));
+    }
+}
+
+#[test]
+fn evaluates_pinned_bazel_root_override_shapes_in_order() {
+    // Compactly preserves the override shapes used by Bazel d99d82's root
+    // MODULE.bazel: empty and pinned versions, ordered patch vectors, and one
+    // opaque local path.
+    let file = root(
+        r#"
+module(name = "bazel", version = "9.0.0")
+single_version_override(module_name = "grpc", patches = ["//third_party/grpc:grpc.patch"], patch_strip = 1)
+single_version_override(module_name = "c-ares", version = "1.34.5")
+single_version_override(module_name = "rules_jvm_external", version = "6.8", patches = ["//third_party:jvm-1.patch", "//third_party:jvm-2.patch"], patch_strip = 1)
+single_version_override(module_name = "rules_graalvm", patches = ["//:g1.patch", "//:g2.patch", "//:g3.patch", "//:g4.patch", "//:g5.patch"], patch_strip = 1)
+single_version_override(module_name = "googleapis", version = "1.0", patches = ["//:googleapis.patch"], patch_strip = 1)
+single_version_override(module_name = "protobuf", version = "35.1", patches = ["//:protobuf.patch"], patch_strip = 1)
+single_version_override(module_name = "grpc-java", patches = ["//:j1.patch", "//:j2.patch", "//:j3.patch", "//:j4.patch"], patch_strip = 1)
+local_path_override(module_name = "remoteapis", path = "./third_party/remoteapis")
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(file.overrides().len(), 8);
+    let names: Vec<_> = file
+        .overrides()
+        .iter()
+        .map(|value| value.module_name().as_str())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "grpc",
+            "c-ares",
+            "rules_jvm_external",
+            "rules_graalvm",
+            "googleapis",
+            "protobuf",
+            "grpc-java",
+            "remoteapis",
+        ]
+    );
+    let grpc = file.overrides()[0].as_single_version().unwrap();
+    assert!(grpc.version().is_empty());
+    assert_eq!(grpc.patches()[0].as_str(), "//third_party/grpc:grpc.patch");
+    assert_eq!(grpc.patch_strip(), 1);
+    assert_eq!(
+        file.overrides()[7].as_local_path().unwrap().path(),
+        "./third_party/remoteapis"
+    );
+}
+
+#[test]
+fn override_values_preserve_opaque_fields_and_normalize_patch_labels() {
+    let file = root(
+        r#"
+module(name = "root", repo_name = "self")
+single_version_override(
+    module_name = "dep",
+    registry = "opaque registry value",
+    patches = ["//:root.patch", ":relative.patch", "@self//pkg:self.patch", "@@canonical+repo//other:canonical.patch"],
+    patch_cmds = ("printf one", "printf two"),
+    patch_strip = -7,
+)
+local_path_override(module_name = "local", path = "")
+local_path_override(module_name = "relative", path = "../somewhere")
+local_path_override(module_name = "absolute", path = "/somewhere")
+"#,
+    )
+    .unwrap();
+
+    let single = file.overrides()[0].as_single_version().unwrap();
+    assert!(single.version().is_empty());
+    assert_eq!(single.registry(), "opaque registry value");
+    assert_eq!(
+        single
+            .patches()
+            .iter()
+            .map(|label| label.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "//:root.patch",
+            "//:relative.patch",
+            "//pkg:self.patch",
+            "@@canonical+repo//other:canonical.patch",
+        ]
+    );
+    assert_eq!(
+        single
+            .patch_cmds()
+            .iter()
+            .map(|command| command.as_ref())
+            .collect::<Vec<_>>(),
+        ["printf one", "printf two"]
+    );
+    assert_eq!(single.patch_strip(), -7);
+    assert_eq!(file.overrides()[1].as_local_path().unwrap().path(), "");
+    assert_eq!(
+        file.overrides()[2].as_local_path().unwrap().path(),
+        "../somewhere"
+    );
+    assert_eq!(
+        file.overrides()[3].as_local_path().unwrap().path(),
+        "/somewhere"
+    );
+}
+
+#[test]
+fn override_arguments_are_named_only_and_fully_validated() {
+    assert_rejected(
+        root("single_version_override(\"dep\")"),
+        "Missing named-only parameter `module_name`",
+    );
+    assert_rejected(
+        root("local_path_override(\"dep\", \"../dep\")"),
+        "Missing named-only parameter `module_name`",
+    );
+    assert_rejected(
+        root("single_version_override(module_name = \"bad.\")"),
+        "invalid module name 'bad.'",
+    );
+    assert_rejected(
+        root("single_version_override(module_name = \"dep\", version = \"1..0\")"),
+        "Invalid version in single_version_override()",
+    );
+    assert_rejected(
+        root("single_version_override(module_name = \"dep\", patches = {\"//:p\": True})"),
+        "for patches, got dict, want sequence",
+    );
+    assert_rejected(
+        root("single_version_override(module_name = \"dep\", patch_cmds = [\"ok\", 1])"),
+        "at index 1 of patch_cmds, got element of type int, want string",
+    );
+    assert_rejected(
+        root("single_version_override(module_name = \"dep\", patch_strip = 2147483648)"),
+        "want value in signed 32-bit range",
+    );
+    assert_rejected(
+        root(
+            "single_version_override(module_name = \"dep\", patches = [\"@unknown_repo//:p.patch\"] )",
+        ),
+        "only patches in the main repository can be applied",
+    );
+    assert_rejected(
+        root("single_version_override(module_name = \"dep\", patches = [\"//pkg/../bad.patch\"] )"),
+        "invalid label",
+    );
+    assert_rejected(
+        root(
+            "single_version_override(module_name = \"dep\", \
+             patches = [\"pkg:relative.patch\"], patch_cmds = [1], \
+             patch_strip = 2147483648)",
+        ),
+        "invalid label",
+    );
+}
+
+#[test]
+fn patch_label_parser_matches_pinned_bazel_forms_and_rejects_malformed_inputs() {
+    let file = root(
+        r#"
+module(name = "root", repo_name = "self")
+single_version_override(
+    module_name = "dep",
+    patches = [
+        "foo/target.patch",
+        "@self",
+        "@@canonical+repo",
+        "@@canonical+repo//pkg:unicode-π.patch",
+        "//pkg:legacy/.",
+    ],
+)
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        file.overrides()[0]
+            .as_single_version()
+            .unwrap()
+            .patches()
+            .iter()
+            .map(|label| label.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "//:foo/target.patch",
+            "//:self",
+            "@@canonical+repo//:canonical+repo",
+            "@@canonical+repo//pkg:unicode-π.patch",
+            "//pkg:legacy",
+        ]
+    );
+
+    for malformed in [
+        "@@bad repo//:p.patch",
+        "@@bad~repo//:p.patch",
+        "foo/bar:relative.patch",
+        "//pkg:bad:target",
+        "///pkg:target",
+        "//pkg/:target",
+        "//pkg//nested:target",
+        "//.../pkg:target",
+        "//pkg:/target",
+        "//pkg:target/",
+        "//pkg:../target",
+        "//pkg:target/../bad",
+        "//pkg:target//bad",
+        "//pkg:bad\\target",
+    ] {
+        assert_rejected(
+            root(&format!(
+                "single_version_override(module_name = \"dep\", patches = [{malformed:?}])"
+            )),
+            "invalid label",
+        );
+    }
+}
+
+#[test]
+fn ignored_override_contexts_validate_but_do_not_store_or_deduplicate() {
+    let ignored = root_ignoring_dev(
+        "single_version_override(module_name = \"dep\")\n\
+         local_path_override(module_name = \"dep\", path = \"one\")\n\
+         local_path_override(module_name = \"dep\", path = \"two\")",
+    )
+    .unwrap();
+    assert!(ignored.overrides().is_empty());
+
+    let dependency_file = dependency(
+        "module(name = \"aaa\", version = \"1.0\")\n\
+         single_version_override(module_name = \"dep\")\n\
+         local_path_override(module_name = \"dep\", path = \"one\")",
+        "aaa",
+        "1.0",
+    )
+    .unwrap();
+    assert!(dependency_file.overrides().is_empty());
+
+    assert_rejected(
+        root_ignoring_dev("single_version_override(module_name = \"bad.\")"),
+        "invalid module name 'bad.'",
+    );
+    assert_rejected(
+        dependency(
+            "module(name = \"aaa\", version = \"1.0\")\n\
+             single_version_override(module_name = \"dep\", patches = [\"@unknown//:p\"])",
+            "aaa",
+            "1.0",
+        ),
+        "only patches in the main repository can be applied",
+    );
+}
+
+#[test]
+fn override_duplicates_are_cross_kind_and_override_can_coexist_with_dep() {
+    assert_rejected(
+        root(
+            "single_version_override(module_name = \"dep\")\n\
+             local_path_override(module_name = \"dep\", path = \"../dep\")",
+        ),
+        "multiple overrides for dep dep found",
+    );
+    let file = root(
+        "bazel_dep(name = \"dep\", version = \"1.0\")\n\
+         single_version_override(module_name = \"dep\", version = \"1.0\")",
+    )
+    .unwrap();
+    assert_eq!(file.dependencies().len(), 1);
+    assert_eq!(file.overrides().len(), 1);
+    assert!(matches!(
+        file.overrides()[0],
+        ModuleOverride::SingleVersion(_)
+    ));
+}
+
+#[test]
+fn root_finalization_matches_lower_pin_alias_and_self_override_quirks() {
+    assert_rejected(
+        root(
+            "module(name = \"root\")\n\
+             bazel_dep(name = \"dep\", version = \"2.0\")\n\
+             single_version_override(module_name = \"dep\", version = \"1.0\")",
+        ),
+        "lower than the version '2.0' requested by the root module",
+    );
+
+    let unpinned = root(
+        "bazel_dep(name = \"dep\", version = \"2.0\")\n\
+         single_version_override(module_name = \"dep\", patches = [\"//:dep.patch\"])",
+    )
+    .unwrap();
+    assert!(
+        unpinned.overrides()[0]
+            .as_single_version()
+            .unwrap()
+            .version()
+            .is_empty()
+    );
+
+    // Bazel's root check indexes deps by apparent repo name. An explicit
+    // different alias and nodep therefore skip this lower-bound check.
+    let aliased = root(
+        "bazel_dep(name = \"dep\", version = \"2.0\", repo_name = \"alias\")\n\
+         single_version_override(module_name = \"dep\", version = \"1.0\")",
+    )
+    .unwrap();
+    assert_eq!(aliased.overrides().len(), 1);
+    let nodep = root(
+        "bazel_dep(name = \"dep\", version = \"2.0\", repo_name = None)\n\
+         single_version_override(module_name = \"dep\", version = \"1.0\")",
+    )
+    .unwrap();
+    assert_eq!(nodep.overrides().len(), 1);
+
+    assert_rejected(
+        root(
+            "module(name = \"root\")\n\
+             local_path_override(module_name = \"root\", path = \".\")",
+        ),
+        "invalid override for the root module found",
+    );
+}
+
+#[test]
+fn unsupported_override_globals_fail_stably_in_all_contexts() {
+    for directive in [
+        "multiple_version_override(module_name = \"aaa\", versions = [\"1.0\"])",
+        "archive_override(module_name = \"aaa\", urls = [])",
+        "git_override(module_name = \"aaa\", remote = \"https://example.invalid\", commit = \"abc\")",
+    ] {
+        let name = directive.split_once('(').unwrap().0;
+        assert_rejected(
+            root_ignoring_dev(directive),
+            &format!("{name}() is not supported by the Buck2 Bazel MODULE dialect yet"),
+        );
     }
 }
 
