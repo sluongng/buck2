@@ -12,37 +12,69 @@
 //!
 //! This evaluator deliberately has no loader, filesystem, DICE, action, or
 //! network context. Its globals contain standard Starlark helpers, isolated
-//! `print`, the supported module/dependency/override directives, and explicit
-//! fail-closed stubs for later override kinds. A successful call publishes one
-//! immutable [`ModuleFile`] and its warnings.
+//! `print`, `module`, `bazel_dep`, `single_version_override`,
+//! `local_path_override`, fail-closed stubs for other override directives,
+//! `use_extension`, and `use_repo`. A successful call publishes one immutable
+//! [`ModuleFile`] and its warnings.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 
+use allocative::Allocative;
+use buck2_bzlmod::ApparentLabel;
 use buck2_bzlmod::DependencyRepoName;
 use buck2_bzlmod::DependencyRequest;
+use buck2_bzlmod::ExtensionIsolation;
+use buck2_bzlmod::ExtensionName;
+use buck2_bzlmod::ExtensionUse;
+use buck2_bzlmod::ExtensionUseKind;
 use buck2_bzlmod::LocalPathOverride;
 use buck2_bzlmod::ModuleDeclaration;
 use buck2_bzlmod::ModuleFile;
 use buck2_bzlmod::ModuleKey;
 use buck2_bzlmod::ModuleName;
 use buck2_bzlmod::ModuleOverride;
+use buck2_bzlmod::ModuleSourceLocation;
+use buck2_bzlmod::OrderedStringDict;
 use buck2_bzlmod::PatchLabel;
+use buck2_bzlmod::ProxyUse;
+use buck2_bzlmod::RawAttribute;
+use buck2_bzlmod::RawAttributeValue;
+use buck2_bzlmod::RawInteger;
+use buck2_bzlmod::RawTag;
+use buck2_bzlmod::RepoImport;
+use buck2_bzlmod::RepositoryName;
 use buck2_bzlmod::SingleVersionOverride;
+use buck2_bzlmod::StarlarkBindingName;
 use buck2_bzlmod::Version;
+use derive_more::Display;
+use num_bigint::BigInt;
 use starlark::PrintHandler;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::Globals;
 use starlark::environment::GlobalsBuilder;
 use starlark::environment::LibraryExtension;
 use starlark::environment::Module;
+use starlark::eval::Arguments;
 use starlark::eval::Evaluator;
 use starlark::starlark_module;
+use starlark::starlark_simple_value;
+use starlark::values::Heap;
+use starlark::values::NoSerialize;
+use starlark::values::StarlarkPagable;
+use starlark::values::StarlarkValue;
 use starlark::values::UnpackValue;
 use starlark::values::Value;
+use starlark::values::ValueIdentity;
+use starlark::values::ValueLike;
+use starlark::values::dict::DictRef;
+use starlark::values::list::ListRef;
 use starlark::values::list_or_tuple::UnpackListOrTuple;
 use starlark::values::none::NoneOr;
 use starlark::values::none::NoneType;
+use starlark::values::starlark_value;
+use starlark::values::tuple::TupleRef;
 use starlark::values::tuple::UnpackTuple;
 
 use crate::dialect::StarlarkDialect;
@@ -204,6 +236,44 @@ enum ModuleFileEvaluationError {
     RootSelfOverride(ModuleName),
     #[error("{0}() is not supported by the Buck2 Bazel MODULE dialect yet")]
     UnsupportedDirective(&'static str),
+    #[error("extension name is not a valid identifier: {0}")]
+    InvalidExtensionName(String),
+    #[error("invalid label \"{label}\": {message}")]
+    InvalidExtensionLabel { label: String, message: String },
+    #[error(
+        "use_extension(isolate = ...) requires Bazel's experimental isolated-extension-usages semantics, which this evaluator does not expose"
+    )]
+    UnsupportedIsolate,
+    #[error("extension event ordinal overflow")]
+    ExtensionOrdinalOverflow,
+    #[error("use_repo() expected a module extension proxy, got {0}")]
+    InvalidExtensionProxy(&'static str),
+    #[error(
+        "invalid user-provided repo name '{0}': valid names may contain only A-Z, a-z, 0-9, '-', '_', '.', and must start with a letter or a number"
+    )]
+    InvalidExtensionRepoName(String),
+    #[error("use_repo() repository name got value of type '{actual}', want 'string'")]
+    UseRepoNameType { actual: &'static str },
+    #[error(
+        "The repo exported as '{exported}' by module extension '{extension_name}' is already imported at {location}"
+    )]
+    DuplicateExportedRepo {
+        exported: String,
+        extension_name: ExtensionName,
+        location: Box<str>,
+    },
+    #[error("unsupported module extension tag attribute value of type '{actual}' at {path}")]
+    UnsupportedTagAttribute { actual: &'static str, path: String },
+    #[error(
+        "module extension tag attribute dictionary key at {path} must be a string, got {actual}"
+    )]
+    InvalidTagDictKey { actual: &'static str, path: String },
+    #[error("cyclic module extension tag attribute value at {0}")]
+    CyclicTagAttribute(String),
+    #[error("module extension tag attribute nesting exceeds {limit} levels at {path}")]
+    TagAttributeDepth { limit: usize, path: String },
+    #[error("invalid module extension state: {0}")]
+    InvalidExtensionState(String),
 }
 
 #[derive(Debug)]
@@ -221,7 +291,126 @@ struct WorkingModuleFile {
     repo_names: BTreeMap<Box<str>, RepoNameUsage>,
     warnings: Vec<ModuleFileWarning>,
     had_non_module_call: bool,
+    next_extension_ordinal: u32,
+    extension_uses: Vec<WorkingExtensionUse>,
+    regular_extension_indices: BTreeMap<(ApparentLabel, ExtensionName), usize>,
+    extension_proxies: Vec<WorkingExtensionProxy>,
 }
+
+#[derive(Debug)]
+struct WorkingExtensionUse {
+    first_use_ordinal: u32,
+    kind: ExtensionUseKind,
+    proxy_ids: Vec<usize>,
+    tags: Vec<RawTag>,
+    exported_imports: BTreeMap<RepositoryName, ModuleSourceLocation>,
+}
+
+#[derive(Debug)]
+struct WorkingExtensionProxy {
+    group_index: Option<usize>,
+    extension_name: ExtensionName,
+    ordinal: u32,
+    exported_name: Option<StarlarkBindingName>,
+    dev_dependency: bool,
+    location: ModuleSourceLocation,
+    imports: Vec<RepoImport>,
+    exported_imports: BTreeMap<RepositoryName, ModuleSourceLocation>,
+}
+
+#[derive(
+    Debug,
+    Display,
+    ProvidesStaticType,
+    NoSerialize,
+    StarlarkPagable,
+    Allocative
+)]
+#[display("<module extension proxy>")]
+struct StarlarkExtensionProxy {
+    proxy_id: usize,
+}
+
+#[starlark_value(type = "module_extension_proxy")]
+impl<'v> StarlarkValue<'v> for StarlarkExtensionProxy {
+    fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
+        Some(heap.alloc_simple(StarlarkExtensionTagCallable {
+            proxy_id: self.proxy_id,
+            class_name: attribute.into(),
+        }))
+    }
+
+    fn has_attr(&self, _attribute: &str, _heap: Heap<'v>) -> bool {
+        true
+    }
+
+    fn dir_attr(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn export_as(
+        &self,
+        variable_name: &str,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<()> {
+        state(eval)?.export_extension_proxy(self.proxy_id, variable_name)?;
+        Ok(())
+    }
+}
+
+starlark_simple_value!(StarlarkExtensionProxy);
+
+#[derive(
+    Debug,
+    Display,
+    ProvidesStaticType,
+    NoSerialize,
+    StarlarkPagable,
+    Allocative
+)]
+#[display("<module extension tag callable>")]
+struct StarlarkExtensionTagCallable {
+    proxy_id: usize,
+    class_name: String,
+}
+
+#[starlark_value(type = "tag_callable")]
+impl<'v> StarlarkValue<'v> for StarlarkExtensionTagCallable {
+    fn invoke(
+        &self,
+        _me: Value<'v>,
+        args: &Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        args.no_positional_args(eval.heap())?;
+        // Detached ignored-development proxies still validate normal Starlark
+        // kwargs shape, but deliberately skip raw-value conversion.
+        let names = args.names_map()?;
+        let location = call_site(eval);
+        let state = state(eval)?;
+        let Some((ordinal, group_index, dev_dependency)) =
+            state.begin_extension_tag(self.proxy_id)?
+        else {
+            return Ok(Value::new_none());
+        };
+        let attributes = convert_tag_attributes(
+            names
+                .into_iter()
+                .map(|(name, value)| (name.as_str().to_owned(), value)),
+        )?;
+        state.finish_extension_tag(
+            group_index,
+            ordinal,
+            &self.class_name,
+            attributes,
+            dev_dependency,
+            &location,
+        )?;
+        Ok(Value::new_none())
+    }
+}
+
+starlark_simple_value!(StarlarkExtensionTagCallable);
 
 impl WorkingModuleFile {
     fn new() -> Self {
@@ -233,7 +422,19 @@ impl WorkingModuleFile {
             repo_names: BTreeMap::new(),
             warnings: Vec::new(),
             had_non_module_call: false,
+            next_extension_ordinal: 0,
+            extension_uses: Vec::new(),
+            regular_extension_indices: BTreeMap::new(),
+            extension_proxies: Vec::new(),
         }
+    }
+
+    fn next_extension_ordinal(&mut self) -> buck2_error::Result<u32> {
+        let ordinal = self.next_extension_ordinal;
+        self.next_extension_ordinal = ordinal
+            .checked_add(1)
+            .ok_or(ModuleFileEvaluationError::ExtensionOrdinalOverflow)?;
+        Ok(ordinal)
     }
 
     fn reserve_repo_name(
@@ -471,6 +672,215 @@ impl ModuleFileEvalState {
             )))
     }
 
+    fn add_extension_proxy(
+        &self,
+        raw_extension_file: &str,
+        extension_name: &str,
+        dev_dependency: bool,
+        location: &str,
+    ) -> buck2_error::Result<usize> {
+        self.working.borrow_mut().had_non_module_call = true;
+        let extension_name = ExtensionName::parse(extension_name).map_err(|_| {
+            ModuleFileEvaluationError::InvalidExtensionName(extension_name.to_owned())
+        })?;
+        let own_repo = self.working.borrow().root_repo_alias().to_owned();
+        let extension_file = normalize_extension_label(raw_extension_file, &own_repo)?;
+        let ignored = dev_dependency && self.kind.ignores_dev_dependencies();
+        let mut working = self.working.borrow_mut();
+        let group_index = if ignored {
+            // A detached Bazel usage has its own otherwise-unobservable first
+            // use and proxy events. Consume both ordinals so later retained
+            // records preserve absolute execution order.
+            let _ = working.next_extension_ordinal()?;
+            None
+        } else {
+            let key = (extension_file.clone(), extension_name.clone());
+            match working.regular_extension_indices.get(&key).copied() {
+                Some(index) => Some(index),
+                None => {
+                    let first_use_ordinal = working.next_extension_ordinal()?;
+                    let index = working.extension_uses.len();
+                    working.extension_uses.push(WorkingExtensionUse {
+                        first_use_ordinal,
+                        kind: ExtensionUseKind::Regular {
+                            extension_file,
+                            extension_name: extension_name.clone(),
+                        },
+                        proxy_ids: Vec::new(),
+                        tags: Vec::new(),
+                        exported_imports: BTreeMap::new(),
+                    });
+                    working.regular_extension_indices.insert(key, index);
+                    Some(index)
+                }
+            }
+        };
+        let ordinal = working.next_extension_ordinal()?;
+        let proxy_id = working.extension_proxies.len();
+        working.extension_proxies.push(WorkingExtensionProxy {
+            group_index,
+            extension_name,
+            ordinal,
+            exported_name: None,
+            dev_dependency,
+            location: ModuleSourceLocation::new(location),
+            imports: Vec::new(),
+            exported_imports: BTreeMap::new(),
+        });
+        if let Some(group_index) = group_index {
+            working.extension_uses[group_index].proxy_ids.push(proxy_id);
+        }
+        Ok(proxy_id)
+    }
+
+    fn export_extension_proxy(
+        &self,
+        proxy_id: usize,
+        variable_name: &str,
+    ) -> buck2_error::Result<()> {
+        let mut working = self.working.borrow_mut();
+        let proxy = working.extension_proxies.get_mut(proxy_id).ok_or_else(|| {
+            ModuleFileEvaluationError::InvalidExtensionState(format!(
+                "unknown extension proxy {proxy_id}"
+            ))
+        })?;
+        if proxy.exported_name.is_none() {
+            proxy.exported_name =
+                Some(StarlarkBindingName::parse(variable_name).map_err(|error| {
+                    ModuleFileEvaluationError::InvalidExtensionState(error.to_string())
+                })?);
+        }
+        Ok(())
+    }
+
+    fn begin_extension_tag(
+        &self,
+        proxy_id: usize,
+    ) -> buck2_error::Result<Option<(u32, usize, bool)>> {
+        let mut working = self.working.borrow_mut();
+        let (group_index, dev_dependency) = working
+            .extension_proxies
+            .get(proxy_id)
+            .map(|proxy| (proxy.group_index, proxy.dev_dependency))
+            .ok_or_else(|| {
+                ModuleFileEvaluationError::InvalidExtensionState(format!(
+                    "unknown extension proxy {proxy_id}"
+                ))
+            })?;
+        let ordinal = working.next_extension_ordinal()?;
+        Ok(group_index.map(|group_index| (ordinal, group_index, dev_dependency)))
+    }
+
+    fn finish_extension_tag(
+        &self,
+        group_index: usize,
+        ordinal: u32,
+        class_name: &str,
+        attributes: Box<[RawAttribute]>,
+        dev_dependency: bool,
+        location: &str,
+    ) -> buck2_error::Result<()> {
+        let tag = RawTag::new(
+            ordinal,
+            class_name,
+            attributes,
+            dev_dependency,
+            ModuleSourceLocation::new(location),
+        )
+        .map_err(|error| ModuleFileEvaluationError::InvalidExtensionState(error.to_string()))?;
+        self.working
+            .borrow_mut()
+            .extension_uses
+            .get_mut(group_index)
+            .ok_or_else(|| {
+                buck2_error::Error::from(ModuleFileEvaluationError::InvalidExtensionState(format!(
+                    "unknown extension group {group_index}"
+                )))
+            })?
+            .tags
+            .push(tag);
+        Ok(())
+    }
+
+    fn add_repo_imports(
+        &self,
+        proxy_id: usize,
+        imports: Vec<(String, String)>,
+        location: &str,
+    ) -> buck2_error::Result<()> {
+        self.working.borrow_mut().had_non_module_call = true;
+        let mut working = self.working.borrow_mut();
+        let group_index = working
+            .extension_proxies
+            .get(proxy_id)
+            .ok_or_else(|| {
+                ModuleFileEvaluationError::InvalidExtensionState(format!(
+                    "unknown extension proxy {proxy_id}"
+                ))
+            })?
+            .group_index;
+
+        for (local, exported) in imports {
+            let local = parse_extension_repo_name(&local)?;
+            let exported = parse_extension_repo_name(&exported)?;
+            working.reserve_repo_name(&local.to_string(), "by a use_repo() call", location)?;
+
+            let previous = match group_index {
+                Some(group_index) => working.extension_uses[group_index]
+                    .exported_imports
+                    .get(&exported),
+                None => working.extension_proxies[proxy_id]
+                    .exported_imports
+                    .get(&exported),
+            };
+            if let Some(previous) = previous {
+                return Err(ModuleFileEvaluationError::DuplicateExportedRepo {
+                    exported: exported.to_string(),
+                    extension_name: working.extension_proxies[proxy_id].extension_name.clone(),
+                    location: previous.as_str().into(),
+                }
+                .into());
+            }
+
+            let ordinal = working.next_extension_ordinal()?;
+            let source_location = ModuleSourceLocation::new(location);
+            match group_index {
+                Some(group_index) => {
+                    working.extension_uses[group_index]
+                        .exported_imports
+                        .insert(exported.clone(), source_location.clone());
+                    working.extension_proxies[proxy_id]
+                        .imports
+                        .push(RepoImport::new(ordinal, local, exported, source_location));
+                }
+                None => {
+                    working.extension_proxies[proxy_id]
+                        .exported_imports
+                        .insert(exported, source_location);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn module_identity_strings(&self) -> (String, String) {
+        let working = self.working.borrow();
+        working
+            .declaration
+            .as_ref()
+            .map(|declaration| {
+                (
+                    declaration
+                        .name()
+                        .map(ModuleName::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    declaration.version().to_string(),
+                )
+            })
+            .unwrap_or_else(|| (String::new(), String::new()))
+    }
+
     fn finish(self) -> buck2_error::Result<ModuleFileEvaluation> {
         let working = self.working.into_inner();
         let declaration = working.declaration.unwrap_or_else(|| {
@@ -528,12 +938,51 @@ impl ModuleFileEvalState {
                 return Err(ModuleFileEvaluationError::RootSelfOverride(root_name.clone()).into());
             }
         }
+        let mut extension_uses = Vec::with_capacity(working.extension_uses.len());
+        for extension_use in working.extension_uses {
+            let proxies = extension_use
+                .proxy_ids
+                .into_iter()
+                .map(|proxy_id| {
+                    let proxy = working.extension_proxies.get(proxy_id).ok_or_else(|| {
+                        ModuleFileEvaluationError::InvalidExtensionState(format!(
+                            "unknown extension proxy {proxy_id}"
+                        ))
+                    })?;
+                    ProxyUse::new(
+                        proxy.ordinal,
+                        proxy.exported_name.clone(),
+                        proxy.dev_dependency,
+                        proxy.location.clone(),
+                        proxy.imports.clone().into_boxed_slice(),
+                    )
+                    .map_err(|error| {
+                        ModuleFileEvaluationError::InvalidExtensionState(error.to_string()).into()
+                    })
+                })
+                .collect::<buck2_error::Result<Vec<_>>>()?;
+            extension_uses.push(
+                ExtensionUse::new(
+                    extension_use.first_use_ordinal,
+                    extension_use.kind,
+                    ExtensionIsolation::None,
+                    proxies.into_boxed_slice(),
+                    extension_use.tags.into_boxed_slice(),
+                )
+                .map_err(|error| {
+                    ModuleFileEvaluationError::InvalidExtensionState(error.to_string())
+                })?,
+            );
+        }
+        let module_file = ModuleFile::new(
+            Some(declaration),
+            working.dependencies.into_boxed_slice(),
+            working.overrides.into_boxed_slice(),
+        )
+        .with_extension_uses(extension_uses.into_boxed_slice())
+        .map_err(|error| ModuleFileEvaluationError::InvalidExtensionState(error.to_string()))?;
         Ok(ModuleFileEvaluation {
-            module_file: ModuleFile::new(
-                Some(declaration),
-                working.dependencies.into_boxed_slice(),
-                working.overrides.into_boxed_slice(),
-            ),
+            module_file,
             warnings: working.warnings.into_boxed_slice(),
         })
     }
@@ -558,6 +1007,168 @@ fn parse_version(directive: &'static str, value: &str) -> buck2_error::Result<Ve
         }
         .into()
     })
+}
+
+fn parse_extension_repo_name(value: &str) -> buck2_error::Result<RepositoryName> {
+    RepositoryName::parse(value)
+        .map_err(|_| ModuleFileEvaluationError::InvalidExtensionRepoName(value.to_owned()).into())
+}
+
+fn normalize_extension_label(raw: &str, own_repo: &str) -> buck2_error::Result<ApparentLabel> {
+    let invalid = |message: String| ModuleFileEvaluationError::InvalidExtensionLabel {
+        label: raw.to_owned(),
+        message,
+    };
+    if raw.starts_with("@@") {
+        return Err(invalid("canonical repository labels are not accepted here".to_owned()).into());
+    }
+
+    let (repository, remainder, absolute) = if let Some(after_at) = raw.strip_prefix('@') {
+        let (repository, remainder) = after_at
+            .split_once("//")
+            .ok_or_else(|| invalid("apparent repository labels must contain '//'".to_owned()))?;
+        if !repository.is_empty() {
+            parse_extension_repo_name(repository)
+                .map_err(|_| invalid("invalid apparent repository name".to_owned()))?;
+        }
+        (Some(repository), remainder, true)
+    } else if let Some(remainder) = raw.strip_prefix("//") {
+        (None, remainder, true)
+    } else {
+        (None, raw, false)
+    };
+
+    let (package, target) = if let Some(target) = remainder.strip_prefix(':') {
+        ("", target)
+    } else if let Some((package, target)) = remainder.split_once(':') {
+        if !absolute || target.contains(':') {
+            return Err(invalid("invalid package or target name".to_owned()).into());
+        }
+        (package, target)
+    } else if absolute {
+        let target = remainder.rsplit('/').next().unwrap_or("");
+        (remainder, target)
+    } else {
+        ("", remainder)
+    };
+
+    let normalized_repository = match repository {
+        Some(repository) if !repository.is_empty() && repository != own_repo => {
+            format!("@{repository}")
+        }
+        _ if own_repo.is_empty() => String::new(),
+        _ => format!("@{own_repo}"),
+    };
+    let normalized = format!("{normalized_repository}//{package}:{target}");
+    ApparentLabel::parse_normalized(&normalized).map_err(|error| invalid(error.to_string()).into())
+}
+
+const MAX_TAG_ATTRIBUTE_DEPTH: usize = 64;
+
+fn convert_tag_attributes<'v, I, K>(names: I) -> buck2_error::Result<Box<[RawAttribute]>>
+where
+    I: IntoIterator<Item = (K, Value<'v>)>,
+    K: AsRef<str>,
+{
+    let mut active = HashSet::new();
+    names
+        .into_iter()
+        .map(|(name, value)| {
+            let name = name.as_ref();
+            let path = format!(".{name}");
+            Ok(RawAttribute::new(
+                name,
+                convert_tag_attribute_value(value, &path, 0, &mut active)?,
+            ))
+        })
+        .collect::<buck2_error::Result<Vec<_>>>()
+        .map(Vec::into_boxed_slice)
+}
+
+fn convert_tag_attribute_value<'v>(
+    value: Value<'v>,
+    path: &str,
+    depth: usize,
+    active: &mut HashSet<ValueIdentity<'v>>,
+) -> buck2_error::Result<RawAttributeValue> {
+    if depth > MAX_TAG_ATTRIBUTE_DEPTH {
+        return Err(ModuleFileEvaluationError::TagAttributeDepth {
+            limit: MAX_TAG_ATTRIBUTE_DEPTH,
+            path: path.to_owned(),
+        }
+        .into());
+    }
+    if let Some(value) = value.unpack_str() {
+        return Ok(RawAttributeValue::String(value.into()));
+    }
+    if let Some(value) = value.unpack_bool() {
+        return Ok(RawAttributeValue::Bool(value));
+    }
+    if value.get_type() == "int" {
+        let integer = BigInt::unpack_value(value)?.ok_or_else(|| {
+            ModuleFileEvaluationError::UnsupportedTagAttribute {
+                actual: value.get_type(),
+                path: path.to_owned(),
+            }
+        })?;
+        return Ok(RawAttributeValue::Integer(
+            RawInteger::parse_decimal(&integer.to_string()).map_err(|error| {
+                ModuleFileEvaluationError::InvalidExtensionState(error.to_string())
+            })?,
+        ));
+    }
+
+    let sequence: Option<Vec<Value<'v>>> = ListRef::from_value(value)
+        .map(|list| list.iter().collect())
+        .or_else(|| TupleRef::from_value(value).map(|tuple| tuple.iter().collect()));
+    if let Some(sequence) = sequence {
+        let identity = value.identity();
+        if !active.insert(identity) {
+            return Err(ModuleFileEvaluationError::CyclicTagAttribute(path.to_owned()).into());
+        }
+        let result = sequence
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| {
+                convert_tag_attribute_value(item, &format!("{path}[{index}]"), depth + 1, active)
+            })
+            .collect::<buck2_error::Result<Vec<_>>>();
+        active.remove(&identity);
+        return Ok(RawAttributeValue::Sequence(result?.into_boxed_slice()));
+    }
+    if let Some(dict) = DictRef::from_value(value) {
+        let identity = value.identity();
+        if !active.insert(identity) {
+            return Err(ModuleFileEvaluationError::CyclicTagAttribute(path.to_owned()).into());
+        }
+        let result = dict
+            .iter()
+            .map(|(key, item)| {
+                let key = key.unpack_str().ok_or_else(|| {
+                    ModuleFileEvaluationError::InvalidTagDictKey {
+                        actual: key.get_type(),
+                        path: path.to_owned(),
+                    }
+                })?;
+                let item_path = format!("{path}[{key:?}]");
+                Ok((
+                    Box::<str>::from(key),
+                    convert_tag_attribute_value(item, &item_path, depth + 1, active)?,
+                ))
+            })
+            .collect::<buck2_error::Result<Vec<_>>>();
+        active.remove(&identity);
+        return Ok(RawAttributeValue::Dict(
+            OrderedStringDict::new(result?.into_boxed_slice()).map_err(|error| {
+                ModuleFileEvaluationError::InvalidExtensionState(error.to_string())
+            })?,
+        ));
+    }
+    Err(ModuleFileEvaluationError::UnsupportedTagAttribute {
+        actual: value.get_type(),
+        path: path.to_owned(),
+    }
+    .into())
 }
 
 fn validate_repo_name(value: &str) -> buck2_error::Result<()> {
@@ -892,6 +1503,84 @@ fn register_module_file_globals(builder: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
+    fn use_extension<'v>(
+        extension_bzl_file: &str,
+        extension_name: &str,
+        #[starlark(require = named, default = false)] dev_dependency: bool,
+        #[starlark(require = named)] isolate: Option<Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        if isolate.is_some() {
+            let error: buck2_error::Error = ModuleFileEvaluationError::UnsupportedIsolate.into();
+            return Err(error.into());
+        }
+        let location = call_site(eval);
+        let proxy_id = state(eval)?.add_extension_proxy(
+            extension_bzl_file,
+            extension_name,
+            dev_dependency,
+            &location,
+        )?;
+        Ok(eval
+            .heap()
+            .alloc_simple(StarlarkExtensionProxy { proxy_id }))
+    }
+
+    fn use_repo<'v>(
+        #[starlark(require = pos)] extension_proxy: Value<'v>,
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: DictRef<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<NoneType> {
+        let proxy_id = extension_proxy
+            .downcast_ref::<StarlarkExtensionProxy>()
+            .map(|proxy| proxy.proxy_id)
+            .ok_or_else(|| {
+                buck2_error::Error::from(ModuleFileEvaluationError::InvalidExtensionProxy(
+                    extension_proxy.get_type(),
+                ))
+            })?;
+        let state = state(eval)?;
+        let (module_name, module_version) = state.module_identity_strings();
+        let location = call_site(eval);
+        // The proxy is checked first above. Bazel then casts every positional
+        // repository name before it processes and reserves that phase.
+        let positional = args
+            .items
+            .into_iter()
+            .map(|value| {
+                let name = value.unpack_str().ok_or_else(|| {
+                    buck2_error::Error::from(ModuleFileEvaluationError::UseRepoNameType {
+                        actual: value.get_type(),
+                    })
+                })?;
+                Ok((name.to_owned(), name.to_owned()))
+            })
+            .collect::<buck2_error::Result<Vec<_>>>()?;
+        state.add_repo_imports(proxy_id, positional, &location)?;
+
+        // Bazel casts all keyword values before processing the keyword phase.
+        let mut imports = Vec::new();
+        for (local, exported) in kwargs.iter() {
+            let local = local.unpack_str().ok_or_else(|| {
+                buck2_error::Error::from(ModuleFileEvaluationError::UseRepoNameType {
+                    actual: local.get_type(),
+                })
+            })?;
+            let exported = exported.unpack_str().ok_or_else(|| {
+                buck2_error::Error::from(ModuleFileEvaluationError::UseRepoNameType {
+                    actual: exported.get_type(),
+                })
+            })?;
+            let exported = exported
+                .replace("{name}", &module_name)
+                .replace("{version}", &module_version);
+            imports.push((local.to_owned(), exported));
+        }
+        state.add_repo_imports(proxy_id, imports, &location)?;
+        Ok(NoneType)
+    }
+
     fn multiple_version_override<'v>(
         #[starlark(args)] _args: UnpackTuple<Value<'v>>,
         #[starlark(kwargs)] _kwargs: Value<'v>,
@@ -948,7 +1637,8 @@ static NOOP_MODULE_PRINT_HANDLER: NoopModulePrintHandler = NoopModulePrintHandle
 /// Parse, validate, and evaluate one in-memory Bazel `MODULE.bazel` source.
 ///
 /// The evaluator has no loader and adds isolated `print`, `module`, and
-/// `bazel_dep`, `single_version_override`, and `local_path_override` to the
+/// `bazel_dep`, `single_version_override`, `local_path_override`, fail-closed
+/// stubs for other override directives, `use_extension`, and `use_repo` to the
 /// standard Starlark globals. The accumulator is private to this call and is
 /// converted to [`ModuleFile`] only after evaluation and contextual checks
 /// both succeed. Print output is discarded rather than emitted to an ambient
@@ -1021,6 +1711,8 @@ mod tests {
                 "str",
                 "tuple",
                 "type",
+                "use_extension",
+                "use_repo",
                 "zip",
             ]
         );
