@@ -1215,6 +1215,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "buck2_bzlmod"
+version = "0.1.0"
+
+[[package]]
 name = "buck2_certs"
 version = "0.1.0"
 dependencies = [
