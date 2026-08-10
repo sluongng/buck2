@@ -1,0 +1,29 @@
+load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
+load("@fbsource//tools/build_defs:rust_unittest.bzl", "rust_unittest")
+
+oncall("build_infra")
+
+rust_library(
+    name = "buck2_repository",
+    srcs = glob(["src/**/*.rs"]),
+    deps = [
+        "fbsource//third-party/rust:http",
+        "fbsource//third-party/rust:indexmap",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:serde_json",
+        "//buck2/app/buck2_bzlmod:buck2_bzlmod",
+    ],
+)
+
+rust_unittest(
+    name = "buck2_repository_tests",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/lib.rs",
+    deps = [
+        "fbsource//third-party/rust:http",
+        "fbsource//third-party/rust:indexmap",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:serde_json",
+        "//buck2/app/buck2_bzlmod:buck2_bzlmod",
+    ],
+)
