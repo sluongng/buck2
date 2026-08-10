@@ -2647,6 +2647,7 @@ dependencies = [
  "ref-cast",
  "regex",
  "serde",
+ "serde_json",
  "sha2",
  "starlark",
  "starlark_map",

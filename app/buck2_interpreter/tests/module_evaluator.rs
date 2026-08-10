@@ -15,11 +15,15 @@ use buck2_bzlmod::ModuleKey;
 use buck2_bzlmod::ModuleName;
 use buck2_bzlmod::ModuleOverride;
 use buck2_bzlmod::RawAttributeValue;
+use buck2_bzlmod::RepoRuleInvocationEvaluationProjection;
 use buck2_bzlmod::Version;
 use buck2_interpreter::module_evaluator::ModuleFileEvalKind;
 use buck2_interpreter::module_evaluator::ModuleFileEvaluation;
 use buck2_interpreter::module_evaluator::evaluate_module_file;
 use buck2_interpreter::module_evaluator::module_file_global_names_for_audit;
+use serde_json::Value as JsonValue;
+use sha2::Digest;
+use sha2::Sha256;
 
 fn root(source: &str) -> buck2_error::Result<ModuleFile> {
     evaluate_module_file(
@@ -92,6 +96,27 @@ fn assert_rejected(result: buck2_error::Result<ModuleFile>, expected: &str) {
     );
 }
 
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn source_line(location: &str) -> usize {
+    location.split(':').nth(1).unwrap().parse().unwrap()
+}
+
+fn pinned_repo_rule_json(value: &RawAttributeValue) -> JsonValue {
+    match value {
+        RawAttributeValue::String(value) => JsonValue::String(value.to_string()),
+        RawAttributeValue::Bool(value) => JsonValue::Bool(*value),
+        RawAttributeValue::Sequence(values) => {
+            JsonValue::Array(values.iter().map(pinned_repo_rule_json).collect())
+        }
+        RawAttributeValue::Integer(_) | RawAttributeValue::Dict(_) => {
+            panic!("pinned repository-rule fixture only contains string, bool, and sequence values")
+        }
+    }
+}
+
 #[test]
 fn evaluates_pinned_bazel_root_module_snippet() {
     // Derived from Bazel d99d82 ModuleFileFunctionTest.testRootModule.
@@ -139,6 +164,219 @@ bazel_dep(name = "ggg", repo_name = "gee", max_compatibility_level = 5)
         deps[3].repo_name(),
         &DependencyRepoName::Apparent("gee".into())
     );
+}
+
+#[test]
+fn evaluates_digest_pinned_bazel_root_extensions_through_the_registration_gate() {
+    const COMMIT: &str = "d99d82e5d21c2795a6b489342886c336ec05509a";
+    const SOURCE: &str =
+        include_str!("../testcases/bazel/d99d82e5d21c2795a6b489342886c336ec05509a/MODULE.bazel");
+    const REPO_RULE_GOLDEN: &[u8] = include_bytes!(
+        "../testcases/bazel/d99d82e5d21c2795a6b489342886c336ec05509a/repo_rules.json"
+    );
+    const COMBINED_GOLDEN: &[u8] =
+        include_bytes!("../testcases/bazel/d99d82e5d21c2795a6b489342886c336ec05509a/combined.json");
+
+    assert_eq!(SOURCE.len(), 19_810);
+    assert_eq!(
+        sha256(SOURCE.as_bytes()),
+        "fe7dbb51e6164641a989ce9130071010799a4944e69615efde182323a2a6f32d"
+    );
+    assert_eq!(REPO_RULE_GOLDEN.len(), 1_843);
+    assert_eq!(
+        sha256(REPO_RULE_GOLDEN),
+        "1a34874fa85e3985ab9960625c94dec3c9de5901904cf7fa709113ee7478c2c0"
+    );
+    assert_eq!(COMBINED_GOLDEN.len(), 11_514);
+    assert_eq!(
+        sha256(COMBINED_GOLDEN),
+        "f6000910fba4aba112d9734b34d04f9511c9239835731503d27b7c715dd51fcd"
+    );
+    let combined_golden = std::str::from_utf8(COMBINED_GOLDEN).unwrap();
+    assert!(combined_golden.starts_with(&format!(
+        "[\"pinned_root_extension_golden_v1\",\"{COMMIT}\""
+    )));
+    // The combined source manifest additionally retains non-semantic binding
+    // and positional-call syntax that the pure model intentionally omits.
+    // Its digest pins that full source oracle; semantic runtime comparison is
+    // exhaustive for repository rules below and inventory-based for regular
+    // extensions.
+
+    // The full unchanged source gets through every regular and innate
+    // extension call. Registration directives are a principled later-phase
+    // boundary and remain at their original source location.
+    let full_error = root(SOURCE).unwrap_err().to_string();
+    assert!(full_error.contains("register_execution_platforms"));
+    assert!(full_error.contains("MODULE.bazel:505"), "{full_error}");
+
+    let registration = "register_execution_platforms(\"//:default_host_platform\")";
+    let (extension_section, _) = SOURCE.split_once(registration).unwrap();
+    let file = root(extension_section).unwrap();
+    assert_eq!(file.extension_uses().len(), 11);
+    assert_eq!(
+        file.extension_uses()
+            .iter()
+            .map(|use_value| use_value.tags().len())
+            .sum::<usize>(),
+        20
+    );
+    assert_eq!(
+        file.extension_uses()
+            .iter()
+            .flat_map(|use_value| use_value.proxies())
+            .flat_map(|proxy| proxy.imports())
+            .map(|import| import.location().as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        10
+    );
+    assert_eq!(
+        file.extension_uses()
+            .iter()
+            .flat_map(|use_value| use_value.proxies())
+            .map(|proxy| proxy.imports().len())
+            .sum::<usize>(),
+        55
+    );
+
+    assert_eq!(file.repo_rule_uses().len(), 4);
+    assert_eq!(
+        file.repo_rule_uses()
+            .iter()
+            .map(|use_value| use_value.invocations().len())
+            .sum::<usize>(),
+        9
+    );
+
+    let repo_rule_golden: JsonValue = serde_json::from_slice(REPO_RULE_GOLDEN).unwrap();
+    let golden_groups = repo_rule_golden.as_array().unwrap();
+    let expected_factory_lines = [403_u64, 482, 486, 491];
+    let expected_bindings = [
+        "http_file",
+        "list_source_repository",
+        "winsdk_configure",
+        "local_repository",
+    ];
+    assert_eq!(golden_groups.len(), file.repo_rule_uses().len());
+    for (index, (golden_group, use_value)) in
+        golden_groups.iter().zip(file.repo_rule_uses()).enumerate()
+    {
+        let golden_group = golden_group.as_array().unwrap();
+        assert_eq!(golden_group[0].as_str(), Some("repo_rule"));
+        assert_eq!(
+            golden_group[1].as_u64(),
+            Some(expected_factory_lines[index])
+        );
+        assert_eq!(golden_group[2].as_str(), Some(expected_bindings[index]));
+        assert_eq!(
+            golden_group[3].as_str(),
+            Some(use_value.id().bzl_file().as_str())
+        );
+        assert_eq!(
+            golden_group[4].as_str(),
+            Some(use_value.id().rule_name().as_str())
+        );
+
+        let golden_calls = golden_group[5].as_array().unwrap();
+        assert_eq!(golden_calls.len(), use_value.invocations().len());
+        for (golden_call, invocation) in golden_calls.iter().zip(use_value.invocations()) {
+            let golden_call = golden_call.as_array().unwrap();
+            assert_eq!(golden_call[0].as_str(), Some("call"));
+            assert_eq!(
+                golden_call[1].as_u64(),
+                Some(source_line(invocation.location().as_str()) as u64)
+            );
+
+            let golden_attributes = golden_call[2].as_array().unwrap();
+            let structural_name = golden_attributes[0].as_array().unwrap();
+            assert_eq!(structural_name[0].as_str(), Some("name"));
+            assert_eq!(
+                structural_name[1].as_str(),
+                Some(invocation.repository_name().as_str())
+            );
+            assert_eq!(golden_attributes.len(), invocation.attributes().len() + 1);
+            for (golden_attribute, attribute) in
+                golden_attributes[1..].iter().zip(invocation.attributes())
+            {
+                let golden_attribute = golden_attribute.as_array().unwrap();
+                assert_eq!(golden_attribute[0].as_str(), Some(attribute.name()));
+                assert_eq!(
+                    golden_attribute[1],
+                    pinned_repo_rule_json(attribute.value())
+                );
+            }
+        }
+    }
+
+    assert_eq!(
+        file.repo_rule_uses()
+            .iter()
+            .map(|use_value| (
+                use_value.id().bzl_file().as_str(),
+                use_value.id().rule_name().as_str(),
+                use_value.invocations().len()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "@bazel_tools//tools/build_defs/repo:http.bzl",
+                "http_file",
+                6
+            ),
+            (
+                "//src/test/shell/bazel:list_source_repository.bzl",
+                "list_source_repository",
+                1
+            ),
+            ("//tools/res:winsdk_configure.bzl", "winsdk_configure", 1),
+            (
+                "@bazel_tools//tools/build_defs/repo:local.bzl",
+                "local_repository",
+                1
+            ),
+        ]
+    );
+    assert_eq!(
+        file.repo_rule_uses()
+            .iter()
+            .flat_map(|use_value| use_value.invocations())
+            .map(|invocation| source_line(invocation.location().as_str()))
+            .collect::<Vec<_>>(),
+        [406, 413, 420, 427, 434, 441, 484, 488, 493]
+    );
+    assert_eq!(
+        file.repo_rule_uses()[0]
+            .invocations()
+            .iter()
+            .map(|invocation| invocation.repository_name().as_str())
+            .collect::<Vec<_>>(),
+        [
+            "jq_linux_amd64",
+            "jq_linux_arm64",
+            "jq_linux_s390x",
+            "jq_macos_amd64",
+            "jq_macos_arm64",
+            "jq_windows_amd64",
+        ]
+    );
+    assert!(
+        file.repo_rule_uses()
+            .iter()
+            .flat_map(|use_value| use_value.invocations())
+            .all(|invocation| !invocation.is_dev_dependency())
+    );
+    let first = &file.repo_rule_uses()[0].invocations()[0];
+    assert_eq!(
+        first
+            .attributes()
+            .iter()
+            .map(|attribute| attribute.name())
+            .collect::<Vec<_>>(),
+        ["executable", "integrity", "urls"]
+    );
+    let last = &file.repo_rule_uses()[3].invocations()[0];
+    assert_eq!(last.repository_name().as_str(), "kythe_release");
+    assert_eq!(last.attributes()[0].name(), "path");
 }
 
 #[test]
@@ -504,6 +742,7 @@ fn exact_global_surface_includes_only_isolated_phase_two_capabilities() {
             "type",
             "use_extension",
             "use_repo",
+            "use_repo_rule",
             "zip",
         ]
     );
@@ -551,13 +790,252 @@ fn build_action_filesystem_and_network_globals_are_absent() {
 #[test]
 fn later_phase_module_directives_fail_explicitly() {
     for directive in [
-        "use_repo_rule(\"//:repo.bzl\", \"repo_rule\")",
         "register_toolchains(\"//:toolchain\")",
         "register_execution_platforms(\"//:platform\")",
     ] {
         let name = directive.split_once('(').unwrap().0;
         assert_rejected(root(directive), &format!("Variable `{name}` not found"));
     }
+}
+
+#[test]
+fn repo_rule_proxies_are_binding_agnostic_and_aggregate_by_structural_owner_identity() {
+    let file = root(
+        r#"
+assigned = use_repo_rule("opaque bzl", "_private rule")
+assigned(name = "one", value = 1)
+alias = assigned
+alias(name = "two", value = ["x", True])
+use_repo_rule("opaque bzl", "_private rule")(name = "three")
+unused = use_repo_rule("//:unused.bzl", "unused")
+left = use_repo_rule("a b", "c")
+right = use_repo_rule("a", "b c")
+left(name = "left")
+right(name = "right")
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(file.repo_rule_uses().len(), 3);
+    let aggregate = &file.repo_rule_uses()[0];
+    assert_eq!(aggregate.id().owner(), &ModuleKey::ROOT);
+    assert_eq!(aggregate.id().bzl_file().as_str(), "opaque bzl");
+    assert_eq!(aggregate.id().rule_name().as_str(), "_private rule");
+    assert_eq!(aggregate.first_use_ordinal(), 0);
+    assert_eq!(
+        aggregate
+            .invocations()
+            .iter()
+            .map(|value| (value.ordinal(), value.repository_name().as_str()))
+            .collect::<Vec<_>>(),
+        [(1, "one"), (2, "two"), (4, "three")]
+    );
+    assert_eq!(
+        aggregate.invocations()[0].location().as_str(),
+        "MODULE.bazel:3:1-34"
+    );
+    assert_eq!(
+        aggregate.invocations()[1].location().as_str(),
+        "MODULE.bazel:5:1-41"
+    );
+    assert_eq!(
+        aggregate.invocations()[2].location().as_str(),
+        "MODULE.bazel:6:1-61"
+    );
+
+    // Keep the raw tuple structurally typed instead of reproducing Bazel's
+    // unchecked space-delimited identity collision for invalid spellings.
+    assert_eq!(file.repo_rule_uses()[1].id().bzl_file().as_str(), "a b");
+    assert_eq!(file.repo_rule_uses()[1].id().rule_name().as_str(), "c");
+    assert_eq!(file.repo_rule_uses()[2].id().bzl_file().as_str(), "a");
+    assert_eq!(file.repo_rule_uses()[2].id().rule_name().as_str(), "b c");
+}
+
+#[test]
+fn repo_rule_identity_is_scoped_to_the_evaluated_module_owner() {
+    let root_file = root("r = use_repo_rule(\"\", \"\")\nr(name = \"root_repo\")").unwrap();
+    let dependency_file = dependency(
+        "module(name = \"dep\", version = \"1.0\")\n\
+         r = use_repo_rule(\"\", \"\")\n\
+         r(name = \"dep_repo\")",
+        "dep",
+        "1.0",
+    )
+    .unwrap();
+    let root_id = root_file.repo_rule_uses()[0].id();
+    let dependency_id = dependency_file.repo_rule_uses()[0].id();
+    assert_eq!(root_id.bzl_file().as_str(), "");
+    assert_eq!(root_id.rule_name().as_str(), "");
+    assert_ne!(root_id, dependency_id);
+    assert_eq!(root_id.owner(), &ModuleKey::ROOT);
+    assert_eq!(dependency_id.owner().to_string(), "dep@1.0");
+}
+
+#[test]
+fn repo_rule_calls_derive_fixed_tag_and_import_projections_from_raw_arguments() {
+    let file = root(
+        r#"
+r = use_repo_rule("//:repo.bzl", "rule")
+r(name = "z_dev", dev_dependency = True, first = 1)
+r(name = "z", sequence = ["x", (True, False)], mapping = {"k": 2})
+r(name = "a_dev", dev_dependency = True)
+r(name = "a", huge = 123456789012345678901234567890)
+"#,
+    )
+    .unwrap();
+    let [use_value] = file.repo_rule_uses() else {
+        panic!("expected one repository rule use")
+    };
+    assert_eq!(use_value.invocations().len(), 4);
+    assert!(use_value.invocations()[0].is_dev_dependency());
+    assert_eq!(use_value.invocations()[0].attributes()[0].name(), "first");
+    assert_eq!(use_value.invocations()[1].attributes().len(), 2);
+    assert_eq!(
+        use_value.invocations()[3].attributes()[0].value(),
+        &RawAttributeValue::Integer(
+            buck2_bzlmod::RawInteger::parse_decimal("123456789012345678901234567890").unwrap()
+        )
+    );
+
+    let evaluation = use_value.evaluation_projection();
+    assert_eq!(RepoRuleInvocationEvaluationProjection::TAG_NAME, "repo");
+    assert_eq!(
+        evaluation.invocations()[0]
+            .attributes()
+            .last()
+            .unwrap()
+            .name(),
+        "name"
+    );
+    assert_eq!(
+        evaluation.invocations()[0].repository_name().as_str(),
+        "z_dev"
+    );
+    let mapping = use_value.repository_mapping_projection();
+    assert_eq!(
+        mapping
+            .regular_imports()
+            .iter()
+            .map(|value| (value.local_name().as_str(), value.exported_name().as_str()))
+            .collect::<Vec<_>>(),
+        [("a", "a"), ("z", "z")]
+    );
+    assert_eq!(
+        mapping
+            .dev_imports()
+            .iter()
+            .map(|value| value.local_name().as_str())
+            .collect::<Vec<_>>(),
+        ["a_dev", "z_dev"]
+    );
+}
+
+#[test]
+fn ignored_repo_rule_dev_calls_validate_name_but_only_leave_event_gaps() {
+    let file = root_ignoring_dev(
+        r#"
+r = use_repo_rule("not a label", "not a rule")
+r(name = "ignored", dev_dependency = True, unsupported = len)
+r(name = "kept", value = 1)
+"#,
+    )
+    .unwrap();
+    let [use_value] = file.repo_rule_uses() else {
+        panic!("expected retained repository rule use")
+    };
+    assert_eq!(use_value.first_use_ordinal(), 0);
+    assert_eq!(use_value.invocations()[0].ordinal(), 2);
+    assert_eq!(
+        use_value.invocations()[0].repository_name().as_str(),
+        "kept"
+    );
+
+    assert_rejected(
+        root_ignoring_dev(
+            "r = use_repo_rule(\"bad\", \"bad\")\n\
+             r(name = \"_invalid\", dev_dependency = True, unsupported = len)",
+        ),
+        "invalid user-provided repo name '_invalid'",
+    );
+    assert_rejected(
+        root(
+            "r = use_repo_rule(\"bad\", \"bad\")\n\
+             r(name = \"regular\", unsupported = len)",
+        ),
+        "unsupported module extension tag attribute value",
+    );
+
+    let dependency = dependency(
+        r#"
+module(name = "dep", version = "1.0")
+r = use_repo_rule("bad", "bad")
+r(name = "ignored", dev_dependency = True, unsupported = len)
+"#,
+        "dep",
+        "1.0",
+    )
+    .unwrap();
+    assert!(dependency.repo_rule_uses().is_empty());
+}
+
+#[test]
+fn repo_rule_call_shape_and_global_name_collisions_are_restricted() {
+    root(
+        "r = use_repo_rule(repo_rule_bzl_file = \"x\", repo_rule_name = \"r\")\n\
+         r(name = \"named_factory\")",
+    )
+    .unwrap();
+    for (source, expected) in [
+        (
+            "r = use_repo_rule(\"//:r.bzl\", \"r\")\nr()",
+            "requires named-only parameter 'name'",
+        ),
+        (
+            "r = use_repo_rule(\"//:r.bzl\", \"r\")\nr(\"x\")",
+            "positional",
+        ),
+        (
+            "r = use_repo_rule(\"//:r.bzl\", \"r\")\nr(name = 1)",
+            "parameter 'name' got value of type 'int'",
+        ),
+        (
+            "r = use_repo_rule(\"//:r.bzl\", \"r\")\nr(dev_dependency = 1)",
+            "parameter 'dev_dependency' got value of type 'int'",
+        ),
+        (
+            "r = use_repo_rule(\"//:r.bzl\", \"r\")\nr(\"x\", name = 1)",
+            "parameter 'name' got value of type 'int'",
+        ),
+    ] {
+        assert_rejected(root(source), expected);
+    }
+
+    for source in [
+        "module(name = \"same\")\nr = use_repo_rule(\"x\", \"r\")\nr(name = \"same\")",
+        "bazel_dep(name = \"dep\", repo_name = \"same\")\nr = use_repo_rule(\"x\", \"r\")\nr(name = \"same\")",
+        "e = use_extension(\"//:e.bzl\", \"e\")\nuse_repo(e, \"same\")\nr = use_repo_rule(\"x\", \"r\")\nr(name = \"same\")",
+        "one = use_repo_rule(\"x\", \"r\")\ntwo = use_repo_rule(\"y\", \"r\")\none(name = \"same\")\ntwo(name = \"same\")",
+    ] {
+        assert_rejected(root(source), "repo name 'same'");
+    }
+
+    assert_rejected(
+        root(
+            "bazel_dep(name = \"dep\", repo_name = \"same\")\n\
+             r = use_repo_rule(\"x\", \"r\")\n\
+             r(name = \"same\", unsupported = len)",
+        ),
+        "repo name 'same'",
+    );
+
+    // An ignored invocation neither reserves its valid name nor converts its
+    // unsupported attributes.
+    root_ignoring_dev(
+        "r = use_repo_rule(\"x\", \"r\")\n\
+         r(name = \"same\", dev_dependency = True, unsupported = len)\n\
+         bazel_dep(name = \"dep\", repo_name = \"same\")",
+    )
+    .unwrap();
 }
 
 #[test]
