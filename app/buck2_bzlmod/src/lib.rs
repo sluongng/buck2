@@ -17,6 +17,7 @@ mod declaration;
 mod module_extension;
 mod module_key;
 mod module_name;
+mod module_registration;
 mod repo_rule;
 mod version;
 
@@ -64,6 +65,9 @@ pub use module_key::ModuleKey;
 pub use module_key::ModuleKeyParseError;
 pub use module_name::ModuleName;
 pub use module_name::ModuleNameParseError;
+pub use module_registration::ModuleRegistrations;
+pub use module_registration::RawAbsoluteTargetPattern;
+pub use module_registration::RawAbsoluteTargetPatternParseError;
 pub use repo_rule::RepoRuleBzlFile;
 pub use repo_rule::RepoRuleEvaluationProjection;
 pub use repo_rule::RepoRuleImportProjection;

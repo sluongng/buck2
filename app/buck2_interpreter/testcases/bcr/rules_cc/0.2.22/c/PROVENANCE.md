@@ -42,7 +42,10 @@ Selected source hashes:
 
 ## Test boundary
 
-The test verifies exact source hashes and parses these current C-facing `.bzl`
-files with Buck2's production Bazel `.bzl` policy. It is syntax-only: it does
-not resolve BCR modules or `load()` labels, instantiate Bazel application
-globals, configure C toolchains, or build C targets.
+The syntax corpus verifies exact source hashes and parses these current
+C-facing `.bzl` files with Buck2's production Bazel `.bzl` policy. The isolated
+module evaluator also digest-pins the exact registry `MODULE.bazel`, evaluates
+its prefix through the source registration records, and confirms that full
+evaluation stops at the currently unsupported `archive_override` directive.
+Neither test resolves BCR modules or `load()` labels, loads extensions, expands
+registered target patterns, configures C toolchains, or builds C targets.

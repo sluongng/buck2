@@ -85,6 +85,7 @@ rust_unittest(
     name = "module_evaluator_tests",
     srcs = ["tests/module_evaluator.rs"] + glob([
         "testcases/bazel/**",
+        "testcases/bcr/**",
     ]),
     crate_root = "tests/module_evaluator.rs",
     deps = [

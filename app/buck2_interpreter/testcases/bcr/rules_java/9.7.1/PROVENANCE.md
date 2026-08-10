@@ -33,8 +33,10 @@ exact files from the integrity-verified release archive.
 - `LICENSE`:
   `c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4`
 
-`MODULE.bazel` is retained only as provenance. The corpus does not parse it as
-a BUILD or `.bzl` file and does not claim bzlmod support.
+The isolated module evaluator digest-pins both identical `MODULE.bazel` copies,
+evaluates the registry source through its registration comprehensions, and
+confirms that full evaluation stops at the currently unsupported
+`archive_override` directive.
 
 ## Parsed syntax fixtures
 
@@ -55,7 +57,8 @@ including `java/repositories.bzl`, `java/private/legacy_native.bzl`,
 
 ## Test boundary
 
-The test verifies file digests and parses these four selected files with the
-production Bazel dialect policy for their actual file kinds. It does not
-resolve modules or `load()` statements, evaluate Bazel application globals,
+The syntax test verifies file digests and parses these four selected files with
+the production Bazel dialect policy for their actual file kinds. The module
+evaluation described above is isolated and does not resolve modules or
+`load()` statements, load extensions, expand registered target patterns,
 instantiate Java rules or toolchains, or build Java targets.
