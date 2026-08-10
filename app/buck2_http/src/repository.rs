@@ -26,6 +26,12 @@ use crate::HttpClient;
 use crate::HttpError;
 use crate::client::DEFAULT_USER_AGENT;
 
+mod network;
+pub(crate) use network::PeerCheckedConnector;
+pub use network::RepositoryClientBuildError;
+pub use network::RepositoryNetworkPolicy;
+pub(crate) use network::RepositoryResolver;
+
 const DEFAULT_MAX_REDIRECTS: usize = 10;
 const DEFAULT_MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -232,10 +238,8 @@ impl fmt::Display for RepositoryRequestHookError {
 /// hooks run, only the same conditional/content-negotiation allowlist accepted
 /// from callers is retained. Custom and credential headers are HTTPS-only.
 ///
-/// These hooks observe URI hops, not connector-resolved socket addresses. The
-/// current Hyper connector does not expose each selected endpoint, so callers
-/// that need IP-range policy must use a connector that enforces it at connect
-/// time.
+/// These hooks observe URI hops. `RepositoryHttpClient` separately checks all
+/// resolver candidates and the connected socket peer before TLS begins.
 pub trait RepositoryRequestHooks: Send + Sync {
     fn validate_uri(
         &self,
@@ -259,7 +263,21 @@ pub struct NoRepositoryRequestHooks;
 
 impl RepositoryRequestHooks for NoRepositoryRequestHooks {}
 
-impl HttpClient {
+/// An HTTP client whose connector enforces repository network boundaries.
+///
+/// This type exposes only the bounded repository request APIs. It cannot be
+/// converted to or dereferenced as a generic `HttpClient`, preventing callers
+/// from bypassing repository request policy after checked construction.
+#[derive(Clone)]
+pub struct RepositoryHttpClient {
+    inner: HttpClient,
+}
+
+impl RepositoryHttpClient {
+    pub(crate) fn new(inner: HttpClient) -> Self {
+        Self { inner }
+    }
+
     /// Send a policy-checked GET whose returned body cannot exceed the
     /// configured byte limit.
     pub async fn repository_get<'a>(
@@ -316,6 +334,7 @@ impl HttpClient {
             );
 
             let response = self
+                .inner
                 .send_request_impl_with_diagnostic_uri(request, diagnostic_uri.clone())
                 .await?;
             if is_redirect(response.status())
@@ -697,6 +716,15 @@ mod tests {
 
     use super::*;
 
+    async fn repository_client() -> buck2_error::Result<RepositoryHttpClient> {
+        buck2_certs::certs::maybe_setup_cryptography();
+        Ok(crate::HttpClientBuilder::https_with_system_roots()
+            .await?
+            .build_repository(
+                RepositoryNetworkPolicy::default().with_allow_explicit_loopback(true),
+            )?)
+    }
+
     #[test]
     fn redacted_uri_hides_query_and_user_info() {
         let uri: Uri = "https://user:secret@example.com/archive?token=secret"
@@ -759,9 +787,7 @@ mod tests {
                 .times(0)
                 .respond_with(responders::status_code(200)),
         );
-        let client = crate::HttpClientBuilder::https_with_system_roots()
-            .await?
-            .build();
+        let client = repository_client().await?;
         let result = client
             .repository_get(
                 &server.url_str("/never"),
@@ -776,6 +802,60 @@ mod tests {
                 ..
             })
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_private_literal_before_connect() -> buck2_error::Result<()> {
+        buck2_certs::certs::maybe_setup_cryptography();
+        let client = crate::HttpClientBuilder::https_with_system_roots()
+            .await?
+            .build_repository(RepositoryNetworkPolicy::default())?;
+        let result = client
+            .repository_get(
+                "https://192.168.1.1/archive?token=query-secret",
+                HeaderMap::new(),
+                &RepositoryHttpPolicy::default(),
+            )
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("private literal must fail before connect"),
+        };
+        let rendered = format!("{error:?}");
+        assert!(rendered.contains("repository destination IP address is forbidden"));
+        assert!(!rendered.contains("query-secret"));
+        assert!(!rendered.contains("token"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redirect_to_private_literal_is_rejected_and_redacted() -> buck2_error::Result<()> {
+        let server = httptest::Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/redirect")).respond_with(
+                responders::status_code(302).append_header(
+                    header::LOCATION,
+                    "https://192.168.1.1/Bearer-location-secret?token=query-secret",
+                ),
+            ),
+        );
+        let client = repository_client().await?;
+        let result = client
+            .repository_get(
+                &server.url_str("/redirect"),
+                HeaderMap::new(),
+                &RepositoryHttpPolicy::default().with_allow_http(true),
+            )
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("private redirect must fail before connect"),
+        };
+        let rendered = format!("{error:?}");
+        assert!(rendered.contains("https://192.168.1.1/<redirected>"));
+        assert!(!rendered.contains("location-secret"));
+        assert!(!rendered.contains("query-secret"));
         Ok(())
     }
 
@@ -803,9 +883,7 @@ mod tests {
     #[tokio::test]
     async fn hook_rejection_redacts_uri() -> buck2_error::Result<()> {
         buck2_certs::certs::maybe_setup_cryptography();
-        let client = crate::HttpClientBuilder::https_with_system_roots()
-            .await?
-            .build();
+        let client = repository_client().await?;
         let result = client
             .repository_get_with_hooks(
                 "https://example.com/archive?token=secret",
@@ -975,9 +1053,7 @@ mod tests {
             header::TRANSFER_ENCODING,
             HeaderValue::from_static("chunked"),
         );
-        let client = crate::HttpClientBuilder::https_with_system_roots()
-            .await?
-            .build();
+        let client = repository_client().await?;
         client
             .repository_get_with_hooks(
                 &source.url_str("/start"),
@@ -1050,9 +1126,7 @@ mod tests {
             ])
             .respond_with(responders::status_code(200)),
         );
-        let client = crate::HttpClientBuilder::https_with_system_roots()
-            .await?
-            .build();
+        let client = repository_client().await?;
         client
             .repository_get_with_hooks(
                 &server.url_str("/same-start"),
@@ -1082,9 +1156,7 @@ mod tests {
                 .times(0)
                 .respond_with(responders::status_code(200)),
         );
-        let client = crate::HttpClientBuilder::https_with_system_roots()
-            .await?
-            .build();
+        let client = repository_client().await?;
         let result = client
             .repository_get(
                 &server.url_str("/one"),
@@ -1120,9 +1192,7 @@ mod tests {
             Expectation::matching(request::method_path("GET", "/gone"))
                 .respond_with(responders::status_code(410)),
         );
-        let client = crate::HttpClientBuilder::https_with_system_roots()
-            .await?
-            .build();
+        let client = repository_client().await?;
         let policy = RepositoryHttpPolicy::default().with_allow_http(true);
         let missing_result = client
             .repository_get(&server.url_str("/missing"), HeaderMap::new(), &policy)
@@ -1151,9 +1221,7 @@ mod tests {
             Expectation::matching(request::method_path("GET", "/large"))
                 .respond_with(responders::status_code(200).body("too large")),
         );
-        let client = crate::HttpClientBuilder::https_with_system_roots()
-            .await?
-            .build();
+        let client = repository_client().await?;
         let result = client
             .repository_get(
                 &server.url_str("/large"),
@@ -1222,9 +1290,7 @@ mod tests {
             ])
             .respond_with(responders::status_code(404).body("Bearer authorization-secret")),
         );
-        let client = crate::HttpClientBuilder::https_with_system_roots()
-            .await?
-            .build();
+        let client = repository_client().await?;
         let result = client
             .repository_get_with_hooks(
                 &format!("{}?token=secret", server.url_str("/missing")),
@@ -1260,9 +1326,7 @@ mod tests {
             Expectation::matching(request::method_path("GET", "/Bearer-location-secret"))
                 .respond_with(responders::status_code(404)),
         );
-        let client = crate::HttpClientBuilder::https_with_system_roots()
-            .await?
-            .build();
+        let client = repository_client().await?;
         let result = client
             .repository_get(
                 &server.url_str("/redirect"),
@@ -1300,7 +1364,9 @@ mod tests {
         let client = crate::HttpClientBuilder::https_with_system_roots()
             .await?
             .with_connect_timeout(Some(std::time::Duration::from_secs(1)))
-            .build();
+            .build_repository(
+                RepositoryNetworkPolicy::default().with_allow_explicit_loopback(true),
+            )?;
         let result = client
             .repository_get(
                 &server.url_str("/redirect"),

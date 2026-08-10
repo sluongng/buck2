@@ -25,6 +25,7 @@ use hyper_rustls::HttpsConnectorBuilder;
 use hyper_timeout::TimeoutConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::connect::dns::GaiResolver;
 use hyper_util::rt::TokioExecutor;
 use rustls::ClientConfig;
 use tokio::sync::Semaphore;
@@ -34,6 +35,11 @@ use tower_service::Service as TowerService;
 use super::HttpClient;
 use super::RequestClient;
 use crate::proxy;
+use crate::repository::PeerCheckedConnector;
+use crate::repository::RepositoryClientBuildError;
+use crate::repository::RepositoryHttpClient;
+use crate::repository::RepositoryNetworkPolicy;
+use crate::repository::RepositoryResolver;
 use crate::stats::HttpNetworkStats;
 use crate::x2p;
 
@@ -298,8 +304,43 @@ impl HttpClientBuilder {
     }
 
     pub fn build(&self) -> HttpClient {
+        self.finish(self.build_inner())
+    }
+
+    /// Build a direct HTTP client with immutable repository network checks.
+    ///
+    /// Proxy and VPNless configurations fail closed because those transports
+    /// resolve or connect to the repository origin outside this process.
+    pub fn build_repository(
+        &self,
+        network_policy: RepositoryNetworkPolicy,
+    ) -> Result<RepositoryHttpClient, RepositoryClientBuildError> {
+        if self.supports_vpnless {
+            return Err(RepositoryClientBuildError::VpnlessUnsupported);
+        }
+        if !self.proxies.is_empty() {
+            return Err(RepositoryClientBuildError::ProxyUnsupported);
+        }
+
+        let resolver = RepositoryResolver::new(GaiResolver::new(), network_policy.clone());
+        let mut connector = HttpConnector::new_with_resolver(resolver);
+        connector.enforce_http(false);
+        let connector = PeerCheckedConnector::new(connector, network_policy);
+        let https_connector = wrap_https_connector(self.tls_config.clone(), self.http2, connector);
+        let inner: Arc<dyn RequestClient> = if let Some(timeout_config) = &self.timeout_config {
+            Arc::new(
+                Client::builder(TokioExecutor::new())
+                    .build(timeout_config.to_connector(https_connector)),
+            )
+        } else {
+            Arc::new(Client::builder(TokioExecutor::new()).build(https_connector))
+        };
+        Ok(RepositoryHttpClient::new(self.finish(inner)))
+    }
+
+    fn finish(&self, inner: Arc<dyn RequestClient>) -> HttpClient {
         HttpClient {
-            inner: self.build_inner(),
+            inner,
             max_redirects: self.max_redirects,
             supports_vpnless: self.supports_vpnless,
             http2: self.http2,
@@ -321,6 +362,23 @@ fn build_https_connector(tls_config: ClientConfig, http2: bool) -> HttpsConnecto
         builder.enable_http2().build()
     } else {
         builder.build()
+    }
+}
+
+fn wrap_https_connector<C>(
+    tls_config: ClientConfig,
+    http2: bool,
+    connector: C,
+) -> HttpsConnector<C> {
+    let builder = HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config)
+        .https_or_http()
+        .enable_http1();
+
+    if http2 {
+        builder.enable_http2().wrap_connector(connector)
+    } else {
+        builder.wrap_connector(connector)
     }
 }
 
@@ -419,6 +477,38 @@ mod tests {
         builder.with_proxy(proxy);
 
         assert_eq!(1, builder.proxies.len());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repository_builder_accepts_only_direct_transport() -> buck2_error::Result<()> {
+        buck2_certs::certs::maybe_setup_cryptography();
+        let mut direct = HttpClientBuilder::https_with_system_roots().await?;
+        direct.with_connect_timeout(Some(Duration::from_secs(1)));
+        assert!(
+            direct
+                .build_repository(RepositoryNetworkPolicy::default())
+                .is_ok()
+        );
+
+        let mut proxied = HttpClientBuilder::https_with_system_roots().await?;
+        proxied
+            .with_connect_timeout(Some(Duration::from_secs(1)))
+            .with_proxy(Proxy::new(
+                Intercept::All,
+                "http://user:secret@localhost:12345".try_into()?,
+            ));
+        assert!(matches!(
+            proxied.build_repository(RepositoryNetworkPolicy::default()),
+            Err(RepositoryClientBuildError::ProxyUnsupported)
+        ));
+
+        let mut vpnless = HttpClientBuilder::https_with_system_roots().await?;
+        vpnless.with_supports_vpnless();
+        assert!(matches!(
+            vpnless.build_repository(RepositoryNetworkPolicy::default()),
+            Err(RepositoryClientBuildError::VpnlessUnsupported)
+        ));
         Ok(())
     }
 
