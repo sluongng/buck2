@@ -69,3 +69,12 @@ rust_unittest(
         "//buck2/starlark-rust/starlark:starlark",
     ],
 )
+
+rust_unittest(
+    name = "module_file_tests",
+    srcs = ["tests/module_file.rs"],
+    crate_root = "tests/module_file.rs",
+    deps = [
+        ":buck2_interpreter",
+    ],
+)
