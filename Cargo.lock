@@ -2581,6 +2581,7 @@ name = "buck2_http"
 version = "0.1.0"
 dependencies = [
  "allocative",
+ "async-trait",
  "buck2_certs",
  "buck2_error",
  "bytes",

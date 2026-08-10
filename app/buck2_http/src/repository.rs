@@ -10,6 +10,7 @@
 
 use std::fmt;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -171,6 +172,15 @@ impl RepositoryHttpPolicy {
                 reason: "URI has no authority",
             });
         }
+        if next
+            .authority()
+            .is_some_and(|authority| authority.as_str().contains('@'))
+        {
+            return Err(HttpError::RepositoryPolicy {
+                uri,
+                reason: "URI user information is forbidden",
+            });
+        }
         if previous.and_then(Uri::scheme_str) == Some("https") && scheme == "http" {
             return Err(HttpError::RepositoryPolicy {
                 uri,
@@ -229,19 +239,22 @@ impl fmt::Display for RepositoryRequestHookError {
 
 /// Hooks run before the initial request and before every effective redirect.
 ///
-/// `validate_uri` can enforce caller-specific origin policy. On a cross-origin
-/// redirect all carried headers are discarded before `prepare_headers` runs,
-/// allowing credentials to be resolved for the destination rather than copied
-/// from the source.
+/// `validate_uri` can enforce caller-specific origin policy. Each HTTPS hop
+/// prepares headers from a fresh copy of the sanitized caller headers, so
+/// helper-provided credentials cannot persist when a later call omits them. On
+/// a cross-origin redirect even that caller-header baseline is discarded before
+/// `prepare_headers` runs.
 ///
-/// Plain HTTP is restricted to loopback and is always unauthenticated: after
-/// hooks run, only the same conditional/content-negotiation allowlist accepted
-/// from callers is retained. Custom and credential headers are HTTPS-only.
+/// Plain HTTP is restricted to loopback and is always unauthenticated:
+/// `validate_uri` runs, but `prepare_headers` does not. Only the
+/// conditional/content-negotiation allowlist accepted from callers is sent.
 ///
 /// These hooks observe URI hops. `RepositoryHttpClient` separately checks all
-/// resolver candidates and the connected socket peer before TLS begins.
+/// resolver candidates and the connected socket peer before TLS begins. Hook
+/// implementations may await external credential helpers without blocking.
+#[async_trait]
 pub trait RepositoryRequestHooks: Send + Sync {
-    fn validate_uri(
+    async fn validate_uri(
         &self,
         _previous: Option<&Uri>,
         _next: &Uri,
@@ -249,7 +262,7 @@ pub trait RepositoryRequestHooks: Send + Sync {
         Ok(())
     }
 
-    fn prepare_headers(
+    async fn prepare_headers(
         &self,
         _uri: &Uri,
         _headers: &mut HeaderMap,
@@ -261,6 +274,7 @@ pub trait RepositoryRequestHooks: Send + Sync {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct NoRepositoryRequestHooks;
 
+#[async_trait]
 impl RepositoryRequestHooks for NoRepositoryRequestHooks {}
 
 /// An HTTP client whose connector enforces repository network boundaries.
@@ -306,14 +320,13 @@ impl RepositoryHttpClient {
         let mut diagnostic_uri = initial.clone();
         policy.validate_hop(None, &current)?;
         sanitize_caller_headers(&mut headers);
-        run_hooks(hooks, None, &current, &mut headers, &diagnostic_uri)?;
+        let mut caller_headers = headers;
+        let mut headers =
+            prepare_request_headers(hooks, None, &current, &caller_headers, &diagnostic_uri)
+                .await?;
 
         let mut redirects = 0;
         loop {
-            sanitize_effective_headers(&mut headers);
-            if current.scheme_str() == Some("http") {
-                sanitize_caller_headers(&mut headers);
-            }
             let mut builder = Request::builder()
                 .method(Method::GET)
                 .uri(current.clone())
@@ -351,14 +364,18 @@ impl RepositoryHttpClient {
                 let next = with_redirect(&current, location)?;
                 let next_diagnostic_uri = redact_redirect_uri(&next);
                 policy.validate_redirect_hop(&current, &next)?;
-                apply_redirect_origin_boundary(&current, &next, &mut headers);
-                run_hooks(
+                // The response body holds the concurrent-request permit. Hooks
+                // may re-enter this client, so release it before awaiting them.
+                drop(response);
+                apply_redirect_origin_boundary(&current, &next, &mut caller_headers);
+                headers = prepare_request_headers(
                     hooks,
                     Some(&current),
                     &next,
-                    &mut headers,
+                    &caller_headers,
                     &next_diagnostic_uri,
-                )?;
+                )
+                .await?;
                 current = next;
                 diagnostic_uri = next_diagnostic_uri;
                 redirects += 1;
@@ -382,25 +399,32 @@ impl RepositoryHttpClient {
     }
 }
 
-fn run_hooks(
+async fn prepare_request_headers(
     hooks: &dyn RepositoryRequestHooks,
     previous: Option<&Uri>,
     next: &Uri,
-    headers: &mut HeaderMap,
+    caller_headers: &HeaderMap,
     diagnostic_uri: &str,
-) -> Result<(), HttpError> {
+) -> Result<HeaderMap, HttpError> {
     hooks
         .validate_uri(previous, next)
+        .await
         .map_err(|kind| HttpError::RepositoryRequestHook {
             uri: diagnostic_uri.to_owned(),
             kind,
         })?;
-    hooks
-        .prepare_headers(next, headers)
-        .map_err(|kind| HttpError::RepositoryRequestHook {
-            uri: diagnostic_uri.to_owned(),
-            kind,
-        })
+    let mut headers = caller_headers.clone();
+    if next.scheme_str() == Some("https") {
+        hooks
+            .prepare_headers(next, &mut headers)
+            .await
+            .map_err(|kind| HttpError::RepositoryRequestHook {
+                uri: diagnostic_uri.to_owned(),
+                kind,
+            })?;
+    }
+    sanitize_effective_headers(&mut headers);
+    Ok(headers)
 }
 
 fn finish_response<'a>(
@@ -707,6 +731,9 @@ fn apply_redirect_origin_boundary(current: &Uri, next: &Uri, headers: &mut Heade
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::task::Poll;
 
     use futures::TryStreamExt;
     use http::HeaderValue;
@@ -870,8 +897,9 @@ mod tests {
 
     struct RejectingHooks;
 
+    #[async_trait]
     impl RepositoryRequestHooks for RejectingHooks {
-        fn validate_uri(
+        async fn validate_uri(
             &self,
             _previous: Option<&Uri>,
             _next: &Uri,
@@ -928,8 +956,9 @@ mod tests {
         observed_headers: Mutex<Vec<HeaderMap>>,
     }
 
+    #[async_trait]
     impl RepositoryRequestHooks for RecordingHooks {
-        fn prepare_headers(
+        async fn prepare_headers(
             &self,
             uri: &Uri,
             headers: &mut HeaderMap,
@@ -976,55 +1005,6 @@ mod tests {
 
     #[tokio::test]
     async fn cross_origin_redirect_clears_headers_before_hook() -> buck2_error::Result<()> {
-        buck2_certs::certs::maybe_setup_cryptography();
-        let destination = httptest::Server::run();
-        let destination_host = destination.url("/").authority().unwrap().to_string();
-        destination.expect(
-            Expectation::matching(all_of![
-                request::method_path("GET", "/finish"),
-                request::headers(not(contains(key(header::AUTHORIZATION.as_str())))),
-                request::headers(not(contains(key(header::COOKIE.as_str())))),
-                request::headers(not(contains(key("x-api-key")))),
-                request::headers(not(contains(key("x-connection-secret")))),
-                request::headers(not(contains(key(header::CONNECTION.as_str())))),
-                request::headers(not(contains((header::CONTENT_LENGTH.as_str(), "999")))),
-                request::headers(not(contains((
-                    header::TRANSFER_ENCODING.as_str(),
-                    "chunked"
-                )))),
-                request::headers(not(contains(key("keep-alive")))),
-                request::headers(not(contains(key(header::PROXY_AUTHENTICATE.as_str())))),
-                request::headers(not(contains(key("http2-settings")))),
-                request::headers(contains((header::HOST.as_str(), destination_host))),
-            ])
-            .respond_with(responders::status_code(200)),
-        );
-        let source = httptest::Server::run();
-        let source_host = source.url("/").authority().unwrap().to_string();
-        source.expect(
-            Expectation::matching(all_of![
-                request::method_path("GET", "/start"),
-                request::headers(not(contains(key(header::AUTHORIZATION.as_str())))),
-                request::headers(not(contains(key(header::COOKIE.as_str())))),
-                request::headers(not(contains(key("x-api-key")))),
-                request::headers(not(contains(key("x-connection-secret")))),
-                request::headers(not(contains(key(header::CONNECTION.as_str())))),
-                request::headers(not(contains((header::CONTENT_LENGTH.as_str(), "999")))),
-                request::headers(not(contains((
-                    header::TRANSFER_ENCODING.as_str(),
-                    "chunked"
-                )))),
-                request::headers(not(contains(key("keep-alive")))),
-                request::headers(not(contains(key(header::PROXY_AUTHENTICATE.as_str())))),
-                request::headers(not(contains(key("http2-settings")))),
-                request::headers(contains((header::HOST.as_str(), source_host))),
-            ])
-            .respond_with(
-                responders::status_code(302)
-                    .append_header(header::LOCATION, destination.url_str("/finish")),
-            ),
-        );
-
         let hooks = RecordingHooks {
             destinations: Mutex::new(Vec::new()),
             observed_headers: Mutex::new(Vec::new()),
@@ -1053,18 +1033,35 @@ mod tests {
             header::TRANSFER_ENCODING,
             HeaderValue::from_static("chunked"),
         );
-        let client = repository_client().await?;
-        client
-            .repository_get_with_hooks(
-                &source.url_str("/start"),
-                headers,
-                &RepositoryHttpPolicy::default().with_allow_http(true),
-                &hooks,
-            )
-            .await?;
+        headers.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_static("caller-etag"),
+        );
+        sanitize_caller_headers(&mut headers);
+
+        let current: Uri = "https://registry.example/start".parse().unwrap();
+        let next: Uri = "https://mirror.example/finish".parse().unwrap();
+        let current_headers =
+            prepare_request_headers(&hooks, None, &current, &headers, "source").await?;
+        assert!(current_headers.contains_key(header::AUTHORIZATION));
+        assert!(current_headers.contains_key(header::COOKIE));
+        assert!(current_headers.contains_key("x-api-key"));
+        assert!(current_headers.contains_key(header::IF_NONE_MATCH));
+        assert!(!current_headers.contains_key(header::HOST));
+        assert!(!current_headers.contains_key(header::CONNECTION));
+        assert!(!current_headers.contains_key(header::CONTENT_LENGTH));
+        assert!(!current_headers.contains_key(header::TRANSFER_ENCODING));
+
+        apply_redirect_origin_boundary(&current, &next, &mut headers);
+        let next_headers =
+            prepare_request_headers(&hooks, Some(&current), &next, &headers, "destination").await?;
+        assert!(next_headers.is_empty());
         assert_eq!(2, hooks.destinations.lock().unwrap().len());
         let observed = hooks.observed_headers.lock().unwrap();
-        assert!(observed[0].is_empty(), "caller headers must be sanitized");
+        assert_eq!(
+            Some("caller-etag"),
+            observed[0][header::IF_NONE_MATCH].to_str().ok()
+        );
         assert!(
             observed[1].is_empty(),
             "cross-origin headers must be cleared before destination hooks"
@@ -1097,44 +1094,292 @@ mod tests {
 
     struct SameOriginHooks;
 
+    #[async_trait]
     impl RepositoryRequestHooks for SameOriginHooks {
-        fn prepare_headers(
+        async fn prepare_headers(
             &self,
             uri: &Uri,
             headers: &mut HeaderMap,
         ) -> Result<(), RepositoryRequestHookError> {
             if uri.path() == "/same-start" {
-                headers.insert(header::IF_NONE_MATCH, HeaderValue::from_static("safe-etag"));
+                headers.insert(
+                    header::AUTHORIZATION,
+                    HeaderValue::from_static("Bearer first-hop"),
+                );
+                headers.insert(
+                    header::IF_NONE_MATCH,
+                    HeaderValue::from_static("helper-etag"),
+                );
             }
             Ok(())
         }
     }
 
     #[tokio::test]
-    async fn same_origin_redirect_preserves_hook_headers() -> buck2_error::Result<()> {
+    async fn same_origin_redirect_rebuilds_headers_from_caller_baseline() -> buck2_error::Result<()>
+    {
+        let hooks = SameOriginHooks;
+        let current: Uri = "https://registry.example/same-start".parse().unwrap();
+        let next: Uri = "https://registry.example/same-finish".parse().unwrap();
+        let mut caller_headers = HeaderMap::new();
+        caller_headers.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_static("caller-etag"),
+        );
+
+        let current_headers =
+            prepare_request_headers(&hooks, None, &current, &caller_headers, "initial").await?;
+        assert_eq!(
+            Some("Bearer first-hop"),
+            current_headers[header::AUTHORIZATION].to_str().ok()
+        );
+        assert_eq!(
+            Some("helper-etag"),
+            current_headers[header::IF_NONE_MATCH].to_str().ok()
+        );
+
+        let next_headers =
+            prepare_request_headers(&hooks, Some(&current), &next, &caller_headers, "redirect")
+                .await?;
+        assert!(!next_headers.contains_key(header::AUTHORIZATION));
+        assert_eq!(
+            Some("caller-etag"),
+            next_headers[header::IF_NONE_MATCH].to_str().ok()
+        );
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct YieldingHeadersHooks {
+        polls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RepositoryRequestHooks for YieldingHeadersHooks {
+        async fn prepare_headers(
+            &self,
+            _uri: &Uri,
+            headers: &mut HeaderMap,
+        ) -> Result<(), RepositoryRequestHookError> {
+            let mut pending_once = true;
+            futures::future::poll_fn(|cx| {
+                self.polls.fetch_add(1, Ordering::Relaxed);
+                if std::mem::take(&mut pending_once) {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            })
+            .await;
+            headers.insert(
+                header::IF_NONE_MATCH,
+                HeaderValue::from_static("async-etag"),
+            );
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn async_hook_can_yield_before_returning_headers() -> buck2_error::Result<()> {
+        let hooks = YieldingHeadersHooks::default();
+        let uri: Uri = "https://registry.example/archive".parse().unwrap();
+        let headers =
+            prepare_request_headers(&hooks, None, &uri, &HeaderMap::new(), "registry").await?;
+        assert_eq!(
+            Some("async-etag"),
+            headers[header::IF_NONE_MATCH].to_str().ok()
+        );
+        assert_eq!(2, hooks.polls.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct CountingHooks {
+        validated: AtomicUsize,
+        prepared: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RepositoryRequestHooks for CountingHooks {
+        async fn validate_uri(
+            &self,
+            _previous: Option<&Uri>,
+            _next: &Uri,
+        ) -> Result<(), RepositoryRequestHookError> {
+            self.validated.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn prepare_headers(
+            &self,
+            _uri: &Uri,
+            headers: &mut HeaderMap,
+        ) -> Result<(), RepositoryRequestHookError> {
+            self.prepared.fetch_add(1, Ordering::Relaxed);
+            headers.insert(
+                header::IF_NONE_MATCH,
+                HeaderValue::from_static("helper-must-not-run"),
+            );
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_http_validates_without_preparing_headers() -> buck2_error::Result<()> {
         buck2_certs::certs::maybe_setup_cryptography();
         let server = httptest::Server::run();
         server.expect(
-            Expectation::matching(request::method_path("GET", "/same-start")).respond_with(
-                responders::status_code(302).append_header(header::LOCATION, "/same-finish"),
-            ),
-        );
-        server.expect(
             Expectation::matching(all_of![
-                request::method_path("GET", "/same-finish"),
-                request::headers(contains((header::IF_NONE_MATCH.as_str(), "safe-etag"))),
+                request::method_path("GET", "/archive"),
+                request::headers(not(contains(key(header::IF_NONE_MATCH.as_str())))),
             ])
             .respond_with(responders::status_code(200)),
         );
-        let client = repository_client().await?;
-        client
+        let hooks = CountingHooks::default();
+        repository_client()
+            .await?
             .repository_get_with_hooks(
-                &server.url_str("/same-start"),
+                &server.url_str("/archive"),
                 HeaderMap::new(),
                 &RepositoryHttpPolicy::default().with_allow_http(true),
-                &SameOriginHooks,
+                &hooks,
             )
             .await?;
+        assert_eq!(1, hooks.validated.load(Ordering::Relaxed));
+        assert_eq!(0, hooks.prepared.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redirect_userinfo_is_rejected_before_hooks() -> buck2_error::Result<()> {
+        buck2_certs::certs::maybe_setup_cryptography();
+        let server = httptest::Server::run();
+        let authority = server.url("/").authority().unwrap().to_string();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/redirect")).respond_with(
+                responders::status_code(302).append_header(
+                    header::LOCATION,
+                    format!(
+                        "http://user:password@{authority}/Bearer-userinfo-secret?token=query-secret"
+                    ),
+                ),
+            ),
+        );
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/Bearer-userinfo-secret"))
+                .times(0)
+                .respond_with(responders::status_code(200)),
+        );
+        let hooks = CountingHooks::default();
+        let client = repository_client().await?;
+        let result = client
+            .repository_get_with_hooks(
+                &server.url_str("/redirect"),
+                HeaderMap::new(),
+                &RepositoryHttpPolicy::default().with_allow_http(true),
+                &hooks,
+            )
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("redirect user information must be rejected"),
+        };
+        match &error {
+            HttpError::RepositoryPolicy { uri, reason } => {
+                assert_eq!("URI user information is forbidden", *reason);
+                assert_eq!(format!("http://{authority}/<redirected>"), *uri);
+            }
+            other => panic!("expected repository policy error, got {other:?}"),
+        }
+        let rendered = format!("{error:?}");
+        assert!(rendered.contains("/<redirected>"));
+        assert!(!rendered.contains("password"));
+        assert!(!rendered.contains("userinfo-secret"));
+        assert!(!rendered.contains("query-secret"));
+        assert_eq!(1, hooks.validated.load(Ordering::Relaxed));
+        assert_eq!(0, hooks.prepared.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    struct ReentrantRedirectHooks {
+        client: RepositoryHttpClient,
+        reentrant_uri: String,
+        hops: Mutex<Vec<(Option<String>, String)>>,
+    }
+
+    #[async_trait]
+    impl RepositoryRequestHooks for ReentrantRedirectHooks {
+        async fn validate_uri(
+            &self,
+            previous: Option<&Uri>,
+            next: &Uri,
+        ) -> Result<(), RepositoryRequestHookError> {
+            self.hops.lock().unwrap().push((
+                previous.map(|uri| uri.path().to_owned()),
+                next.path().to_owned(),
+            ));
+            if previous.is_some() {
+                let policy = RepositoryHttpPolicy::default().with_allow_http(true);
+                let response = self
+                    .client
+                    .repository_get(&self.reentrant_uri, HeaderMap::new(), &policy)
+                    .await
+                    .map_err(|_| RepositoryRequestHookError::CredentialsUnavailable)?;
+                drop(response);
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_releases_request_permit_before_async_hooks() -> buck2_error::Result<()> {
+        buck2_certs::certs::maybe_setup_cryptography();
+        let server = httptest::Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/start")).respond_with(
+                responders::status_code(302).append_header(header::LOCATION, "/finish"),
+            ),
+        );
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/hook"))
+                .respond_with(responders::status_code(200)),
+        );
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/finish"))
+                .respond_with(responders::status_code(200)),
+        );
+        let client = crate::HttpClientBuilder::https_with_system_roots()
+            .await?
+            .with_max_concurrent_requests(Some(1))
+            .build_repository(
+                RepositoryNetworkPolicy::default().with_allow_explicit_loopback(true),
+            )?;
+        let hooks = ReentrantRedirectHooks {
+            client: client.clone(),
+            reentrant_uri: server.url_str("/hook"),
+            hops: Mutex::new(Vec::new()),
+        };
+        let policy = RepositoryHttpPolicy::default().with_allow_http(true);
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.repository_get_with_hooks(
+                &server.url_str("/start"),
+                HeaderMap::new(),
+                &policy,
+                &hooks,
+            ),
+        )
+        .await
+        .expect("redirect hook re-entry must not deadlock")?;
+        assert_eq!(StatusCode::OK, response.status());
+        assert_eq!(
+            &[
+                (None, "/start".to_owned()),
+                (Some("/start".to_owned()), "/finish".to_owned()),
+            ],
+            hooks.hops.lock().unwrap().as_slice()
+        );
         Ok(())
     }
 
@@ -1265,8 +1510,9 @@ mod tests {
 
     struct AuthorizationHooks;
 
+    #[async_trait]
     impl RepositoryRequestHooks for AuthorizationHooks {
-        fn prepare_headers(
+        async fn prepare_headers(
             &self,
             _uri: &Uri,
             headers: &mut HeaderMap,
