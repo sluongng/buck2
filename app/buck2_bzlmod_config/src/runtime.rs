@@ -45,6 +45,7 @@ pub struct CredentialHelpersRuntimeConfig {
 
 struct CredentialHelperEntry {
     scope: CredentialHelperScope,
+    authorization_domain: Box<str>,
     executable: PathBuf,
 }
 
@@ -59,6 +60,16 @@ pub struct CredentialHelpersSummary<'a> {
     pub provider_digest: &'a str,
     pub authorization_domains: &'a [Box<str>],
     pub helper_count: usize,
+}
+
+/// A selected credential helper and its canonical authorization domain.
+///
+/// This runtime-only type intentionally does not implement `Debug`, `Eq`,
+/// `Hash`, `Allocative`, or `Pagable`, keeping executable paths out of DICE
+/// identity, summaries, and diagnostics.
+pub struct CredentialHelperMatch<'a> {
+    pub executable: &'a Path,
+    pub authorization_domain: &'a str,
 }
 
 /// Attach runtime-only Bzlmod data to one command transaction.
@@ -128,8 +139,10 @@ impl CredentialHelpersRuntimeConfig {
                     "credential helper executable paths must be absolute"
                 ));
             }
+            let authorization_domain = scope.as_identity_str().into();
             entries.push(CredentialHelperEntry {
                 scope,
+                authorization_domain,
                 executable: PathBuf::from(executable),
             });
         }
@@ -140,10 +153,9 @@ impl CredentialHelpersRuntimeConfig {
         let mut hasher = Sha256::new();
         let mut domains = Vec::with_capacity(entries.len());
         for entry in &entries {
-            let scope = entry.scope.as_identity_str();
-            hash_field(&mut hasher, scope.as_bytes());
+            hash_field(&mut hasher, entry.authorization_domain.as_bytes());
             hash_field(&mut hasher, entry.executable.as_os_str().as_encoded_bytes());
-            domains.push(scope.into());
+            domains.push(entry.authorization_domain.clone());
         }
         let identity = CredentialProviderIdentity::new(
             hex::encode(hasher.finalize()).into(),
@@ -165,7 +177,7 @@ impl CredentialHelpersRuntimeConfig {
 
     /// Select a helper using exact, longest-wildcard, then default precedence.
     /// The first entry wins ties.
-    pub fn helper_for_host(&self, host: &str) -> Option<&Path> {
+    pub fn match_for_host(&self, host: &str) -> Option<CredentialHelperMatch<'_>> {
         let host = host
             .trim_matches(['[', ']'])
             .trim_end_matches('.')
@@ -174,7 +186,7 @@ impl CredentialHelpersRuntimeConfig {
             .parse::<std::net::IpAddr>()
             .map(|ip| ip.to_string())
             .unwrap_or(host);
-        let mut best: Option<(u8, usize, &Path)> = None;
+        let mut best: Option<(u8, usize, &CredentialHelperEntry)> = None;
         for entry in &self.entries {
             let rank = match &entry.scope {
                 CredentialHelperScope::Exact(exact) if exact.as_ref() == host => (3, exact.len()),
@@ -191,10 +203,19 @@ impl CredentialHelpersRuntimeConfig {
             if best.is_none_or(|(best_class, best_len, _)| {
                 rank.0 > best_class || (rank.0 == best_class && rank.1 > best_len)
             }) {
-                best = Some((rank.0, rank.1, entry.executable.as_path()));
+                best = Some((rank.0, rank.1, entry));
             }
         }
-        best.map(|(_, _, path)| path)
+        best.map(|(_, _, entry)| CredentialHelperMatch {
+            executable: entry.executable.as_path(),
+            authorization_domain: &entry.authorization_domain,
+        })
+    }
+
+    /// Select a helper using exact, longest-wildcard, then default precedence.
+    /// The first entry wins ties.
+    pub fn helper_for_host(&self, host: &str) -> Option<&Path> {
+        self.match_for_host(host).map(|matched| matched.executable)
     }
 
     pub fn redacted_summary(&self) -> CredentialHelpersSummary<'_> {
@@ -274,26 +295,78 @@ fn hash_field(hasher: &mut Sha256, value: &[u8]) {
 mod tests {
     use super::*;
 
+    fn assert_match(
+        helpers: &CredentialHelpersRuntimeConfig,
+        host: &str,
+        executable: &str,
+        authorization_domain: &str,
+    ) {
+        let matched = helpers.match_for_host(host).expect("expected a match");
+        assert_eq!(matched.executable, Path::new(executable));
+        assert_eq!(matched.authorization_domain, authorization_domain);
+    }
+
     #[test]
     fn selects_helpers_by_documented_precedence() -> buck2_error::Result<()> {
         let helpers = CredentialHelpersRuntimeConfig::parse(
             "default=/bin/default,*.example.com=/bin/wild,*.sub.example.com=/bin/long,api.example.com=/bin/exact,api.example.com=/bin/later",
         )?;
-        assert_eq!(
-            helpers.helper_for_host("api.example.com"),
-            Some(Path::new("/bin/exact"))
+        assert_match(
+            &helpers,
+            "api.example.com",
+            "/bin/exact",
+            "exact:api.example.com",
         );
-        assert_eq!(
-            helpers.helper_for_host("x.sub.example.com"),
-            Some(Path::new("/bin/long"))
+        assert_match(
+            &helpers,
+            "x.sub.example.com",
+            "/bin/long",
+            "wildcard:*.sub.example.com",
         );
-        assert_eq!(
-            helpers.helper_for_host("x.example.com"),
-            Some(Path::new("/bin/wild"))
+        assert_match(
+            &helpers,
+            "x.example.com",
+            "/bin/wild",
+            "wildcard:*.example.com",
         );
-        assert_eq!(
-            helpers.helper_for_host("elsewhere.test"),
-            Some(Path::new("/bin/default"))
+        assert_match(&helpers, "elsewhere.test", "/bin/default", "default");
+        Ok(())
+    }
+
+    #[test]
+    fn wildcard_match_keeps_one_domain_across_hosts() -> buck2_error::Result<()> {
+        let helpers = CredentialHelpersRuntimeConfig::parse("*.example.com=/bin/wild")?;
+        assert_match(
+            &helpers,
+            "one.example.com",
+            "/bin/wild",
+            "wildcard:*.example.com",
+        );
+        assert_match(
+            &helpers,
+            "two.example.com",
+            "/bin/wild",
+            "wildcard:*.example.com",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_match_has_distinct_domain_from_wildcard() -> buck2_error::Result<()> {
+        let helpers = CredentialHelpersRuntimeConfig::parse(
+            "*.example.com=/bin/wild,api.example.com=/bin/exact",
+        )?;
+        assert_match(
+            &helpers,
+            "api.example.com",
+            "/bin/exact",
+            "exact:api.example.com",
+        );
+        assert_match(
+            &helpers,
+            "www.example.com",
+            "/bin/wild",
+            "wildcard:*.example.com",
         );
         Ok(())
     }
@@ -302,14 +375,8 @@ mod tests {
     fn canonicalizes_ipv6_helper_scopes() -> buck2_error::Result<()> {
         let helpers =
             CredentialHelpersRuntimeConfig::parse("2001:0db8::1=/bin/ipv6,[::1]=/bin/loopback")?;
-        assert_eq!(
-            helpers.helper_for_host("[2001:db8::1]"),
-            Some(Path::new("/bin/ipv6"))
-        );
-        assert_eq!(
-            helpers.helper_for_host("0:0:0:0:0:0:0:1"),
-            Some(Path::new("/bin/loopback"))
-        );
+        assert_match(&helpers, "[2001:db8::1]", "/bin/ipv6", "exact:2001:db8::1");
+        assert_match(&helpers, "0:0:0:0:0:0:0:1", "/bin/loopback", "exact:::1");
         Ok(())
     }
 
@@ -354,6 +421,25 @@ mod tests {
             wildcard.identity().authorization_domains()[0].as_ref(),
             "wildcard:*.example.com"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn matches_agree_with_provider_authorization_domains() -> buck2_error::Result<()> {
+        let helpers = CredentialHelpersRuntimeConfig::parse(
+            "default=/bin/default,*.example.com=/bin/wild,api.example.com=/bin/exact",
+        )?;
+        for (host, domain_index) in [
+            ("elsewhere.test", 0),
+            ("www.example.com", 1),
+            ("api.example.com", 2),
+        ] {
+            let matched = helpers.match_for_host(host).expect("expected a match");
+            assert_eq!(
+                matched.authorization_domain,
+                helpers.identity().authorization_domains()[domain_index].as_ref()
+            );
+        }
         Ok(())
     }
 

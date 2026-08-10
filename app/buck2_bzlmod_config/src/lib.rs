@@ -50,6 +50,7 @@ pub use config::WorkspaceRelativePath;
 pub use dice::HasBzlmodConfig;
 pub use dice::SetBzlmodConfig;
 pub use runtime::BzlmodRuntimeConfig;
+pub use runtime::CredentialHelperMatch;
 pub use runtime::CredentialHelpersRuntimeConfig;
 pub use runtime::CredentialHelpersSummary;
 pub use runtime::HasBzlmodRuntimeConfig;
