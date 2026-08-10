@@ -1219,6 +1219,24 @@ name = "buck2_bzlmod"
 version = "0.1.0"
 
 [[package]]
+name = "buck2_bzlmod_config"
+version = "0.1.0"
+dependencies = [
+ "allocative",
+ "async-trait",
+ "buck2_common",
+ "buck2_error",
+ "derive_more 2.1.1",
+ "dice",
+ "dupe",
+ "hex",
+ "http",
+ "pagable",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "buck2_certs"
 version = "0.1.0"
 dependencies = [
