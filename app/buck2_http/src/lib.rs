@@ -26,7 +26,10 @@ pub use client::to_bytes;
 pub use proxy::ProxyHostAllowlist;
 pub use repository::NoRepositoryRequestHooks;
 pub use repository::RedactedUri;
+pub use repository::RepositoryClientBuildError;
+pub use repository::RepositoryHttpClient;
 pub use repository::RepositoryHttpPolicy;
+pub use repository::RepositoryNetworkPolicy;
 pub use repository::RepositoryRequestHookError;
 pub use repository::RepositoryRequestHooks;
 
