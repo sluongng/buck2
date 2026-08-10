@@ -17,23 +17,65 @@ use sha2::Digest;
 use sha2::Sha256;
 
 use crate::CredentialProviderIdentity;
+use crate::MachineRegistryIdentity;
 
 /// Secret-adjacent command runtime data which must never be injected into DICE.
 ///
 /// This type intentionally implements neither `Debug`, `Eq`, `Hash`,
 /// `Allocative`, nor `Pagable`. Callers can inspect only a redacted summary and
-/// select the helper for a request host.
+/// select the helper for a request host or resolve an opaque machine-registry
+/// identity to its normalized path.
 pub struct BzlmodRuntimeConfig {
     credential_helpers: CredentialHelpersRuntimeConfig,
+    machine_registries: MachineRegistriesRuntimeConfig,
 }
 
 impl BzlmodRuntimeConfig {
-    pub(crate) fn new(credential_helpers: CredentialHelpersRuntimeConfig) -> Self {
-        Self { credential_helpers }
+    pub(crate) fn new(
+        credential_helpers: CredentialHelpersRuntimeConfig,
+        machine_registries: MachineRegistriesRuntimeConfig,
+    ) -> Self {
+        Self {
+            credential_helpers,
+            machine_registries,
+        }
     }
 
     pub fn credential_helpers(&self) -> &CredentialHelpersRuntimeConfig {
         &self.credential_helpers
+    }
+
+    /// Resolve a safe machine-registry identity to its command-scoped path.
+    pub fn machine_registry_path(&self, identity: &MachineRegistryIdentity) -> Option<&Path> {
+        self.machine_registries.path(identity)
+    }
+}
+
+/// Ordered machine-registry paths retained outside DICE and diagnostics.
+pub(crate) struct MachineRegistriesRuntimeConfig {
+    entries: Box<[MachineRegistryRuntimeEntry]>,
+}
+
+struct MachineRegistryRuntimeEntry {
+    identity: MachineRegistryIdentity,
+    path: PathBuf,
+}
+
+impl MachineRegistriesRuntimeConfig {
+    pub(crate) fn from_entries(entries: Vec<(MachineRegistryIdentity, PathBuf)>) -> Self {
+        Self {
+            entries: entries
+                .into_iter()
+                .map(|(identity, path)| MachineRegistryRuntimeEntry { identity, path })
+                .collect(),
+        }
+    }
+
+    fn path(&self, identity: &MachineRegistryIdentity) -> Option<&Path> {
+        self.entries
+            .iter()
+            .find(|entry| &entry.identity == identity)
+            .map(|entry| entry.path.as_path())
     }
 }
 
@@ -447,7 +489,10 @@ mod tests {
     fn stores_runtime_data_outside_dice_identity() -> buck2_error::Result<()> {
         let helpers = CredentialHelpersRuntimeConfig::parse("default=/secret/helper")?;
         let mut data = UserComputationData::default();
-        data.set_bzlmod_runtime_config(BzlmodRuntimeConfig::new(helpers));
+        data.set_bzlmod_runtime_config(BzlmodRuntimeConfig::new(
+            helpers,
+            MachineRegistriesRuntimeConfig::from_entries(Vec::new()),
+        ));
         let stored = data.get_bzlmod_runtime_config()?;
         assert_eq!(
             stored.credential_helpers().helper_for_host("example.com"),

@@ -216,6 +216,11 @@ mod tests {
     #[pagable_typetag(dice::DiceKeyDyn)]
     struct ProjectionConsumer(ProjectionKind);
 
+    #[derive(Clone, Copy, Display, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
+    #[display("MachineRegistryDebugConsumer")]
+    #[pagable_typetag(dice::DiceKeyDyn)]
+    struct MachineRegistryDebugConsumer;
+
     #[async_trait]
     impl Key for ResolutionConsumer {
         type Value = bool;
@@ -284,6 +289,27 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl Key for MachineRegistryDebugConsumer {
+        type Value = String;
+
+        async fn compute(
+            &self,
+            ctx: &mut DiceComputations,
+            _cancellations: &CancellationContext,
+        ) -> Self::Value {
+            format!("{:?}", ctx.get_bzlmod_resolution_config().await.unwrap())
+        }
+
+        fn equality(x: &Self::Value, y: &Self::Value) -> bool {
+            x == y
+        }
+
+        fn value_serialize() -> impl ValueSerialize<Value = Self::Value> {
+            NoValueSerialize::<Self::Value>::new()
+        }
+    }
+
     #[test]
     fn projection_structs_partition_configuration_identity() {
         let baseline = config("");
@@ -331,6 +357,27 @@ mod tests {
             helper_a.transport().credential_provider().provider_digest(),
             helper_b.transport().credential_provider().provider_digest()
         );
+
+        let machine_a = config("registries = file:///private/registry-a\n");
+        let machine_b = config("registries = file:///private/registry-b\n");
+        assert_ne!(machine_a.resolution(), machine_b.resolution());
+        assert_eq!(machine_a.transport(), machine_b.transport());
+        assert_eq!(machine_a.local_store(), machine_b.local_store());
+        assert_eq!(machine_a.remote_cache(), machine_b.remote_cache());
+    }
+
+    #[tokio::test]
+    async fn projected_debug_does_not_expose_machine_registry_paths() -> buck2_error::Result<()> {
+        const PATH: &str = "/very/private/dice-registry";
+        let dice = Dice::builder().build(DetectCycles::Disabled);
+        let mut updater = dice.updater();
+        updater.set_bzlmod_config(config(&format!("registries = file://{PATH}\n")))?;
+        let ctx = updater.commit().await;
+
+        let debug = ctx.compute(&MachineRegistryDebugConsumer).await?;
+        assert!(!debug.contains(PATH));
+        assert!(debug.contains("machine-file:sha256:"));
+        Ok(())
     }
 
     #[tokio::test]

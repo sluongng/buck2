@@ -13,13 +13,17 @@ use std::fmt;
 use std::net::IpAddr;
 use std::path::Component;
 use std::path::Path;
+use std::path::PathBuf;
 
 use allocative::Allocative;
 use buck2_common::legacy_configs::configs::LegacyBuckConfig;
 use http::Uri;
 use pagable::Pagable;
+use sha2::Digest;
+use sha2::Sha256;
 
 use crate::runtime::CredentialHelpersRuntimeConfig;
+use crate::runtime::MachineRegistriesRuntimeConfig;
 
 const BZLMOD_SECTION: &str = "bzlmod";
 const DEFAULT_REGISTRY: &str = "https://bcr.bazel.build";
@@ -117,7 +121,17 @@ pub struct CredentialProviderIdentity {
 pub enum RepositoryUrl {
     Network(Box<str>),
     WorkspaceFile(Box<str>),
-    MachineFile(Box<str>),
+    MachineFile(MachineRegistryIdentity),
+}
+
+/// Opaque identity for a machine-absolute registry path.
+///
+/// The normalized path is retained only in [`crate::BzlmodRuntimeConfig`]. This
+/// DICE-safe identity is a domain-separated SHA-256 digest and is safe to use in
+/// diagnostics, hashes, and serialized DICE values.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
+pub struct MachineRegistryIdentity {
+    safe_spelling: Box<str>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Allocative, Pagable)]
@@ -210,7 +224,10 @@ impl ParsedBzlmodConfig {
                 lock_mode,
                 true,
             )?,
-            None => vec![RepositoryUrl::Network(DEFAULT_REGISTRY.into())],
+            None => ParsedRepositoryUrls {
+                urls: vec![RepositoryUrl::Network(DEFAULT_REGISTRY.into())],
+                machine_registries: Vec::new(),
+            },
         };
         let module_mirrors = match input.get("module_mirrors") {
             Some(value) => parse_url_list(
@@ -221,7 +238,10 @@ impl ParsedBzlmodConfig {
                 lock_mode,
                 false,
             )?,
-            None => Vec::new(),
+            None => ParsedRepositoryUrls {
+                urls: Vec::new(),
+                machine_registries: Vec::new(),
+            },
         };
         let lockfile = parse_lockfile(input.get("lockfile"))?;
         let repository_cache = parse_repository_cache(input.get("repository_cache"))?;
@@ -307,7 +327,10 @@ impl ParsedBzlmodConfig {
         if remote_mode != RemoteRepositoryCacheMode::Disabled
             && (!credential_helpers.is_empty()
                 || allow_private_network
-                || registries.iter().any(|registry| !registry.is_network()))
+                || registries
+                    .urls
+                    .iter()
+                    .any(|registry| !registry.is_network()))
             && trust_domain.is_none()
         {
             return Err(buck2_error::buck2_error!(
@@ -320,12 +343,12 @@ impl ParsedBzlmodConfig {
         let config = BzlmodConfig {
             resolution: BzlmodResolutionConfig {
                 enabled,
-                registries: registries.into_boxed_slice(),
+                registries: registries.urls.into_boxed_slice(),
                 lockfile,
                 lock_mode,
             },
             transport: BzlmodTransportConfig {
-                module_mirrors: module_mirrors.into_boxed_slice(),
+                module_mirrors: module_mirrors.urls.into_boxed_slice(),
                 allow_insecure_http,
                 allow_private_network,
                 credential_provider: credential_provider.clone(),
@@ -349,7 +372,10 @@ impl ParsedBzlmodConfig {
         };
         Ok(Self {
             config,
-            runtime: crate::BzlmodRuntimeConfig::new(credential_helpers),
+            runtime: crate::BzlmodRuntimeConfig::new(
+                credential_helpers,
+                MachineRegistriesRuntimeConfig::from_entries(registries.machine_registries),
+            ),
         })
     }
 
@@ -492,7 +518,29 @@ impl CredentialProviderIdentity {
 impl RepositoryUrl {
     pub fn as_str(&self) -> &str {
         match self {
-            Self::Network(value) | Self::WorkspaceFile(value) | Self::MachineFile(value) => value,
+            Self::Network(value) | Self::WorkspaceFile(value) => value,
+            Self::MachineFile(identity) => identity.as_str(),
+        }
+    }
+
+    pub fn network_url(&self) -> Option<&str> {
+        match self {
+            Self::Network(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn workspace_file_url(&self) -> Option<&str> {
+        match self {
+            Self::WorkspaceFile(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn machine_file_identity(&self) -> Option<&MachineRegistryIdentity> {
+        match self {
+            Self::MachineFile(identity) => Some(identity),
+            _ => None,
         }
     }
 
@@ -506,6 +554,39 @@ impl RepositoryUrl {
 
     pub fn is_machine_file(&self) -> bool {
         matches!(self, Self::MachineFile(_))
+    }
+}
+
+impl MachineRegistryIdentity {
+    fn from_normalized_path(path: &Path) -> Self {
+        const DOMAIN: &[u8] = b"buck2-bzlmod-machine-registry-path-v1\0";
+
+        let encoded = path.as_os_str().as_encoded_bytes();
+        let mut hasher = Sha256::new();
+        hasher.update(DOMAIN);
+        hasher.update((encoded.len() as u64).to_le_bytes());
+        hasher.update(encoded);
+        Self {
+            safe_spelling: format!("machine-file:sha256:{}", hex::encode(hasher.finalize())).into(),
+        }
+    }
+
+    /// Stable, path-free spelling suitable for diagnostics and serialization.
+    pub fn as_str(&self) -> &str {
+        &self.safe_spelling
+    }
+
+    /// The lowercase hexadecimal SHA-256 digest.
+    pub fn sha256_hex(&self) -> &str {
+        self.safe_spelling
+            .strip_prefix("machine-file:sha256:")
+            .expect("MachineRegistryIdentity has a fixed safe spelling")
+    }
+}
+
+impl fmt::Display for MachineRegistryIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -723,33 +804,52 @@ fn parse_url_list(
     allow_private_network: bool,
     lock_mode: LockMode,
     allow_file: bool,
-) -> buck2_error::Result<Vec<RepositoryUrl>> {
+) -> buck2_error::Result<ParsedRepositoryUrls> {
     if value.value.trim().is_empty() {
-        return Ok(Vec::new());
+        return Ok(ParsedRepositoryUrls {
+            urls: Vec::new(),
+            machine_registries: Vec::new(),
+        });
     }
-    value
-        .value
-        .split(',')
-        .map(|entry| {
-            let entry = entry.trim();
-            if entry.is_empty() {
-                return Err(invalid_value(
-                    name,
-                    value,
-                    "ordered URL lists may not contain empty entries",
-                ));
-            }
-            parse_url(
+    let mut urls = Vec::new();
+    let mut machine_registries = Vec::new();
+    for entry in value.value.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err(invalid_value(
                 name,
                 value,
-                entry,
-                allow_insecure_http,
-                allow_private_network,
-                lock_mode,
-                allow_file,
-            )
-        })
-        .collect()
+                "ordered URL lists may not contain empty entries",
+            ));
+        }
+        let parsed = parse_url(
+            name,
+            value,
+            entry,
+            allow_insecure_http,
+            allow_private_network,
+            lock_mode,
+            allow_file,
+        )?;
+        urls.push(parsed.url);
+        if let Some(machine_registry) = parsed.machine_registry {
+            machine_registries.push(machine_registry);
+        }
+    }
+    Ok(ParsedRepositoryUrls {
+        urls,
+        machine_registries,
+    })
+}
+
+struct ParsedRepositoryUrls {
+    urls: Vec<RepositoryUrl>,
+    machine_registries: Vec<(MachineRegistryIdentity, PathBuf)>,
+}
+
+struct ParsedRepositoryUrl {
+    url: RepositoryUrl,
+    machine_registry: Option<(MachineRegistryIdentity, PathBuf)>,
 }
 
 fn parse_url(
@@ -760,7 +860,7 @@ fn parse_url(
     allow_private_network: bool,
     lock_mode: LockMode,
     allow_file: bool,
-) -> buck2_error::Result<RepositoryUrl> {
+) -> buck2_error::Result<ParsedRepositoryUrl> {
     if value.contains('#') {
         return Err(invalid_value(name, input, "URL fragments are not allowed"));
     }
@@ -823,7 +923,10 @@ fn parse_url(
             "private, loopback, link-local, multicast, unspecified, and other non-public literal hosts require allow_private_network=true",
         ));
     }
-    Ok(RepositoryUrl::Network(value.into()))
+    Ok(ParsedRepositoryUrl {
+        url: RepositoryUrl::Network(value.into()),
+        machine_registry: None,
+    })
 }
 
 fn parse_file_registry(
@@ -832,7 +935,7 @@ fn parse_file_registry(
     original: &str,
     value: &str,
     lock_mode: LockMode,
-) -> buck2_error::Result<RepositoryUrl> {
+) -> buck2_error::Result<ParsedRepositoryUrl> {
     if value.contains('?') || value.contains('#') {
         return Err(invalid_value(
             name,
@@ -895,7 +998,12 @@ fn parse_file_registry(
                 "machine-absolute file registries are not portable and are rejected in lock_mode=error",
             ));
         }
-        return Ok(RepositoryUrl::MachineFile(original.into()));
+        let path = PathBuf::from(path);
+        let identity = MachineRegistryIdentity::from_normalized_path(&path);
+        return Ok(ParsedRepositoryUrl {
+            url: RepositoryUrl::MachineFile(identity.clone()),
+            machine_registry: Some((identity, path)),
+        });
     }
     if Path::new(path)
         .components()
@@ -910,7 +1018,10 @@ fn parse_file_registry(
             "workspace file registries must use a normalized workspace-relative path",
         ));
     }
-    Ok(RepositoryUrl::WorkspaceFile(original.into()))
+    Ok(ParsedRepositoryUrl {
+        url: RepositoryUrl::WorkspaceFile(original.into()),
+        machine_registry: None,
+    })
 }
 
 fn reject_unknown_keys(input: &BzlmodConfigInput) -> buck2_error::Result<()> {
@@ -985,6 +1096,9 @@ fn invalid_value(name: &str, value: &InputValue, message: impl fmt::Display) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::hash::Hash;
+    use std::hash::Hasher;
+
     use buck2_common::legacy_configs::configs::testing::parse;
 
     use super::*;
@@ -1032,6 +1146,15 @@ mod tests {
             "https://one.example/r"
         );
         assert_eq!(
+            config.resolution().registries()[0].network_url(),
+            Some("https://one.example/r")
+        );
+        assert!(
+            config.resolution().registries()[0]
+                .machine_file_identity()
+                .is_none()
+        );
+        assert_eq!(
             config.resolution().registries()[1].as_str(),
             "https://two.example/r"
         );
@@ -1076,10 +1199,28 @@ mod tests {
     #[test]
     fn supports_typed_file_registries_with_lock_portability() -> buck2_error::Result<()> {
         let workspace = parsed("[bzlmod]\nregistries = file:third-party/registry\n")?;
-        assert!(workspace.config().resolution().registries()[0].is_workspace_file());
+        let workspace_registry = &workspace.config().resolution().registries()[0];
+        assert!(workspace_registry.is_workspace_file());
+        assert_eq!(
+            workspace_registry.workspace_file_url(),
+            Some("file:third-party/registry")
+        );
+        assert_eq!(workspace_registry.as_str(), "file:third-party/registry");
 
         let machine = parsed("[bzlmod]\nregistries = file:///opt/bzl-registry\n")?;
-        assert!(machine.config().resolution().registries()[0].is_machine_file());
+        let machine_registry = &machine.config().resolution().registries()[0];
+        assert!(machine_registry.is_machine_file());
+        let identity = machine_registry
+            .machine_file_identity()
+            .expect("machine registry identity");
+        assert_eq!(identity.sha256_hex().len(), 64);
+        assert_eq!(machine_registry.as_str(), identity.as_str());
+        assert_eq!(machine_registry.to_string(), identity.as_str());
+        assert!(identity.as_str().starts_with("machine-file:sha256:"));
+        assert_eq!(
+            machine.runtime().machine_registry_path(identity),
+            Some(Path::new("/opt/bzl-registry"))
+        );
 
         assert!(
             parsed("[bzlmod]\nlock_mode = error\nregistries = file:///opt/bzl-registry\n").is_err()
@@ -1102,6 +1243,111 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn machine_registry_paths_are_runtime_only() -> buck2_error::Result<()> {
+        const FIRST: &str = "/very/private/registry-a";
+        const SECOND: &str = "/very/private/registry-b";
+
+        for lock_mode in ["update", "refresh"] {
+            let parsed = parsed(&format!(
+                "[bzlmod]\nlock_mode = {lock_mode}\nregistries = file://{FIRST},file://{FIRST},file://{SECOND}\n"
+            ))?;
+            let registries = parsed.config().resolution().registries();
+            assert_eq!(registries.len(), 3);
+            let first = registries[0]
+                .machine_file_identity()
+                .expect("first machine identity");
+            let duplicate = registries[1]
+                .machine_file_identity()
+                .expect("duplicate machine identity");
+            let second = registries[2]
+                .machine_file_identity()
+                .expect("second machine identity");
+            assert_eq!(first, duplicate);
+            assert_ne!(first, second);
+            assert_eq!(
+                parsed.runtime().machine_registry_path(first),
+                Some(Path::new(FIRST))
+            );
+            assert_eq!(
+                parsed.runtime().machine_registry_path(duplicate),
+                Some(Path::new(FIRST))
+            );
+            assert_eq!(
+                parsed.runtime().machine_registry_path(second),
+                Some(Path::new(SECOND))
+            );
+
+            let debug = format!("{:?}", parsed.config());
+            let display = registries
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut hashed = RecordingHasher::default();
+            parsed.config().hash(&mut hashed);
+            for path in [FIRST, SECOND] {
+                assert!(!debug.contains(path));
+                assert!(!display.contains(path));
+                assert!(
+                    !hashed
+                        .0
+                        .windows(path.len())
+                        .any(|bytes| bytes == path.as_bytes())
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn machine_registry_runtime_lookup_requires_matching_identity() -> buck2_error::Result<()> {
+        let first = parsed("[bzlmod]\nregistries = file:///private/first\n")?;
+        let second = parsed("[bzlmod]\nregistries = file:///private/second\n")?;
+        let first_identity = first.config().resolution().registries()[0]
+            .machine_file_identity()
+            .expect("first identity");
+        let second_identity = second.config().resolution().registries()[0]
+            .machine_file_identity()
+            .expect("second identity");
+
+        assert_ne!(first_identity, second_identity);
+        assert_eq!(
+            first.runtime().machine_registry_path(first_identity),
+            Some(Path::new("/private/first"))
+        );
+        assert_eq!(first.runtime().machine_registry_path(second_identity), None);
+        assert_eq!(second.runtime().machine_registry_path(first_identity), None);
+        Ok(())
+    }
+
+    #[test]
+    fn post_url_validation_errors_do_not_leak_machine_paths() {
+        const PATH: &str = "/very/private/registry";
+        let error = match parsed(&format!(
+            "[bzlmod]\nregistries = file://{PATH}\nremote_repository_cache = read\nremote_repository_cache_use_case = bzlmod-team\n"
+        )) {
+            Ok(_) => panic!("file-backed remote reuse without a trust domain must fail"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains("remote_repository_cache_trust_domain"));
+        assert!(!message.contains(PATH));
+    }
+
+    #[derive(Default)]
+    struct RecordingHasher(Vec<u8>);
+
+    impl Hasher for RecordingHasher {
+        fn finish(&self) -> u64 {
+            0
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.extend_from_slice(bytes);
+        }
     }
 
     #[test]
