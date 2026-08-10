@@ -9,10 +9,12 @@
  */
 
 use buck2_bzlmod::DependencyRepoName;
+use buck2_bzlmod::ExtensionUseKind;
 use buck2_bzlmod::ModuleFile;
 use buck2_bzlmod::ModuleKey;
 use buck2_bzlmod::ModuleName;
 use buck2_bzlmod::ModuleOverride;
+use buck2_bzlmod::RawAttributeValue;
 use buck2_bzlmod::Version;
 use buck2_interpreter::module_evaluator::ModuleFileEvalKind;
 use buck2_interpreter::module_evaluator::ModuleFileEvaluation;
@@ -500,6 +502,8 @@ fn exact_global_surface_includes_only_isolated_phase_two_capabilities() {
             "str",
             "tuple",
             "type",
+            "use_extension",
+            "use_repo",
             "zip",
         ]
     );
@@ -547,14 +551,349 @@ fn build_action_filesystem_and_network_globals_are_absent() {
 #[test]
 fn later_phase_module_directives_fail_explicitly() {
     for directive in [
-        "use_extension(\"//:extensions.bzl\", \"ext\")",
-        "use_repo(None, \"repo\")",
         "use_repo_rule(\"//:repo.bzl\", \"repo_rule\")",
         "register_toolchains(\"//:toolchain\")",
         "register_execution_platforms(\"//:platform\")",
     ] {
         let name = directive.split_once('(').unwrap().0;
         assert_rejected(root(directive), &format!("Variable `{name}` not found"));
+    }
+}
+
+#[test]
+fn regular_extension_uses_coalesce_and_preserve_all_source_ordered_events() {
+    let file = root(
+        r#"
+module(name = "root", version = "1.2", repo_name = "self")
+a = use_extension("//pkg:defs.notbzl", "ext")
+getattr(a, "tag-name")(**{
+    "attr-name": 123456789012345678901234567890,
+    "sequence": ["x", (True, False)],
+    "mapping": {"first": 1, "second": [2]},
+})
+b = use_extension("@self//pkg:defs.notbzl", "ext", dev_dependency = True)
+[b.item(value = i) for i in range(2)]
+use_repo(a, "plain", alias = "{name}.{version}")
+"#,
+    )
+    .unwrap();
+
+    let [extension] = file.extension_uses() else {
+        panic!("expected one coalesced extension use")
+    };
+    assert_eq!(extension.first_use_ordinal(), 0);
+    match extension.kind() {
+        ExtensionUseKind::Regular {
+            extension_file,
+            extension_name,
+        } => {
+            assert_eq!(extension_file.as_str(), "@self//pkg:defs.notbzl");
+            assert_eq!(extension_name.as_str(), "ext");
+        }
+    }
+    assert_eq!(extension.proxies().len(), 2);
+    assert_eq!(extension.proxies()[0].ordinal(), 1);
+    assert_eq!(
+        extension.proxies()[0].exported_name().unwrap().as_str(),
+        "a"
+    );
+    assert_eq!(extension.proxies()[1].ordinal(), 3);
+    assert!(extension.proxies()[1].is_dev_dependency());
+
+    let tags = extension.tags();
+    assert_eq!(tags.len(), 3);
+    assert_eq!(tags[0].ordinal(), 2);
+    assert_eq!(tags[0].class_name(), "tag-name");
+    assert_eq!(tags[0].attributes()[0].name(), "attr-name");
+    assert_eq!(
+        tags[0].attributes()[0].value(),
+        &RawAttributeValue::Integer(
+            buck2_bzlmod::RawInteger::parse_decimal("123456789012345678901234567890").unwrap()
+        )
+    );
+    assert_eq!(tags[1].ordinal(), 4);
+    assert_eq!(tags[2].ordinal(), 5);
+    assert!(tags[1].is_dev_dependency());
+    assert!(tags[2].is_dev_dependency());
+    assert!(
+        tags.iter()
+            .all(|tag| tag.location().as_str().contains("MODULE.bazel:"))
+    );
+
+    let imports = extension.proxies()[0].imports();
+    assert_eq!(imports.len(), 2);
+    assert_eq!(imports[0].ordinal(), 6);
+    assert_eq!(imports[0].local_name().as_str(), "plain");
+    assert_eq!(imports[0].exported_name().as_str(), "plain");
+    assert_eq!(imports[1].ordinal(), 7);
+    assert_eq!(imports[1].local_name().as_str(), "alias");
+    assert_eq!(imports[1].exported_name().as_str(), "root.1.2");
+    assert_eq!(imports[0].location(), imports[1].location());
+}
+
+#[test]
+fn main_repository_extension_label_forms_coalesce_without_a_module_directive() {
+    let file = root(
+        r#"
+a = use_extension("defs", "ext")
+b = use_extension(":defs", "ext")
+c = use_extension("//:defs", "ext")
+d = use_extension("@//:defs", "ext")
+"#,
+    )
+    .unwrap();
+    let [extension] = file.extension_uses() else {
+        panic!("expected one extension use")
+    };
+    let ExtensionUseKind::Regular { extension_file, .. } = extension.kind();
+    assert_eq!(extension_file.as_str(), "//:defs");
+    assert_eq!(extension.proxies().len(), 4);
+}
+
+#[test]
+fn extension_proxy_export_uses_first_assignment_and_inline_proxy_stays_unnamed() {
+    let file = root(
+        r#"
+first = use_extension("//:ext.bzl", "ext")
+second = first
+use_extension("//:ext.bzl", "ext").tag()
+"#,
+    )
+    .unwrap();
+    let [extension] = file.extension_uses() else {
+        panic!("expected one extension use")
+    };
+    assert_eq!(extension.proxies().len(), 2);
+    assert_eq!(
+        extension.proxies()[0].exported_name().unwrap().as_str(),
+        "first"
+    );
+    assert!(extension.proxies()[1].exported_name().is_none());
+    assert_eq!(extension.tags()[0].ordinal(), 3);
+
+    let located = root(
+        "e = use_extension(\"//:ext.bzl\", \"ext\")\n\
+         e.tag()\n\
+         use_repo(e, \"repo\")",
+    )
+    .unwrap();
+    let extension = &located.extension_uses()[0];
+    assert_eq!(
+        extension.proxies()[0].location().as_str(),
+        "MODULE.bazel:1:5-39"
+    );
+    assert_eq!(
+        extension.tags()[0].location().as_str(),
+        "MODULE.bazel:2:1-8"
+    );
+    assert_eq!(
+        extension.proxies()[0].imports()[0].location().as_str(),
+        "MODULE.bazel:3:1-20"
+    );
+}
+
+#[test]
+fn ignored_dev_extension_is_detached_but_reserves_imports_and_event_gaps() {
+    let file = root_ignoring_dev(
+        r#"
+dev = use_extension("//:dev.bzl", "dev", dev_dependency = True)
+dev.anything(value = None)
+use_repo(dev, "ignored_repo")
+regular = use_extension("//:regular.bzl", "regular")
+regular.tag(value = 1)
+"#,
+    )
+    .unwrap();
+    let [extension] = file.extension_uses() else {
+        panic!("expected only the retained extension use")
+    };
+    assert_eq!(extension.first_use_ordinal(), 4);
+    assert_eq!(extension.proxies()[0].ordinal(), 5);
+    assert_eq!(extension.tags()[0].ordinal(), 6);
+
+    assert_rejected(
+        root_ignoring_dev(
+            r#"
+dev = use_extension("//:dev.bzl", "dev", dev_dependency = True)
+use_repo(dev, "same")
+regular = use_extension("//:regular.bzl", "regular")
+use_repo(regular, "same")
+"#,
+        ),
+        "repo name 'same'",
+    );
+}
+
+#[test]
+fn dependency_dev_extension_is_detached_and_ignored_tag_still_validates_kwargs_shape() {
+    let file = dependency(
+        r#"
+module(name = "dep", version = "1.0")
+dev = use_extension("//:dev.bzl", "dev", dev_dependency = True)
+dev.tag(value = None)
+regular = use_extension("//:regular.bzl", "regular")
+"#,
+        "dep",
+        "1.0",
+    )
+    .unwrap();
+    let [extension] = file.extension_uses() else {
+        panic!("expected only the regular extension")
+    };
+    assert_eq!(extension.first_use_ordinal(), 3);
+    assert_eq!(extension.proxies()[0].ordinal(), 4);
+
+    assert_rejected(
+        root_ignoring_dev(
+            "dev = use_extension(\"//:dev.bzl\", \"dev\", dev_dependency = True)\n\
+             dev.tag(**{1: \"value\"})",
+        ),
+        "not an identifier",
+    );
+}
+
+#[test]
+fn extension_calls_validate_isolation_call_shape_and_raw_value_graphs() {
+    assert_rejected(
+        root("use_extension(\"bad label\", \"not-valid\")"),
+        "extension name is not a valid identifier",
+    );
+    assert_rejected(
+        root("use_extension(\"//:ext.bzl\", \"ext\", isolate = True)"),
+        "experimental isolated-extension-usages semantics",
+    );
+    assert_rejected(
+        root("use_extension(\"//:ext.bzl\", \"ext\", isolate = False)"),
+        "experimental isolated-extension-usages semantics",
+    );
+    assert_rejected(
+        root("use_extension(\"@@bad//:label\", \"not-valid\", isolate = True)"),
+        "experimental isolated-extension-usages semantics",
+    );
+    assert_rejected(
+        root("use_extension(\"@@bad//:label\", \"not-valid\", isolate = False)"),
+        "experimental isolated-extension-usages semantics",
+    );
+    assert_rejected(
+        root("use_extension(\"@@bad//:label\", \"not-valid\", isolate = None)"),
+        "experimental isolated-extension-usages semantics",
+    );
+    assert_rejected(
+        root("use_extension(\"@@bad//:label\", \"ext\")"),
+        "canonical repository labels are not accepted",
+    );
+    assert_rejected(
+        root("e = use_extension(\"//:ext.bzl\", \"ext\")\ne.tag(1)"),
+        "positional",
+    );
+    assert_rejected(
+        root("e = use_extension(\"//:ext.bzl\", \"ext\")\ne.tag(value = None)"),
+        "unsupported module extension tag attribute value",
+    );
+    assert_rejected(
+        root("e = use_extension(\"//:ext.bzl\", \"ext\")\ne.tag(value = len)"),
+        "unsupported module extension tag attribute value",
+    );
+    assert_rejected(
+        root("e = use_extension(\"//:ext.bzl\", \"ext\")\ne.tag(value = {1: \"x\"})"),
+        "dictionary key",
+    );
+    assert_rejected(
+        root(
+            "e = use_extension(\"//:ext.bzl\", \"ext\")\n\
+             value = []\n\
+             value.append(value)\n\
+             e.tag(value = value)",
+        ),
+        "cyclic module extension tag attribute value",
+    );
+
+    let depth_64 = format!("{}0{}", "[".repeat(64), "]".repeat(64));
+    root(&format!(
+        "e = use_extension(\"//:ext.bzl\", \"ext\")\ne.tag(value = {depth_64})"
+    ))
+    .unwrap();
+    let depth_65 = format!("{}0{}", "[".repeat(65), "]".repeat(65));
+    assert_rejected(
+        root(&format!(
+            "e = use_extension(\"//:ext.bzl\", \"ext\")\ne.tag(value = {depth_65})"
+        )),
+        "nesting exceeds 64 levels",
+    );
+
+    let shared = root(
+        "e = use_extension(\"//:ext.bzl\", \"ext\")\n\
+         value = [1, {\"nested\": True}]\n\
+         e.tag(first = value, second = value)",
+    )
+    .unwrap();
+    assert_eq!(shared.extension_uses()[0].tags()[0].attributes().len(), 2);
+}
+
+#[test]
+fn use_repo_validates_global_local_and_usage_wide_exported_collisions() {
+    assert_rejected(
+        root("use_repo(None, 1)"),
+        "expected a module extension proxy, got NoneType",
+    );
+    assert_rejected(
+        root("e = use_extension(\"//:ext.bzl\", \"ext\")\nuse_repo(e, 1)"),
+        "repository name got value of type 'int', want 'string'",
+    );
+    assert_rejected(
+        root(
+            "e = use_extension(\"//:ext.bzl\", \"ext\")\n\
+             use_repo(e, \"same\")\n\
+             use_repo(e, \"same\")",
+        ),
+        "repo name 'same'",
+    );
+    assert_rejected(
+        root(
+            "e = use_extension(\"//:ext.bzl\", \"ext\")\n\
+             use_repo(e, one = \"exported\")\n\
+             use_repo(e, two = \"exported\")",
+        ),
+        "exported as 'exported' by module extension 'ext' is already imported",
+    );
+    assert_rejected(
+        root(
+            "one = use_extension(\"//:ext.bzl\", \"ext\")\n\
+             two = use_extension(\"//:ext.bzl\", \"ext\")\n\
+             use_repo(one, local_one = \"exported\")\n\
+             use_repo(two, local_two = \"exported\")",
+        ),
+        "already imported",
+    );
+    assert_rejected(
+        root_ignoring_dev(
+            "dev = use_extension(\"//:dev.bzl\", \"dev_ext\", dev_dependency = True)\n\
+             use_repo(dev, one = \"exported\")\n\
+             use_repo(dev, two = \"exported\")",
+        ),
+        "exported as 'exported' by module extension 'dev_ext' is already imported",
+    );
+    assert_rejected(
+        root(
+            "e = use_extension(\"//:ext.bzl\", \"ext\")\n\
+             use_repo(e, \"{name}\")",
+        ),
+        "invalid user-provided repo name '{name}'",
+    );
+
+    for source in [
+        "module(name = \"root\", repo_name = \"same\")\n\
+         e = use_extension(\"//:ext.bzl\", \"ext\")\n\
+         use_repo(e, \"same\")",
+        "bazel_dep(name = \"dep\", repo_name = \"same\")\n\
+         e = use_extension(\"//:ext.bzl\", \"ext\")\n\
+         use_repo(e, \"same\")",
+        "one = use_extension(\"//:one.bzl\", \"ext\")\n\
+         two = use_extension(\"//:two.bzl\", \"ext\")\n\
+         use_repo(one, \"same\")\n\
+         use_repo(two, \"same\")",
+    ] {
+        assert_rejected(root(source), "repo name 'same'");
     }
 }
 

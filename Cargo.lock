@@ -2641,6 +2641,7 @@ dependencies = [
  "futures 0.3.34",
  "gazebo",
  "itertools 0.15.0",
+ "num-bigint 0.5.1",
  "pagable",
  "plist",
  "ref-cast",

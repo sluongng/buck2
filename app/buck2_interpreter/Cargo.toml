@@ -27,6 +27,7 @@ fancy-regex.workspace = true
 futures.workspace = true
 gazebo.workspace = true
 itertools.workspace = true
+num-bigint.workspace = true
 pagable.workspace = true
 plist.workspace = true
 ref-cast.workspace = true
