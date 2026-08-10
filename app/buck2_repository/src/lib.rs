@@ -8,7 +8,7 @@
  * above-listed licenses.
  */
 
-//! Transport-independent data types for Bazel index registries.
+//! Data types and transport primitives for Bazel index registries.
 //!
 //! The models ignore unknown fields, matching Bazel's Gson decoding while
 //! exposing only bounded, typed data to consumers. `docs_url` is explicitly
@@ -20,9 +20,13 @@
 //! required fields and the source discriminator remain strict. `MODULE.bazel`
 //! remains opaque bytes owned by the caller.
 
+mod file_registry;
 mod path;
 mod registry_json;
 
+pub use file_registry::FileRegistryRead;
+pub use file_registry::FileRegistryReadError;
+pub use file_registry::read_file_registry;
 pub use path::RegistryFileKind;
 pub use path::RegistryPath;
 pub use path::RegistryPathError;
