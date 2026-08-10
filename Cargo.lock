@@ -2623,6 +2623,7 @@ version = "0.1.0"
 dependencies = [
  "allocative",
  "async-trait",
+ "buck2_bzlmod",
  "buck2_common",
  "buck2_core",
  "buck2_error",

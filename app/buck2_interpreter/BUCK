@@ -39,6 +39,7 @@ rust_library(
         "fbsource//third-party/rust:tokio",
         "fbsource//third-party/rust:triomphe",
         "//buck2/allocative/allocative:allocative",
+        "//buck2/app/buck2_bzlmod:buck2_bzlmod",
         "//buck2/app/buck2_common:buck2_common",
         "//buck2/app/buck2_core:buck2_core",
         "//buck2/app/buck2_error:buck2_error",
@@ -76,5 +77,16 @@ rust_unittest(
     crate_root = "tests/module_file.rs",
     deps = [
         ":buck2_interpreter",
+    ],
+)
+
+rust_unittest(
+    name = "module_evaluator_tests",
+    srcs = ["tests/module_evaluator.rs"],
+    crate_root = "tests/module_evaluator.rs",
+    deps = [
+        ":buck2_interpreter",
+        "//buck2/app/buck2_bzlmod:buck2_bzlmod",
+        "//buck2/app/buck2_error:buck2_error",
     ],
 )
