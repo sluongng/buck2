@@ -8,12 +8,14 @@
  * above-listed licenses.
  */
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
 use crate::ModuleKey;
 use crate::ModuleName;
 use crate::Version;
+use crate::module_extension::ExtensionUse;
 
 /// A patch label normalized during `MODULE.bazel` evaluation.
 ///
@@ -345,6 +347,7 @@ pub struct ModuleFile {
     declaration: Option<ModuleDeclaration>,
     dependencies: Box<[DependencyRequest]>,
     overrides: Box<[ModuleOverride]>,
+    extension_uses: Box<[ExtensionUse]>,
 }
 
 impl ModuleFile {
@@ -357,7 +360,95 @@ impl ModuleFile {
             declaration,
             dependencies,
             overrides,
+            extension_uses: Box::new([]),
         }
+    }
+
+    /// Attaches source-ordered module extension uses to the evaluated file.
+    pub fn with_extension_uses(
+        mut self,
+        extension_uses: Box<[ExtensionUse]>,
+    ) -> Result<Self, ModuleFileExtensionUseError> {
+        for uses in extension_uses.windows(2) {
+            if uses[0].first_use_ordinal() >= uses[1].first_use_ordinal() {
+                return Err(ModuleFileExtensionUseError::UsesNotSourceOrdered {
+                    previous: uses[0].first_use_ordinal(),
+                    next: uses[1].first_use_ordinal(),
+                });
+            }
+        }
+
+        let mut identities = BTreeSet::new();
+        let mut event_ordinals = BTreeSet::new();
+        for extension_use in extension_uses.iter() {
+            if !identities.insert((
+                extension_use.kind().clone(),
+                extension_use.isolation().clone(),
+            )) {
+                return Err(ModuleFileExtensionUseError::DuplicateExtensionIdentity {
+                    first_use: extension_use.first_use_ordinal(),
+                });
+            }
+            if !event_ordinals.insert(extension_use.first_use_ordinal()) {
+                return Err(ModuleFileExtensionUseError::DuplicateEventOrdinal(
+                    extension_use.first_use_ordinal(),
+                ));
+            }
+            for proxy in extension_use.proxies() {
+                if !event_ordinals.insert(proxy.ordinal()) {
+                    return Err(ModuleFileExtensionUseError::DuplicateEventOrdinal(
+                        proxy.ordinal(),
+                    ));
+                }
+                for import in proxy.imports() {
+                    if !event_ordinals.insert(import.ordinal()) {
+                        return Err(ModuleFileExtensionUseError::DuplicateEventOrdinal(
+                            import.ordinal(),
+                        ));
+                    }
+                }
+            }
+            for tag in extension_use.tags() {
+                if !event_ordinals.insert(tag.ordinal()) {
+                    return Err(ModuleFileExtensionUseError::DuplicateEventOrdinal(
+                        tag.ordinal(),
+                    ));
+                }
+            }
+        }
+
+        let mut local_repo_names = BTreeSet::new();
+        if let Some(declaration) = self.declaration.as_ref() {
+            let own_apparent_repo = declaration
+                .repo_name()
+                .filter(|repo_name| !repo_name.is_empty())
+                .or_else(|| declaration.name().map(ModuleName::as_str));
+            if let Some(repo_name) = own_apparent_repo {
+                local_repo_names.insert(repo_name.to_owned());
+            }
+        }
+        for dependency in self.dependencies.iter() {
+            if let DependencyRepoName::Apparent(repo_name) = dependency.repo_name() {
+                if !local_repo_names.insert(repo_name.to_string()) {
+                    return Err(ModuleFileExtensionUseError::DuplicateLocalRepoName(
+                        repo_name.clone(),
+                    ));
+                }
+            }
+        }
+        for extension_use in extension_uses.iter() {
+            for proxy in extension_use.proxies() {
+                for import in proxy.imports() {
+                    if !local_repo_names.insert(import.local_name().as_str().to_owned()) {
+                        return Err(ModuleFileExtensionUseError::DuplicateLocalRepoName(
+                            import.local_name().as_str().into(),
+                        ));
+                    }
+                }
+            }
+        }
+        self.extension_uses = extension_uses;
+        Ok(self)
     }
 
     pub fn declaration(&self) -> Option<&ModuleDeclaration> {
@@ -371,7 +462,42 @@ impl ModuleFile {
     pub fn overrides(&self) -> &[ModuleOverride] {
         &self.overrides
     }
+
+    pub fn extension_uses(&self) -> &[ExtensionUse] {
+        &self.extension_uses
+    }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModuleFileExtensionUseError {
+    UsesNotSourceOrdered { previous: u32, next: u32 },
+    DuplicateExtensionIdentity { first_use: u32 },
+    DuplicateEventOrdinal(u32),
+    DuplicateLocalRepoName(Box<str>),
+}
+
+impl fmt::Display for ModuleFileExtensionUseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UsesNotSourceOrdered { previous, next } => write!(
+                f,
+                "module extension uses must be source ordered, got {previous} then {next}"
+            ),
+            Self::DuplicateExtensionIdentity { first_use } => write!(
+                f,
+                "duplicate module extension identity at first-use ordinal {first_use}"
+            ),
+            Self::DuplicateEventOrdinal(ordinal) => {
+                write!(f, "duplicate module extension event ordinal {ordinal}")
+            }
+            Self::DuplicateLocalRepoName(name) => {
+                write!(f, "duplicate module-local repository name '{name}'")
+            }
+        }
+    }
+}
+
+impl Error for ModuleFileExtensionUseError {}
 
 #[cfg(test)]
 mod tests {
@@ -438,6 +564,7 @@ mod tests {
         assert!(!file.dependencies()[0].is_nodep());
         assert!(file.dependencies()[1].is_nodep());
         assert!(file.dependencies()[1].is_dev_dependency());
+        assert!(file.extension_uses().is_empty());
     }
 
     #[test]
