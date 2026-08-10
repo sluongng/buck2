@@ -14,6 +14,7 @@ use std::fmt;
 
 use crate::ModuleKey;
 use crate::ModuleName;
+use crate::ModuleRegistrations;
 use crate::RepoRuleUse;
 use crate::Version;
 use crate::module_extension::ExtensionUse;
@@ -350,6 +351,7 @@ pub struct ModuleFile {
     overrides: Box<[ModuleOverride]>,
     extension_uses: Box<[ExtensionUse]>,
     repo_rule_uses: Box<[RepoRuleUse]>,
+    registrations: ModuleRegistrations,
 }
 
 impl ModuleFile {
@@ -364,7 +366,14 @@ impl ModuleFile {
             overrides,
             extension_uses: Box::new([]),
             repo_rule_uses: Box::new([]),
+            registrations: ModuleRegistrations::default(),
         }
+    }
+
+    /// Attaches the source-ordered registration records from this module file.
+    pub fn with_registrations(mut self, registrations: ModuleRegistrations) -> Self {
+        self.registrations = registrations;
+        self
     }
 
     /// Attaches source-ordered module extension uses to the evaluated file.
@@ -425,6 +434,10 @@ impl ModuleFile {
 
     pub fn repo_rule_uses(&self) -> &[RepoRuleUse] {
         &self.repo_rule_uses
+    }
+
+    pub fn registrations(&self) -> &ModuleRegistrations {
+        &self.registrations
     }
 }
 
@@ -701,6 +714,14 @@ mod tests {
         assert!(file.dependencies()[1].is_nodep());
         assert!(file.dependencies()[1].is_dev_dependency());
         assert!(file.extension_uses().is_empty());
+        assert_eq!(file.registrations(), &ModuleRegistrations::default());
+
+        let registrations = ModuleRegistrations::new(
+            vec![crate::RawAbsoluteTargetPattern::parse("//:host").unwrap()].into_boxed_slice(),
+            vec![crate::RawAbsoluteTargetPattern::parse("@repo//:all").unwrap()].into_boxed_slice(),
+        );
+        let file = file.with_registrations(registrations.clone());
+        assert_eq!(file.registrations(), &registrations);
     }
 
     #[test]

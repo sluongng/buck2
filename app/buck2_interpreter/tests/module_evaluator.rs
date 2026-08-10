@@ -167,7 +167,7 @@ bazel_dep(name = "ggg", repo_name = "gee", max_compatibility_level = 5)
 }
 
 #[test]
-fn evaluates_digest_pinned_bazel_root_extensions_through_the_registration_gate() {
+fn evaluates_digest_pinned_bazel_root_module_with_all_phase_two_records() {
     const COMMIT: &str = "d99d82e5d21c2795a6b489342886c336ec05509a";
     const SOURCE: &str =
         include_str!("../testcases/bazel/d99d82e5d21c2795a6b489342886c336ec05509a/MODULE.bazel");
@@ -202,16 +202,9 @@ fn evaluates_digest_pinned_bazel_root_extensions_through_the_registration_gate()
     // exhaustive for repository rules below and inventory-based for regular
     // extensions.
 
-    // The full unchanged source gets through every regular and innate
-    // extension call. Registration directives are a principled later-phase
-    // boundary and remain at their original source location.
-    let full_error = root(SOURCE).unwrap_err().to_string();
-    assert!(full_error.contains("register_execution_platforms"));
-    assert!(full_error.contains("MODULE.bazel:505"), "{full_error}");
-
-    let registration = "register_execution_platforms(\"//:default_host_platform\")";
-    let (extension_section, _) = SOURCE.split_once(registration).unwrap();
-    let file = root(extension_section).unwrap();
+    let file = root(SOURCE).unwrap();
+    assert_eq!(file.dependencies().len(), 39);
+    assert_eq!(file.overrides().len(), 8);
     assert_eq!(file.extension_uses().len(), 11);
     assert_eq!(
         file.extension_uses()
@@ -246,6 +239,27 @@ fn evaluates_digest_pinned_bazel_root_extensions_through_the_registration_gate()
             .map(|use_value| use_value.invocations().len())
             .sum::<usize>(),
         9
+    );
+    assert_eq!(
+        file.registrations()
+            .execution_platforms()
+            .iter()
+            .map(|pattern| pattern.as_str())
+            .collect::<Vec<_>>(),
+        ["//:default_host_platform"]
+    );
+    assert_eq!(
+        file.registrations()
+            .toolchains()
+            .iter()
+            .map(|pattern| pattern.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "//:all",
+            "@local_config_winsdk//:all",
+            "//tools/res:empty_rc_toolchain",
+            "@graalvm_ce_toolchains//:gvm",
+        ]
     );
 
     let repo_rule_golden: JsonValue = serde_json::from_slice(REPO_RULE_GOLDEN).unwrap();
@@ -402,6 +416,192 @@ bazel_dep(name = "googletest", version = "1.17.0", repo_name = None, dev_depende
         "bazel_features@1.50.0"
     );
     assert!(!file.dependencies()[0].is_dev_dependency());
+}
+
+#[test]
+fn evaluates_exact_rules_go_0_62_0_registry_module_with_dev_registration_omitted() {
+    const SOURCE: &str = include_str!("../testcases/bcr/rules_go/0.62.0/registry/MODULE.bazel");
+    assert_eq!(SOURCE.len(), 3_734);
+    assert_eq!(
+        sha256(SOURCE.as_bytes()),
+        "8ee616065c3d2b2f7ac0880108316ce8d0c332b3a30aad24e95c0bc124ec853e"
+    );
+
+    let file = dependency(SOURCE, "rules_go", "0.62.0").unwrap();
+    assert_eq!(file.dependencies().len(), 8);
+    assert_eq!(file.extension_uses().len(), 2);
+    assert_eq!(
+        file.extension_uses()
+            .iter()
+            .map(|use_value| use_value.tags().len())
+            .sum::<usize>(),
+        2
+    );
+    assert_eq!(
+        file.extension_uses()
+            .iter()
+            .flat_map(|use_value| use_value.proxies())
+            .map(|proxy| proxy.imports().len())
+            .sum::<usize>(),
+        17
+    );
+    assert_eq!(
+        registered_patterns(&file),
+        (vec![], vec!["@go_toolchains//:all"])
+    );
+    assert!(SOURCE.contains("@protoc_toolchains//..."));
+}
+
+#[test]
+fn exact_rules_cc_0_2_22_registration_prefix_precedes_the_archive_override_gate() {
+    const C_SOURCE: &str = include_str!("../testcases/bcr/rules_cc/0.2.22/c/registry/MODULE.bazel");
+    const CPP_SOURCE: &str =
+        include_str!("../testcases/bcr/rules_cc/0.2.22/cpp/registry/MODULE.bazel");
+    assert_eq!(C_SOURCE, CPP_SOURCE);
+    assert_eq!(C_SOURCE.len(), 2_039);
+    assert_eq!(
+        sha256(C_SOURCE.as_bytes()),
+        "94df4328edef9e44d38de5e73b037cd348e75e7ae55f4e21bf07878c41a31ebb"
+    );
+
+    let error = dependency(C_SOURCE, "rules_cc", "0.2.22")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("archive_override() is not supported"),
+        "{error}"
+    );
+    assert!(error.contains("MODULE.bazel:41"), "{error}");
+
+    let registration_prefix = C_SOURCE.split_once("archive_override(").unwrap().0;
+    let file = dependency(registration_prefix, "rules_cc", "0.2.22").unwrap();
+    assert_eq!(
+        registered_patterns(&file),
+        (
+            vec![],
+            vec![
+                "@local_config_cc_toolchains//:all",
+                "//cc/private/toolchain/test:default_test_runner_toolchain",
+            ],
+        )
+    );
+}
+
+#[test]
+fn exact_rules_java_9_7_1_registration_prefix_executes_comprehensions_in_order() {
+    const SOURCE: &str = include_str!("../testcases/bcr/rules_java/9.7.1/registry/MODULE.bazel");
+    const UPSTREAM_SOURCE: &str =
+        include_str!("../testcases/bcr/rules_java/9.7.1/source/MODULE.bazel");
+    assert_eq!(SOURCE, UPSTREAM_SOURCE);
+    assert_eq!(SOURCE.len(), 4_054);
+    assert_eq!(
+        sha256(SOURCE.as_bytes()),
+        "aced1dc2cf4282cf56f1ab13b697b88dc676898b2630713d3e82a94371f7eceb"
+    );
+
+    let error = dependency(SOURCE, "rules_java", "9.7.1")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("archive_override() is not supported"),
+        "{error}"
+    );
+    assert!(error.contains("MODULE.bazel:125"), "{error}");
+
+    let registration_prefix = SOURCE.split_once("archive_override(").unwrap().0;
+    let file = dependency(registration_prefix, "rules_java", "9.7.1").unwrap();
+    let actual = file
+        .registrations()
+        .toolchains()
+        .iter()
+        .map(|pattern| pattern.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let mut expected = vec![
+        "//toolchains:all".to_owned(),
+        "@local_jdk//:runtime_toolchain_definition".to_owned(),
+        "@local_jdk//:bootstrap_runtime_toolchain_definition".to_owned(),
+    ];
+    for (version, platforms) in [
+        (
+            "8",
+            &[
+                "linux",
+                "linux_aarch64",
+                "linux_s390x",
+                "macos",
+                "macos_aarch64",
+                "windows",
+            ][..],
+        ),
+        (
+            "11",
+            &[
+                "linux",
+                "linux_aarch64",
+                "linux_ppc64le",
+                "linux_s390x",
+                "macos",
+                "macos_aarch64",
+                "win",
+                "win_arm64",
+            ],
+        ),
+        (
+            "17",
+            &[
+                "linux",
+                "linux_aarch64",
+                "linux_ppc64le",
+                "linux_s390x",
+                "macos",
+                "macos_aarch64",
+                "win",
+                "win_arm64",
+            ],
+        ),
+        (
+            "21",
+            &[
+                "linux",
+                "linux_aarch64",
+                "linux_ppc64le",
+                "linux_riscv64",
+                "linux_s390x",
+                "macos",
+                "macos_aarch64",
+                "win",
+                "win_arm64",
+            ],
+        ),
+        (
+            "25",
+            &[
+                "linux",
+                "linux_aarch64",
+                "linux_ppc64le",
+                "linux_riscv64",
+                "linux_s390x",
+                "macos",
+                "macos_aarch64",
+                "win",
+                "win_arm64",
+            ],
+        ),
+    ] {
+        let prefix = if version == "8" {
+            "remote_jdk"
+        } else {
+            "remotejdk"
+        };
+        expected.extend(
+            platforms.iter().map(|platform| {
+                format!("@{prefix}{version}_{platform}_toolchain_config_repo//:all")
+            }),
+        );
+    }
+    assert_eq!(actual.len(), 43);
+    assert_eq!(actual, expected);
+    assert!(file.registrations().execution_platforms().is_empty());
 }
 
 #[test]
@@ -733,6 +933,8 @@ fn exact_global_surface_includes_only_isolated_phase_two_capabilities() {
             "ord",
             "print",
             "range",
+            "register_execution_platforms",
+            "register_toolchains",
             "repr",
             "reversed",
             "single_version_override",
@@ -787,15 +989,168 @@ fn build_action_filesystem_and_network_globals_are_absent() {
     );
 }
 
+fn registered_patterns(file: &ModuleFile) -> (Vec<&str>, Vec<&str>) {
+    (
+        file.registrations()
+            .execution_platforms()
+            .iter()
+            .map(|pattern| pattern.as_str())
+            .collect(),
+        file.registrations()
+            .toolchains()
+            .iter()
+            .map(|pattern| pattern.as_str())
+            .collect(),
+    )
+}
+
 #[test]
-fn later_phase_module_directives_fail_explicitly() {
-    for directive in [
-        "register_toolchains(\"//:toolchain\")",
-        "register_execution_platforms(\"//:platform\")",
+fn module_registrations_accept_zero_and_multiple_patterns_without_rewriting() {
+    let file = root(
+        r#"
+register_execution_platforms()
+register_execution_platforms("//:host", "@platforms//...", "//malformed::opaque")
+register_toolchains()
+register_toolchains("//:all", "//:all", "@generated//pkg")
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        registered_patterns(&file),
+        (
+            vec!["//:host", "@platforms//...", "//malformed::opaque"],
+            vec!["//:all", "//:all", "@generated//pkg"],
+        )
+    );
+}
+
+#[test]
+fn module_registration_dev_dependency_is_named_only_and_label_keywords_are_rejected() {
+    let retained = root(
+        "register_toolchains(\"//:dev\", dev_dependency = True)\n\
+         register_execution_platforms(dev_dependency = True)",
+    )
+    .unwrap();
+    assert_eq!(registered_patterns(&retained), (vec![], vec!["//:dev"]));
+
+    assert_rejected(
+        root("register_toolchains(\"//:all\", True)"),
+        "at index 1 of register_toolchains, got element of type bool, want string",
+    );
+    assert_rejected(
+        root("register_toolchains(toolchain_labels = \"//:all\")"),
+        "toolchain_labels",
+    );
+    assert_rejected(
+        root("register_execution_platforms(platform_labels = \"//:host\")"),
+        "platform_labels",
+    );
+}
+
+#[test]
+fn registration_active_call_checks_all_types_before_prefixes_then_prefixes_in_order() {
+    let type_error = root("register_toolchains(\"relative-first\", \"//:ok\", 1)")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        type_error
+            .contains("at index 2 of register_toolchains, got element of type int, want string"),
+        "{type_error}"
+    );
+    assert!(
+        !type_error
+            .lines()
+            .next()
+            .unwrap()
+            .contains("relative-first"),
+        "{type_error}"
+    );
+
+    let prefix_error =
+        root("register_execution_platforms(\"relative-first\", \"relative-second\")")
+            .unwrap_err()
+            .to_string();
+    let headline = prefix_error.lines().next().unwrap();
+    assert_eq!(
+        headline,
+        "error: Expected absolute target patterns (must begin with '//' or '@') for 'register_execution_platforms' argument, but got 'relative-first' as an argument"
+    );
+    assert!(!headline.contains("relative-second"), "{prefix_error}");
+}
+
+#[test]
+fn ignored_dev_registration_skips_values_but_still_makes_module_late() {
+    for result in [
+        root_ignoring_dev(
+            "register_toolchains(\"relative\", len, dev_dependency = True)\n\
+             module(name = \"root\")",
+        ),
+        dependency(
+            "register_execution_platforms(\"relative\", len, dev_dependency = True)\n\
+             module(name = \"dep\", version = \"1.0\")",
+            "dep",
+            "1.0",
+        ),
     ] {
-        let name = directive.split_once('(').unwrap().0;
-        assert_rejected(root(directive), &format!("Variable `{name}` not found"));
+        assert_rejected(result, "must be called before any other functions");
     }
+}
+
+#[test]
+fn registration_dev_policy_is_contextual_and_failures_do_not_publish_partial_state() {
+    let source = "register_execution_platforms(\"//:platform\", dev_dependency = True)\n\
+                  register_toolchains(\"@repo//...\", dev_dependency = True)";
+    assert_eq!(
+        registered_patterns(&root(source).unwrap()),
+        (vec!["//:platform"], vec!["@repo//..."])
+    );
+    assert_eq!(
+        registered_patterns(&root_ignoring_dev(source).unwrap()),
+        (vec![], vec![])
+    );
+    let dependency_source = format!("module(name = \"dep\", version = \"1.0\")\n{source}");
+    assert_eq!(
+        registered_patterns(&dependency(&dependency_source, "dep", "1.0").unwrap()),
+        (vec![], vec![])
+    );
+
+    assert_rejected(
+        root("register_toolchains(\"//:would-be-prefix\", \"relative\")"),
+        "relative",
+    );
+    assert_eq!(
+        registered_patterns(&root("pass").unwrap()),
+        (vec![], vec![])
+    );
+}
+
+#[test]
+fn registrations_do_not_consume_extension_or_repo_rule_ordinals() {
+    let file = root(
+        r#"
+e = use_extension("//:ext.bzl", "ext")
+register_toolchains("//:one")
+r = use_repo_rule("//:repo.bzl", "repo")
+register_execution_platforms("//:platform")
+e.tag(value = 1)
+r(name = "generated")
+register_toolchains("//:two")
+"#,
+    )
+    .unwrap();
+
+    let extension = &file.extension_uses()[0];
+    assert_eq!(extension.first_use_ordinal(), 0);
+    assert_eq!(extension.proxies()[0].ordinal(), 1);
+    assert_eq!(extension.tags()[0].ordinal(), 3);
+    let repo_rule = &file.repo_rule_uses()[0];
+    assert_eq!(repo_rule.first_use_ordinal(), 2);
+    assert_eq!(repo_rule.invocations()[0].ordinal(), 4);
+    assert_eq!(
+        registered_patterns(&file),
+        (vec!["//:platform"], vec!["//:one", "//:two"])
+    );
 }
 
 #[test]

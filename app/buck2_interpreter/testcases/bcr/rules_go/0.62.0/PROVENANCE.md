@@ -51,8 +51,11 @@ The upstream Apache-2.0 `LICENSE.txt` is stored unmodified with SHA-256
 
 ## Test boundary
 
-These fixtures test only that the selected current BUILD and `.bzl` source
+The syntax corpus verifies that the selected current BUILD and `.bzl` source
 text parses and validates under Buck2's production Bazel file policies. The
-test does not resolve Bzlmod dependencies or `load()` labels, evaluate Bazel
-application globals, run module extensions or repository rules, configure
-toolchains, analyze targets, or compile Go code.
+isolated module evaluator additionally digest-pins and fully evaluates the
+exact registry `MODULE.bazel` into Phase-2 records, including omission of its
+development-only recursive toolchain registration in dependency context. It
+does not resolve Bzlmod dependencies or `load()` labels, load module extensions
+or repository rules, expand registered target patterns, configure toolchains,
+analyze targets, or compile Go code.

@@ -5,11 +5,12 @@ non-yanked Bazel Central Registry releases used by the Buck2 Bazel-dialect
 parser tests. Tests are hermetic and verify each file's SHA-256 before parsing
 it with the production policy for its actual file kind.
 
-The corpus proves only that the selected current BUILD and `.bzl` source text
-is accepted by Buck2's Bazel syntax and validation policy. It does not resolve
-`MODULE.bazel`, loads, repository mappings, module extensions, repository
-rules, or toolchains; evaluate Bazel application globals; or build language
-targets. Module metadata is retained only as source provenance.
+The corpus primarily proves that the selected current BUILD and `.bzl` source
+text is accepted by Buck2's Bazel syntax and validation policy. The isolated
+module evaluator additionally exercises exact registry `MODULE.bazel` sources
+when its supported directive set is sufficient, without resolving loads,
+repository mappings, module extensions, repository rules, or registered target
+patterns. Module metadata is otherwise retained as source provenance.
 
 Each module/version directory records the immutable BCR entry revision,
 registry metadata hashes, archive URL and integrity, upstream source revision,

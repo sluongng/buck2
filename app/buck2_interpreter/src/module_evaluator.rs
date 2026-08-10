@@ -14,8 +14,9 @@
 //! network context. Its globals contain standard Starlark helpers, isolated
 //! `print`, `module`, `bazel_dep`, `single_version_override`,
 //! `local_path_override`, fail-closed stubs for other override directives,
-//! `use_extension`, `use_repo`, and `use_repo_rule`. A successful call
-//! publishes one immutable [`ModuleFile`] and its warnings.
+//! `register_execution_platforms`, `register_toolchains`, `use_extension`,
+//! `use_repo`, and `use_repo_rule`. A successful call publishes one immutable
+//! [`ModuleFile`] and its warnings.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -35,10 +36,12 @@ use buck2_bzlmod::ModuleFile;
 use buck2_bzlmod::ModuleKey;
 use buck2_bzlmod::ModuleName;
 use buck2_bzlmod::ModuleOverride;
+use buck2_bzlmod::ModuleRegistrations;
 use buck2_bzlmod::ModuleSourceLocation;
 use buck2_bzlmod::OrderedStringDict;
 use buck2_bzlmod::PatchLabel;
 use buck2_bzlmod::ProxyUse;
+use buck2_bzlmod::RawAbsoluteTargetPattern;
 use buck2_bzlmod::RawAttribute;
 use buck2_bzlmod::RawAttributeValue;
 use buck2_bzlmod::RawInteger;
@@ -290,6 +293,19 @@ enum ModuleFileEvaluationError {
     TagAttributeDepth { limit: usize, path: String },
     #[error("invalid module extension state: {0}")]
     InvalidExtensionState(String),
+    #[error("at index {index} of {directive}, got element of type {actual}, want string")]
+    RegistrationTargetType {
+        directive: &'static str,
+        index: usize,
+        actual: &'static str,
+    },
+    #[error(
+        "Expected absolute target patterns (must begin with '//' or '@') for '{directive}' argument, but got '{pattern}' as an argument"
+    )]
+    InvalidRegistrationTarget {
+        directive: &'static str,
+        pattern: String,
+    },
 }
 
 #[derive(Debug)]
@@ -313,6 +329,8 @@ struct WorkingModuleFile {
     extension_proxies: Vec<WorkingExtensionProxy>,
     repo_rule_uses: Vec<WorkingRepoRuleUse>,
     repo_rule_indices: BTreeMap<RepoRuleUseId, usize>,
+    execution_platforms: Vec<RawAbsoluteTargetPattern>,
+    toolchains: Vec<RawAbsoluteTargetPattern>,
 }
 
 #[derive(Debug)]
@@ -530,6 +548,8 @@ impl WorkingModuleFile {
             extension_proxies: Vec::new(),
             repo_rule_uses: Vec::new(),
             repo_rule_indices: BTreeMap::new(),
+            execution_platforms: Vec::new(),
+            toolchains: Vec::new(),
         }
     }
 
@@ -774,6 +794,57 @@ impl ModuleFileEvalState {
                 module_name,
                 path.into(),
             )))
+    }
+
+    fn add_registrations<'v>(
+        &self,
+        directive: &'static str,
+        labels: UnpackTuple<Value<'v>>,
+        dev_dependency: bool,
+        execution_platforms: bool,
+    ) -> buck2_error::Result<()> {
+        self.working.borrow_mut().had_non_module_call = true;
+        if dev_dependency && self.kind.ignores_dev_dependencies() {
+            return Ok(());
+        }
+
+        // Bazel casts every positional value before validating any target
+        // pattern. Keep these phases separate so a later type error wins over
+        // an earlier relative pattern and a failed call cannot append a prefix.
+        let raw_labels = labels
+            .items
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                value.unpack_str().ok_or_else(|| {
+                    buck2_error::Error::from(ModuleFileEvaluationError::RegistrationTargetType {
+                        directive,
+                        index,
+                        actual: value.get_type(),
+                    })
+                })
+            })
+            .collect::<buck2_error::Result<Vec<_>>>()?;
+        let registrations = raw_labels
+            .into_iter()
+            .map(|pattern| {
+                RawAbsoluteTargetPattern::parse(pattern).map_err(|_| {
+                    ModuleFileEvaluationError::InvalidRegistrationTarget {
+                        directive,
+                        pattern: pattern.to_owned(),
+                    }
+                    .into()
+                })
+            })
+            .collect::<buck2_error::Result<Vec<_>>>()?;
+
+        let mut working = self.working.borrow_mut();
+        if execution_platforms {
+            working.execution_platforms.extend(registrations);
+        } else {
+            working.toolchains.extend(registrations);
+        }
+        Ok(())
     }
 
     fn add_extension_proxy(
@@ -1190,6 +1261,10 @@ impl ModuleFileEvalState {
         let module_file = module_file
             .with_repo_rule_uses(repo_rule_uses.into_boxed_slice())
             .map_err(|error| ModuleFileEvaluationError::InvalidExtensionState(error.to_string()))?;
+        let module_file = module_file.with_registrations(ModuleRegistrations::new(
+            working.execution_platforms.into_boxed_slice(),
+            working.toolchains.into_boxed_slice(),
+        ));
         Ok(ModuleFileEvaluation {
             module_file,
             warnings: working.warnings.into_boxed_slice(),
@@ -1712,6 +1787,34 @@ fn register_module_file_globals(builder: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
+    fn register_execution_platforms<'v>(
+        #[starlark(args)] platform_labels: UnpackTuple<Value<'v>>,
+        #[starlark(require = named, default = false)] dev_dependency: bool,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<NoneType> {
+        state(eval)?.add_registrations(
+            "register_execution_platforms",
+            platform_labels,
+            dev_dependency,
+            true,
+        )?;
+        Ok(NoneType)
+    }
+
+    fn register_toolchains<'v>(
+        #[starlark(args)] toolchain_labels: UnpackTuple<Value<'v>>,
+        #[starlark(require = named, default = false)] dev_dependency: bool,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<NoneType> {
+        state(eval)?.add_registrations(
+            "register_toolchains",
+            toolchain_labels,
+            dev_dependency,
+            false,
+        )?;
+        Ok(NoneType)
+    }
+
     fn use_extension<'v>(
         extension_bzl_file: &str,
         extension_name: &str,
@@ -1858,12 +1961,13 @@ static NOOP_MODULE_PRINT_HANDLER: NoopModulePrintHandler = NoopModulePrintHandle
 ///
 /// The evaluator has no loader and adds isolated `print`, `module`, and
 /// `bazel_dep`, `single_version_override`, `local_path_override`, fail-closed
-/// stubs for other override directives, `use_extension`, `use_repo`, and
-/// `use_repo_rule` to the standard Starlark globals. The private accumulator is
-/// converted to [`ModuleFile`] only after evaluation and contextual checks both
-/// succeed. Print output is discarded rather than emitted to an ambient process
-/// stream, and root warnings are returned with the module file rather than
-/// emitted ambiently.
+/// stubs for other override directives, `register_execution_platforms`,
+/// `register_toolchains`, `use_extension`, `use_repo`, and `use_repo_rule` to
+/// the standard Starlark globals. The private accumulator is converted to
+/// [`ModuleFile`] only after evaluation and contextual checks both succeed.
+/// Print output is discarded rather than emitted to an ambient process stream,
+/// and root warnings are returned with the module file rather than emitted
+/// ambiently.
 pub fn evaluate_module_file(
     filename: &str,
     content: String,
@@ -1924,6 +2028,8 @@ mod tests {
                 "ord",
                 "print",
                 "range",
+                "register_execution_platforms",
+                "register_toolchains",
                 "repr",
                 "reversed",
                 "single_version_override",

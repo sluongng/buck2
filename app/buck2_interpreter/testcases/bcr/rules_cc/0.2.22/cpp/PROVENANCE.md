@@ -49,7 +49,11 @@ for deprecated public APIs.
 
 ## Test boundary
 
-The corpus parses these `.bzl` files with Buck2's production Bazel Bzl parser
-policy and checks their pinned hashes. It intentionally does not load or
-evaluate the module, resolve Bzlmod dependencies, execute repository or module
-extensions, expand the C++ rules, select a toolchain, or compile C++ code.
+The syntax corpus parses these `.bzl` files with Buck2's production Bazel Bzl
+parser policy and checks their pinned hashes. The isolated module evaluator
+also verifies that this exact registry `MODULE.bazel` matches the C copy,
+evaluates its prefix through the source registration records, and confirms
+that full evaluation stops at the currently unsupported `archive_override`
+directive. Neither test resolves Bzlmod dependencies, loads repository or
+module extensions, expands the C++ rules or registered target patterns,
+selects a toolchain, or compiles C++ code.
