@@ -11,9 +11,9 @@
 //! Typed, command-scoped configuration for Buck2's Bzlmod implementation.
 //!
 //! This crate deliberately contains no repository transport, cache, evaluator,
-//! or server wiring. Credential-helper executable paths are retained only in
-//! [`BzlmodRuntimeConfig`]; the DICE-safe configuration contains a provider
-//! digest and authorization scopes instead.
+//! or server wiring. Credential-helper executable paths and machine-absolute
+//! registry paths are retained only in [`BzlmodRuntimeConfig`]; the DICE-safe
+//! configuration contains opaque digest identities and authorization scopes.
 
 mod config;
 mod dice;
@@ -42,6 +42,7 @@ pub use config::MAX_CREDENTIAL_HELPER_TOTAL_HEADER_BYTES;
 pub use config::MAX_MAX_REDIRECTS;
 pub use config::MAX_MAX_REGISTRY_FILE_BYTES;
 pub use config::MAX_MAX_REPOSITORY_DOWNLOAD_BYTES;
+pub use config::MachineRegistryIdentity;
 pub use config::ParsedBzlmodConfig;
 pub use config::RemoteRepositoryCacheMode;
 pub use config::RepositoryCacheLocation;
