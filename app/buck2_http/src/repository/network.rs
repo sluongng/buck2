@@ -30,14 +30,21 @@ type BoxError = Box<dyn Error + Send + Sync>;
 /// The immutable network boundary attached to a repository HTTP client.
 ///
 /// Repository clients accept globally routable unicast destinations by
-/// default. Loopback access is available only as an explicit testing/local
-/// registry exception, and only when the URI itself names a loopback origin.
+/// default. Private-network access is available only as an explicit opt-in.
+/// Loopback access may also be enabled as a narrower testing/local registry
+/// exception, and only when the URI itself names a loopback origin.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RepositoryNetworkPolicy {
+    allow_private_network: bool,
     allow_explicit_loopback: bool,
 }
 
 impl RepositoryNetworkPolicy {
+    pub fn with_allow_private_network(mut self, allow: bool) -> Self {
+        self.allow_private_network = allow;
+        self
+    }
+
     pub fn with_allow_explicit_loopback(mut self, allow: bool) -> Self {
         self.allow_explicit_loopback = allow;
         self
@@ -56,6 +63,7 @@ pub enum RepositoryClientBuildError {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum DestinationClass {
     Public,
+    PublicAndPrivate,
     ExplicitLoopback,
 }
 
@@ -63,6 +71,8 @@ impl DestinationClass {
     fn for_host(host: &str, policy: &RepositoryNetworkPolicy) -> Self {
         if policy.allow_explicit_loopback && is_explicit_loopback_host(host) {
             Self::ExplicitLoopback
+        } else if policy.allow_private_network {
+            Self::PublicAndPrivate
         } else {
             Self::Public
         }
@@ -71,6 +81,7 @@ impl DestinationClass {
     fn permits(self, ip: IpAddr) -> bool {
         match self {
             Self::Public => is_public_ip(ip),
+            Self::PublicAndPrivate => is_public_ip(ip) || is_private_network_ip(ip),
             Self::ExplicitLoopback => is_loopback_ip(ip),
         }
     }
@@ -116,6 +127,20 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
 
 fn is_loopback_ip(ip: IpAddr) -> bool {
     normalize_ip(ip).is_loopback()
+}
+
+fn is_private_network_ip(ip: IpAddr) -> bool {
+    match normalize_ip(ip) {
+        IpAddr::V4(ip) => {
+            ip.is_loopback()
+                || ipv4_in_prefix(ip, Ipv4Addr::new(10, 0, 0, 0), 8)
+                || ipv4_in_prefix(ip, Ipv4Addr::new(172, 16, 0, 0), 12)
+                || ipv4_in_prefix(ip, Ipv4Addr::new(192, 168, 0, 0), 16)
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback() || ipv6_in_prefix(ip, Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7)
+        }
+    }
 }
 
 fn ipv4_in_prefix(ip: Ipv4Addr, network: Ipv4Addr, prefix: u32) -> bool {
@@ -456,6 +481,89 @@ mod tests {
     }
 
     #[test]
+    fn private_network_boundaries_and_mapped_addresses() {
+        for value in [
+            "10.0.0.0",
+            "10.255.255.255",
+            "127.0.0.0",
+            "127.255.255.255",
+            "172.16.0.0",
+            "172.31.255.255",
+            "192.168.0.0",
+            "192.168.255.255",
+            "fc00::",
+            "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "::1",
+            "::ffff:10.0.0.1",
+            "::ffff:127.0.0.1",
+            "::ffff:172.31.255.255",
+            "::ffff:192.168.0.1",
+        ] {
+            assert!(
+                is_private_network_ip(IpAddr::from_str(value).unwrap()),
+                "{value}"
+            );
+        }
+        for value in [
+            "9.255.255.255",
+            "11.0.0.0",
+            "126.255.255.255",
+            "128.0.0.0",
+            "172.15.255.255",
+            "172.32.0.0",
+            "192.167.255.255",
+            "192.169.0.0",
+            "fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "fe00::",
+            "::ffff:169.254.1.1",
+        ] {
+            assert!(
+                !is_private_network_ip(IpAddr::from_str(value).unwrap()),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_network_policy_denies_other_special_ranges() {
+        let policy = RepositoryNetworkPolicy::default().with_allow_private_network(true);
+        for value in [
+            "0.0.0.0",
+            "100.64.0.0",
+            "100.127.255.255",
+            "169.254.0.1",
+            "192.0.0.1",
+            "192.0.2.1",
+            "192.88.99.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "64:ff9b::1",
+            "64:ff9b:1::1",
+            "100::1",
+            "2001::1",
+            "2001:db8::1",
+            "2002::1",
+            "3fff::1",
+            "5f00::1",
+            "fe80::1",
+            "fec0::1",
+            "ff00::1",
+            "::ffff:100.64.0.1",
+            "::ffff:169.254.0.1",
+        ] {
+            assert!(
+                !DestinationClass::for_host("example.com", &policy)
+                    .permits(IpAddr::from_str(value).unwrap()),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
     fn loopback_requires_explicit_policy_and_origin() {
         let strict = RepositoryNetworkPolicy::default();
         let local = strict.clone().with_allow_explicit_loopback(true);
@@ -479,6 +587,110 @@ mod tests {
             DestinationClass::Public,
             DestinationClass::for_host("example.com", &local)
         );
+    }
+
+    #[test]
+    fn private_network_policy_is_explicit_and_preserves_public_access() {
+        let strict = RepositoryNetworkPolicy::default();
+        let private = strict.clone().with_allow_private_network(true);
+        assert_eq!(
+            DestinationClass::Public,
+            DestinationClass::for_host("example.com", &strict)
+        );
+        assert_eq!(
+            DestinationClass::PublicAndPrivate,
+            DestinationClass::for_host("example.com", &private)
+        );
+        for value in [
+            "8.8.8.8",
+            "2001:4860:4860::8888",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.0.1",
+            "fc00::1",
+            "127.0.0.1",
+            "::1",
+        ] {
+            assert!(
+                DestinationClass::for_host("example.com", &private)
+                    .permits(IpAddr::from_str(value).unwrap()),
+                "{value}"
+            );
+        }
+        assert!(
+            !DestinationClass::for_host("example.com", &strict)
+                .permits(IpAddr::from_str("10.0.0.1").unwrap())
+        );
+
+        let disabled = private.with_allow_private_network(false);
+        assert_eq!(
+            DestinationClass::Public,
+            DestinationClass::for_host("example.com", &disabled)
+        );
+    }
+
+    #[test]
+    fn explicit_loopback_remains_origin_bound_with_private_access() {
+        let policy = RepositoryNetworkPolicy::default()
+            .with_allow_private_network(true)
+            .with_allow_explicit_loopback(true);
+        assert_eq!(
+            DestinationClass::ExplicitLoopback,
+            DestinationClass::for_host("localhost", &policy)
+        );
+        assert!(
+            DestinationClass::for_host("localhost", &policy)
+                .permits(IpAddr::from_str("127.0.0.1").unwrap())
+        );
+        assert!(
+            !DestinationClass::for_host("localhost", &policy)
+                .permits(IpAddr::from_str("10.0.0.1").unwrap())
+        );
+        assert!(
+            !DestinationClass::for_host("localhost", &policy)
+                .permits(IpAddr::from_str("8.8.8.8").unwrap())
+        );
+        assert_eq!(
+            DestinationClass::PublicAndPrivate,
+            DestinationClass::for_host("example.com", &policy)
+        );
+    }
+
+    #[test]
+    fn private_ip_literals_require_opt_in() {
+        let strict = RepositoryNetworkPolicy::default();
+        let private = strict.clone().with_allow_private_network(true);
+        for value in [
+            "https://10.0.0.1/archive",
+            "https://172.16.0.1/archive",
+            "https://192.168.0.1/archive",
+            "https://127.0.0.1/archive",
+            "https://[fc00::1]/archive",
+            "https://[::1]/archive",
+            "https://[::ffff:10.0.0.1]/archive",
+        ] {
+            let uri = value.parse().unwrap();
+            assert!(
+                validate_uri_before_connect(&uri, &strict).is_err(),
+                "{value}"
+            );
+            assert!(
+                validate_uri_before_connect(&uri, &private).is_ok(),
+                "{value}"
+            );
+        }
+        for value in [
+            "https://169.254.0.1/archive",
+            "https://[fe80::1]/archive",
+            "https://[::ffff:169.254.0.1]/archive",
+            "https://[fe80::1%25eth0]/archive",
+        ] {
+            let uri = value.parse().unwrap();
+            assert!(
+                validate_uri_before_connect(&uri, &private).is_err(),
+                "{value}"
+            );
+        }
     }
 
     #[derive(Clone)]
@@ -582,6 +794,58 @@ mod tests {
         );
         assert!(
             resolve("localhost", &["127.0.0.1:0", "8.8.8.8:0"], local,)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_private_opt_in_accepts_mixed_allowed_candidates() {
+        let private = RepositoryNetworkPolicy::default().with_allow_private_network(true);
+        assert_eq!(
+            6,
+            resolve(
+                "example.com",
+                &[
+                    "8.8.8.8:0",
+                    "10.0.0.1:0",
+                    "172.16.0.1:0",
+                    "192.168.0.1:0",
+                    "127.0.0.1:0",
+                    "[fc00::1]:0",
+                ],
+                private.clone(),
+            )
+            .await
+            .unwrap()
+            .len()
+        );
+        assert!(
+            resolve(
+                "example.com",
+                &["10.0.0.1:0", "169.254.0.1:0"],
+                private.clone(),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            resolve("example.com", &["169.254.0.1:0", "10.0.0.1:0"], private,)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_private_opt_in_normalizes_mapped_ipv6() {
+        let private = RepositoryNetworkPolicy::default().with_allow_private_network(true);
+        assert!(
+            resolve("example.com", &["[::ffff:10.0.0.1]:0"], private.clone())
+                .await
+                .is_ok()
+        );
+        assert!(
+            resolve("example.com", &["[::ffff:169.254.0.1]:0"], private)
                 .await
                 .is_err()
         );
@@ -719,6 +983,81 @@ mod tests {
         assert!(
             connector
                 .call("https://example.com/archive".parse().unwrap())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn connector_private_opt_in_checks_literals_peers_and_ports() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let private = RepositoryNetworkPolicy::default().with_allow_private_network(true);
+
+        let mapped_private_peer = FakeConnector {
+            calls: calls.clone(),
+            peer: "[::ffff:10.0.0.1]:443".parse().unwrap(),
+        };
+        let mut connector = PeerCheckedConnector::new(mapped_private_peer, private.clone());
+        assert!(
+            connector
+                .call("https://10.0.0.1/archive".parse().unwrap())
+                .await
+                .is_ok()
+        );
+        assert_eq!(1, calls.load(Ordering::SeqCst));
+
+        let public_peer = FakeConnector {
+            calls: calls.clone(),
+            peer: "8.8.8.8:443".parse().unwrap(),
+        };
+        let mut connector = PeerCheckedConnector::new(public_peer, private.clone());
+        assert!(
+            connector
+                .call("https://example.com/archive".parse().unwrap())
+                .await
+                .is_ok()
+        );
+
+        let forbidden_peer = FakeConnector {
+            calls: calls.clone(),
+            peer: "169.254.0.1:443".parse().unwrap(),
+        };
+        let mut connector = PeerCheckedConnector::new(forbidden_peer, private.clone());
+        assert!(
+            connector
+                .call("https://example.com/archive".parse().unwrap())
+                .await
+                .is_err()
+        );
+
+        let literal_calls = calls.load(Ordering::SeqCst);
+        let literal_peer = FakeConnector {
+            calls: calls.clone(),
+            peer: "10.0.0.1:443".parse().unwrap(),
+        };
+        let mut connector = PeerCheckedConnector::new(literal_peer, private.clone());
+        assert!(
+            connector
+                .call("https://169.254.0.1/archive".parse().unwrap())
+                .await
+                .is_err()
+        );
+        assert!(
+            connector
+                .call("https://[fe80::1%25eth0]/archive".parse().unwrap())
+                .await
+                .is_err()
+        );
+        assert_eq!(literal_calls, calls.load(Ordering::SeqCst));
+
+        let wrong_port = FakeConnector {
+            calls,
+            peer: "10.0.0.1:80".parse().unwrap(),
+        };
+        let mut connector = PeerCheckedConnector::new(wrong_port, private);
+        assert!(
+            connector
+                .call("https://10.0.0.1/archive".parse().unwrap())
                 .await
                 .is_err()
         );
