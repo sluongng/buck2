@@ -125,7 +125,7 @@ impl<B> RedirectEngine<B> {
         loop {
             if self.processed_redirects > self.max_redirects {
                 return Err(HttpError::TooManyRedirects {
-                    uri: initial_uri.to_string(),
+                    uri: crate::repository::redact_uri(&initial_uri),
                     max_redirects: self.max_redirects,
                 });
             }
@@ -135,7 +135,7 @@ impl<B> RedirectEngine<B> {
             tracing::debug!(
                 "http: processing redirect request ({}) for {}",
                 self.response.status(),
-                self.pending_request.uri,
+                crate::repository::RedactedUri::from_uri(&self.pending_request.uri),
             );
 
             if let Some(redirect_request) = self
